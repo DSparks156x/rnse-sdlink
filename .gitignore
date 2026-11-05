@@ -1,0 +1,45 @@
+# build outputs
+.pio/
+.venv/
+out/
+*.o
+*.a
+*.elf
+*.bin
+*.hex
+*.map
+*.dis
+*.sym
+*.rsav
+*.img
+*.exe
+*.pdb
+__pycache__/
+*.pyc
+# binaries built in-tree
+pi/avlink/avlink
+pi/avlink/test/out/
+pienc/rnv2enc
+pienc/rnv2dec_ref
+pienc/rnv2enc_emu
+pienc/test_kernels
+pienc/test_kernels_emu
+pienc/bench_kernels
+pienc/synth
+pienc/headroom_eval
+teensy/tools/host_link/host_link
+# run data and logs
+*.log
+*.wav
+*.pcm
+*.mp3
+*.rnv
+*.json
+bench_log.txt
+tramp_slot.txt
+# backups and stale variants
+*.bak*
+*.before_*
+# firmware dumps and extracted vendor data must never be committed
+fw/
+*.payload.bin
