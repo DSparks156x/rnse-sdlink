@@ -8,7 +8,9 @@
  *    length, Exp-Golomb length, Huffman miss. A bad frame returns an error code instead of reading wild memory.
  *  - residual in place on a 32-word temp (cache-resident) then one store pass: P1 is write-through on this unit,
  *    so the frame buffer is written exactly once per coded block and never read back.
- * Compiled twice from rnv2sh.c: rnvo_* (plain) and rnvp_* (with PREF of the next reference line pair). */
+ * Compiled three times from rnv2sh.c: rnvo_* (plain), rnvp_* (with PREF of the next reference line pair) and
+ * rnvf_* (RNV_FAST: register bit window, sign table, residual added in the second transform pass, PREF of the next reference row;
+ * same pixels, about 26% less time on the unit). sdstream uses rnvf; its --pref picks the plain rnvo, for A/B. */
 #ifndef RNV2SH_H
 #define RNV2SH_H
 
@@ -53,6 +55,7 @@ void rnv_state_reset(rnv_state *s);
  * marks every block for re-copy and leaves s->last on the partially decoded buffer (caller decides). */
 int rnvo_decode(rnv_state *s, const rnv_u8 *f, rnv_u32 len);
 int rnvp_decode(rnv_state *s, const rnv_u8 *f, rnv_u32 len);
+int rnvf_decode(rnv_state *s, const rnv_u8 *f, rnv_u32 len);
 
 /* reference decoder (video/dec/rnv2dec.c logic, ping-pong 2 buffers), for A/B timing on the unit */
 typedef struct { rnv_u8 *buf[2]; int cur; rnv_u8 prevmode[RNV_NB]; } rnvref_dec;

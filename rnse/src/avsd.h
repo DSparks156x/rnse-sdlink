@@ -28,7 +28,7 @@
 #define DEC_STREAM_MAX 0x280000u
 #define SF_BUF       0x8F800000u
 #define SF_BUF_BYTES 0x40000u
-#define AFIFO        0x8F9A0000u
+#define AFIFO        0x8F980000u   /* ends 8F9A0000. Firmware sink: temp+byte FIFO 8F9B6320..8F9DA320 (read at 8EA19824), ring 8F9DA320.. : stay out, it silently overwrote our FIFO tail and stacks */
 #define AFIFO_FRAMES 32768u
 
 #define CD_GPIO      0xFF93E00Cu
@@ -58,6 +58,7 @@ u32 crc32_upd(u32 crc, const u8 *p, u32 n);   /* crc starts at 0; returns the zl
 int du_takeover(u32 phys_front);   /* returns 0, or 1 if already taken */
 void du_flip(u32 phys);
 void du_restore(void);
+u32 du_mr(void);
 u32 du_dssr(void);
 #define DU_MR_YUY2   0x04104033u
 #define DSA_PHYS(a)  ((u32)(a) & 0x1FFFFFF0u)

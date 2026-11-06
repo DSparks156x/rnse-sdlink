@@ -4,7 +4,8 @@
 # 'scan <dir>' = directory under analysis/av_over_sd_v1 that is checked for unlisted files.
 scan teensy
 scan pi
-scan pienc
+scan pienc_budget
+scan ../r61_car_v1
 scan rnse_proto
 scan link
 
@@ -19,6 +20,13 @@ teensy/tools/bench/ analysis/av_over_sd_v1/teensy/tools/bench/*.py
 teensy/tools/host_selftest/main.cpp analysis/av_over_sd_v1/teensy/tools/host_selftest/main.cpp
 teensy/tools/host_link/main.cpp analysis/av_over_sd_v1/teensy/tools/host_link/main.cpp
 teensy/tools/host_link/Makefile analysis/av_over_sd_v1/teensy/tools/host_link/Makefile
+teensy/tools/test_avstream_ownership.cpp analysis/av_over_sd_v1/teensy/tools/test_avstream_ownership.cpp
+teensy/tools/host_link/live_reader.cpp analysis/av_over_sd_v1/teensy/tools/host_link/live_reader.cpp
+skip teensy/build_fixes/*
+skip teensy/build_resume/*
+skip teensy/tools/native_test_cache/*
+skip teensy/tools/*.before
+skip teensy/tools/*.patch
 link/sd_wire.py analysis/av_over_sd_v1/link/sd_wire.py
 docs/PROTOCOL.md analysis/av_over_sd_v1/link/SPEC.md
 skip teensy/README.txt
@@ -43,20 +51,30 @@ pi/vtouch/vtouch.py analysis/av_over_sd_v1/pi/vtouch/vtouch.py
 pi/scripts/ analysis/av_over_sd_v1/pi/scripts/*.sh
 pi/scripts/car/ analysis/av_over_sd_v1/pi/scripts/car/*
 skip pi/avlink/avlink
-skip pi/avlink/test/*
+pi/avlink/test/ analysis/av_over_sd_v1/pi/avlink/test/*.c
+pi/avlink/test/ analysis/av_over_sd_v1/pi/avlink/test/*.py
+skip pi/avlink/test/out/*
+skip pi/avlink/test/out_fixes/*
+skip pi/avlink/test/credit_review/*
 
 # ---- pienc (encoder)
-pienc/Makefile analysis/av_over_sd_v1/pienc/Makefile
-pienc/README.txt analysis/av_over_sd_v1/pienc/README.txt
-pienc/include/ analysis/av_over_sd_v1/pienc/include/*.h
-pienc/src/ analysis/av_over_sd_v1/pienc/src/*.c
-pienc/src/ analysis/av_over_sd_v1/pienc/src/*.h
-pienc/ref/ analysis/av_over_sd_v1/pienc/ref/*
-pienc/tools/closed_loop_test.sh analysis/av_over_sd_v1/pienc/tools/closed_loop_test.sh
-pienc/tools/synth.c analysis/av_over_sd_v1/pienc/tools/synth.c
-skip pienc/REPORT.txt
-skip pienc/tools/*
-skip pienc/results/*
+# The repo folder pienc/ is the 'pienc_budget' encoder of the working tree (superframe budget + settled-quality options).
+# With no new flag it produces the same stream as the older plain 'pienc' encoder, so only this one is kept.
+pienc/Makefile analysis/av_over_sd_v1/pienc_budget/Makefile
+pienc/README.txt analysis/av_over_sd_v1/pienc_budget/README.txt
+pienc/include/ analysis/av_over_sd_v1/pienc_budget/include/*.h
+pienc/src/ analysis/av_over_sd_v1/pienc_budget/src/*.c
+pienc/src/ analysis/av_over_sd_v1/pienc_budget/src/*.h
+pienc/ref/ analysis/av_over_sd_v1/pienc_budget/ref/*
+pienc/tools/closed_loop_test.sh analysis/av_over_sd_v1/pienc_budget/tools/closed_loop_test.sh
+pienc/tools/synth.c analysis/av_over_sd_v1/pienc_budget/tools/synth.c
+pienc/tools/bench_kernels.c analysis/av_over_sd_v1/pienc_budget/tools/bench_kernels.c
+skip pienc_budget/REPORT.txt
+skip pienc_budget/tools/*
+skip pienc_budget/budget/*
+skip pienc_budget/orig_src/*
+skip pienc_budget/build/*
+skip pienc_budget/results/*
 
 # ---- rnse (RAM programs for the RNS-E + host side)
 rnse/build.sh analysis/av_over_sd_v1/rnse_proto/build.sh
@@ -66,6 +84,9 @@ rnse/rnse_bench.py analysis/av_over_sd_v1/rnse_proto/rnse_bench.py
 rnse/sdstream.py analysis/av_over_sd_v1/rnse_proto/sdstream.py
 rnse/sdbench.py analysis/av_over_sd_v1/rnse_proto/sdbench.py
 rnse/sdtime.py analysis/av_over_sd_v1/rnse_proto/sdtime.py
+rnse/sdfast.py analysis/av_over_sd_v1/rnse_proto/sdfast.py
+rnse/sdloadd.py analysis/av_over_sd_v1/rnse_proto/sdloadd.py
+rnse/sdload_test.py analysis/av_over_sd_v1/rnse_proto/sdload_test.py
 rnse/build_sdtime.sh analysis/av_over_sd_v1/rnse_proto/build_sdtime.sh
 rnse/src/crt0.S analysis/av_over_sd_v1/rnse_proto/src/crt0.S
 rnse/src/tramp.S analysis/av_over_sd_v1/rnse_proto/src/tramp.S
@@ -78,12 +99,22 @@ rnse/src/rnv2ref.c analysis/av_over_sd_v1/rnse_proto/src/rnv2ref.c
 rnse/src/rnv2sh.c analysis/av_over_sd_v1/rnse_proto/src/rnv2sh.c
 rnse/src/rnv2tab.c analysis/av_over_sd_v1/rnse_proto/src/rnv2tab.c
 rnse/src/sdbench.c analysis/av_over_sd_v1/rnse_proto/src/sdbench.c
+rnse/src/sdboot.c analysis/av_over_sd_v1/rnse_proto/src/sdboot.c
 rnse/src/sdmem.c analysis/av_over_sd_v1/rnse_proto/src/sdmem.c
 rnse/src/sdmem_target.c analysis/av_over_sd_v1/rnse_proto/src/sdmem_target.c
 rnse/src/sdprobe.c analysis/av_over_sd_v1/rnse_proto/src/sdprobe.c
 rnse/src/sdstream.c analysis/av_over_sd_v1/rnse_proto/src/sdstream.c
 rnse/src/sdtime.c analysis/av_over_sd_v1/rnse_proto/src/sdtime.c
 rnse/src/tone48.c analysis/av_over_sd_v1/rnse_proto/src/tone48.c
+# ---- flash-resident hook sources (r61). Source only: no flash tools, image build or firmware patching here.
+rnse/hook/tvauto.c analysis/r61_car_v1/src/tvauto.c
+rnse/hook/hdr.S analysis/r61_car_v1/src/hdr.S
+rnse/hook/tvauto.ld analysis/r61_car_v1/src/tvauto.ld
+rnse/hook/tvhook_r61.s analysis/r61_car_v1/tvhook_r61.s
+skip ../r61_car_v1/R61.md
+skip ../r61_car_v1/rebuild.py
+skip ../r61_car_v1/tva_bench.py
+skip ../r61_car_v1/sdstage/*
 # CAN transport used by rnse_bench.py (owner's own earlier tools, outside av_over_sd_v1)
 rnse/can/probe.py analysis/soc_caps_v1/probe.py
 rnse/can/cowcan_memread.py tools/cowcan_memread.py
@@ -108,4 +139,3 @@ skip rnse_proto/src/uplink_stub.c
 skip rnse_proto/tone48.py
 skip rnse_proto/uiprobe.py
 skip rnse_proto/verify_sdwrite.py
-skip rnse_proto/src/sdboot.c

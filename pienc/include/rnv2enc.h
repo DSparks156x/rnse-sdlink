@@ -55,6 +55,29 @@ typedef struct {
     double hyst;               /* a level finer than the previous frame's must fit within this fraction of the allowance (0.85) */
     int pin_level;             /* >= 0: hold this ladder level, no level control (evaluation); -1 = controlled (default) */
     int me_win_max;            /* ... and is below this (no match nearby: cut / new content; window would not help; default 1024) */
+    /* anti-ghost rate control (0 = off, each usable alone; none changes the format).  See README.txt "MASKING". */
+    int refine_static;         /* 1: blocks outside the damage are still refined until they reach the current quality point.  0 (old): a coarse block whose source stopped changing stays as it is until the next key */
+    double lag_target;         /* with max_frame: bucket fill the qp control steers to under sustained load (fraction of the bucket): lower = less picture lag on the link (0.35) */
+    double max_frame;          /* non-key frame size limit, in frames of link rate: a burst leaves as a coarser frame the link can show now, refined by the next frames, not as one huge late frame */
+    double stale_d, stale_w;   /* mode decision: J[m] += stale_w * max(0, D[m] - stale_d): picture that is visibly wrong is replaced (coarsely if need be) rather than left stale */
+    int burst_probe;           /* 1: on a sudden burst of active blocks estimate the frame size from a row sample first, to pick the first qp */
+    int mu_relax;              /* 1: if the frame ended well under the cycle budget at a high mu, retry lower mu values (mu only rose within a frame) */
+    int qp_drop;               /* qp fall per frame while frames are well under budget (rnv2.py: 2); after a burst this is how quickly the picture sharpens */
+    int fast_refine;           /* 1: level steps finer without dwell while the frame is far below the allowance */
+    int dither;                /* 1: static 2x2 ordered dither of the source in smooth gradient blocks, for the 6-bit panel.  Prototype: default off */
+    int dither_range;          /* gradient test: max-min per channel within a block and its 4 neighbours at most this (default 24) */
+    /* superframe budget (0 = off, the old rate control bit for bit).  See README.txt "SUPERFRAME BUDGET". */
+    double sf_budget;          /* bytes of video one superframe carries (avlink --maxvid x 512).  Non-key frames are held to this ceiling, or to a whole number of superframes when they spill deliberately */
+    double trim_ratio;         /* a frame up to this x the ceiling is cut by re-running the mode decision at a higher lambda, no qp analysis pass (1.35) */
+    double trim_max;           /* largest lambda factor of that cut (3): beyond it the picture suffers more than a lost frame */
+    int spill_qp;              /* fitting one superframe would need qp >= this: spill instead (default 18; 99 = never) */
+    int spill_sf;              /* superframes a deliberate spill takes (2) */
+    int spill_gap;             /* frames between deliberate spills (30): each one costs a displayed frame */
+    double spill_cyc;          /* x cyc_budget a deliberate spill may use (1: the cap holds on every frame, since one long decode starves the audio) */
+    int converge;              /* 1: blocks whose source stopped changing are sent RAW (exact against the YUY2 target) as link and cycles allow, worst first, until the whole frame matches.  0 = off */
+    int csc_fit;               /* with converge, 1: a block whose source stopped changing gets its Y/U/V re-chosen so the modelled panel equals the source's 6 bits per channel (with room from the step edges), then is sent exact */
+    int conv_sf;               /* superframes a frame may take for that when the source has slowed (still screen, 2) */
+    int spill_carry;           /* 1: the excess of a spill stays in the bucket as debt; 0: forgiven (the tick it took is paid in lost frames) */
 } rnv2enc_params;
 
 typedef struct {
@@ -64,6 +87,8 @@ typedef struct {
     int sizes[4];
     int gmv_n, gmv[8][2];      /* global motion candidates found (half-pel units) */
     double t_ms[8];            /* phase timings: csc, gme, me, analyse, decide, commit, write, total */
+    int nchanged, nexact, nraw_conv; /* blocks whose source changed; blocks equal to the target after this frame (converge); blocks sent RAW by converge */
+    int spill, trims;          /* sf_budget: 0 fits, 1 deliberate spill or key, 2 missed the ceiling; lambda trim passes */
 } rnv2enc_info;
 
 typedef struct rnv2enc rnv2enc;
@@ -73,6 +98,8 @@ rnv2enc *rnv2enc_create(const rnv2enc_params *p);
 void rnv2enc_destroy(rnv2enc *e);
 /* Set the link capacity (bytes/s) from any thread; it takes effect at the start of the next rnv2enc_encode call. */
 void rnv2enc_set_linkcap(rnv2enc *e, double bytes_per_s);
+/* Time since the previous frame, seconds, for the next encode call.  Without it the bucket drains one 1/fps per frame (old).  Unused time is not banked past an empty bucket; a short interval raises the fill, up to the bucket size. */
+void rnv2enc_set_elapsed(rnv2enc *e, double seconds);
 /* Encode one frame.  pix: 800x480 in fmt with stride bytes per row.  dmg/ndmg: damage rectangles (speed hint
  * only); ndmg < 0 means "no damage information" (everything is checked).  On return *out points to the frame
  * (valid until the next call).  Returns 0 on success. */
@@ -86,6 +113,8 @@ void rnv2enc_target_yuy2(const rnv2enc *e, uint8_t *dst);
 void rnv2enc_planes(const rnv2enc *e, const uint8_t **rY, const uint8_t **rU, const uint8_t **rV,
                     const uint8_t **tY, const uint8_t **tU, const uint8_t **tV);
 const char *rnv2enc_kernel_name(const rnv2enc *e);
+/* the mode of each of the 6000 blocks (raster) in the last frame: 0 SKIP 1 MC 2 MCR 3 ZRES 4 INTRA 5 RAW */
+void rnv2enc_modes(const rnv2enc *e, uint8_t *out);
 
 #ifdef __cplusplus
 }

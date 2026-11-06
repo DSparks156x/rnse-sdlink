@@ -79,6 +79,20 @@ LIBRARY USE
   rnv2enc_destroy(e);
   One encoder per stream; a call must not overlap another call on the same encoder.
 
+MASKING (rnv2enc_mask, 2026-11-05): anti-ghost rate control, encoder only, stream format unchanged.  All on by default; --mask 0 = the old rate control, bit for bit.
+  --refine 1       A block outside the damage is still refined until it reaches the current quality point.  Old: with --damage / --auto-damage, a coarse block whose source
+                   stopped changing stayed coarse until the next key (the "never cleans up" bug).  Without damage hints the old encoder was not affected.
+  --maxframe 1.5   Non-key frame limit, in frames of link rate (110 KB at 4.4 MB/s).  A burst leaves as a coarser frame the link shows now; the next frames sharpen it.
+  --lagtarget 0.5  With maxframe: the qp control steers to this bucket fill under sustained load, so the picture does not sit 4 frames behind on the link.
+  --staled 6000 --stalew 2   Mode decision: J[m] += w * max(0, D[m] - d).  Visibly wrong picture is replaced, coarsely if need be, rather than left stale.  6000 = about RMS 6.5 on luma alone at the classic point (kappa 4, thr 3); chroma error counts too.
+  --burstprobe 1   On a sudden burst, a sample of 1 row in 8 at a mid qp picks the first qp; also starts mu from the last burst's mu.
+  --murelax 1      A frame that ended under 80% of the cycle budget at a high mu retries a lower mu (mu used to rise only).
+  --qpdrop 4       qp fall per frame after a burst (was 2).   --fastrefine 1  ladder steps finer without dwell while frames are far under the allowance.
+  --keydefer 180   A periodic key waits, up to this many frames, for a quiet frame (last frame < 20 KB).  A key asked for on --linkctl goes at once.
+  --dither 1       PROTOTYPE, default off: screen-locked 2x2 ordered dither of the source in smooth gradient blocks, for the 6-bit panel; --ditherrange N is the smoothness limit (24).
+  Metrics: --ghost FILE (src/main.c, definitions at ghost_t): err block = luma RMS >= 6, ghost = err block closer to an old source content than to the current one; "glass" counters
+  use the frame actually on the panel, given the time its bytes take at 4.4 MB/s.  Tools: tools/mkscenes.py (test clips), mrun.sh + msum.py (runs), mkcmp.py (side by side), bandtest.py (banding).
+
 HEADROOM-DRIVEN QUALITY (default since r-headroom; --fixedq restores the old fixed operating point bit for bit)
   Owner rule: lossy only when the link lacks headroom.  The encoder walks a 12-step quality ladder (--levels):
     level 0       near-exact: --lamx 0.01 --kappalo 16 --thrlo 0 (the 'thr 0, kappa 16' point; ~9 MB/s on the night map)
@@ -121,3 +135,21 @@ HEADROOM-DRIVEN QUALITY (default since r-headroom; --fixedq restores the old fix
   Android Auto clips and flicker: results/headroom.txt.
   Evaluation: tools/headroom_run.sh (needs raw clips, tools/npz2raw.py) -> results/headroom.txt; metrics by tools/headroom_eval.c
     (decode with ./rnv2dec_ref, RGB666 glass compare with the source, flicker on static pixels).
+
+SUPERFRAME BUDGET (pienc_budget only, 2026-11-05; off unless asked for: with no new flag the stream equals the pienc/ encoder byte for byte)
+  --maxvid N          same N as avlink --maxvid (or --sfbudget BYTES = N x 512).  avlink never packs a frame head into the tail of a superframe, so a frame one byte over N sectors costs a whole tick.
+                      Non-key frames: ceiling of one superframe.  The level search, soft and hard limit all use it; the finest level has to fit the ceiling as well as the old allowance.
+  --trimratio 1.35    a frame up to this over the ceiling is cut by re-running the mode decision at up to --trimmax 3 x lambda, no analysis pass.  Over that, a qp analysis pass (3 at most).  If the cut fails, the frame goes at its own quality and spills ("missed", stats column spill = 2).
+  --spillqp 18        when fitting one superframe would need qp >= this: spill on purpose, --spillsf 2 superframes, lambda ladder free to fill the room, cycle cap x --spillcyc 1.  At most one per --spillgap 30 frames, only if the bucket can take it.
+  Cycle cap: in this mode --cyc holds on every frame, keys included: a last step raises mu until the frame fits, even if that puts it over the byte ceiling.
+  --spillcarry 1      the excess of a spill stays as bucket debt.  0 = forgiven.  Measured no real difference (budget/ sweep): 1 stays.
+  --refill frame|wall|sim   frame: bucket drains 1/fps per frame (old).  wall: by the clock between frame arrivals, for the live chain; not reproducible bit for bit, as it follows time.  sim: by budget/link_model.py's link, reproducible.
+                      Bounded: the fill stays within 0..bucket, so idle time banks nothing past an empty bucket.
+  Stats file gets two more columns: spill (0 fits, 1 deliberate or key, 2 missed), trims.  Evaluation: budget/reproduce.sh.
+
+SETTLED QUALITY (pienc_budget only, 2026-11-06; off unless asked for)
+  --converge 1   A block whose source did not change, and which differs from the YUY2 target, is sent RAW (the target itself, error 0), worst first, with what the frame has left: on a slowed source up to --convsf 2 superframes per frame, at frames every tick only on a light frame (under half a superframe) and only to the end of it.  A block already equal to the target is not looked at again.  Bucket and --cyc hold.  Turns on --keystill 1.
+  --keystill 1   The periodic key waits for a frame after a large change (3000+ blocks), or --keymax 300 s.  Never on a still screen or a small update.  A key asked for on --linkctl goes at once.  Decoder recovery rests on that request.
+  --cscfit 1     With converge, per block: small updates (300 blocks or fewer) before coding, other blocks only on a frame where nothing changes, pixel pairs without a hard edge get Y/U/V re-chosen so the modelled panel (BT.601 full, nearest chroma, 6 bits) equals the source's 6 bits, away from step edges.  The panel model is assumed.
+  --cscfit 2     The same with a screen-locked 2x2 ordered offset: still-only dither.
+  --modes-out F  6000 bytes per frame, the mode of each block.  Stats columns added: nchanged nexact nraw_conv.  Evaluation: budget/k_exact.py, launcher_eval.py, settle_eval.py.

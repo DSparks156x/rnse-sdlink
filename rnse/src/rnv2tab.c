@@ -6,6 +6,7 @@
 #include "rnv2_tables.h"
 
 rnv_huff rnv_hc, rnv_hbl, rnv_hbc;
+rnv_u32 rnv_cf[1 << RNV_L1BITS];
 rnv_u8 rnv_clamp[1024];
 rnv_u8 rnv_clz8[256];
 
@@ -43,6 +44,11 @@ void rnv_tables_init(void)
     for (i = 0; i < 1024; i++) rnv_clamp[i] = (rnv_u8)(i - 384 < 0 ? 0 : i - 384 > 255 ? 255 : i - 384);
     for (i = 0; i < 256; i++) { int z = 0; while (z < 8 && !(i & (0x80 >> z))) z++; rnv_clz8[i] = (rnv_u8)z; }
     huff_build(&rnv_hc, COEF_LEN, RNV_NSYM, 1);
+    for (i = 0; i < (1 << RNV_L1BITS); i++) {
+        rnv_u32 e = rnv_hc.l1[i];
+        if (!e) { rnv_cf[i] = (RNV_LVMAX + 1u) << 16; continue; }   /* longer than 10 bits: level above any real one sends rnvf to its slow path */
+        rnv_cf[i] = (e & 31) | ((((e >> 9) & 15) + 1) << 8) | (((e >> 5) & 15) + 1) << 16 | (e >> 13) << 24;
+    }
     huff_build(&rnv_hbl, CBPL_LEN, 16, 0);
     huff_build(&rnv_hbc, CBPC_LEN, 16, 0);
 }

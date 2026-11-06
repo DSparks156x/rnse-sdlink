@@ -21,6 +21,7 @@ import layout as L
 HERE = os.path.dirname(os.path.abspath(__file__))
 F_DECODE, F_AUDIO, F_DISPLAY, F_TLVCRC, F_PAYCRC, F_PACE, F_PREF = 1, 2, 4, 8, 16, 32, 64
 F_MEM = 128
+F_STANDBY = 512
 MODES = {'verify': F_PAYCRC, 'decode': F_PAYCRC | F_DECODE | F_TLVCRC,
          'audio': F_PAYCRC | F_DECODE | F_AUDIO, 'av': F_PAYCRC | F_DECODE | F_AUDIO | F_DISPLAY}
 ERRS = {0: 'ok', 1: 'no CTL block', 2: 'bad parameters', 3: 'card-detect gate: no card', 4: 'PCM sink busy (MP3 player '
@@ -34,13 +35,14 @@ F = ['seq', 'sf_ok', 'hdr_bad', 'retry', 'expired', 'seq_mism', 'rd_calls', 'rd_
      'first_err_seq', 'v_err_code', 'cd_raw', 'a_fmt_bad', 'wall_ms', 'sf_total', 'reuse_waits', 'a_ev_under',
      'a_ev_other', 'frag_in', 'frag_err', 'span_max', 'vframe_max', 'span1', 'span2', 'span3', 'span4', 'span5',
      'span6', 'span7', 'span8p', 'log_n', 'mem_cmd', 'mem_bad', 'mem_tx', 'mem_retry', 'mem_io',
-     'iis_ret', 'iis_saved', 'iis_ms', 'iis_reissue', 'iis_end', 'ssi_cr', 'ssi_sr', 'e219a', 'e219b', 'p904a', 'p904b', 'stuck_n', 'stuck_ms', 'stuck_lba', 'stuck_cnt', 'sdr0', 'sdr1', 'sdr2', 'sdr3', 'sdr4', 'sdr5', 'sdr6', 'sdr7', 'fl_n', 'fl_wait', 'fl_f14', 'fl_f20', 'fl_f34', 'fl_f50', 'fl_max', 'fl_blk']
+     'iis_ret', 'iis_saved', 'iis_ms', 'iis_reissue', 'iis_end', 'ssi_cr', 'ssi_sr', 'e219a', 'e219b', 'p904a', 'p904b', 'stuck_n', 'stuck_ms', 'stuck_lba', 'stuck_cnt', 'sdr0', 'sdr1', 'sdr2', 'sdr3', 'sdr4', 'sdr5', 'sdr6', 'sdr7', 'fl_n', 'fl_wait', 'fl_f14', 'fl_f20', 'fl_f34', 'fl_f50', 'fl_max', 'fl_blk',
+     'sess', 'r_min', 'r_zero', 'rate_mhz', 'ctx_chg', 'ctx_a', 'ctx_b', 'du_fix', 'a_resync', 'mute_a', 'keys', 'restarts']
 LOGN = 1024
 CPM = L.TMU_HZ / 1000.0
 EV = ['hdr_bad', 'retry', 'vdec', 'verr', 'vcrc', 'vdrop', 'late', 'acrc', 'under', 'discont', 'tlv_bad', 'shown']
 
 
-def make_ctl(slot=1, gate=1, flags=F_PAYCRC, secs=20, wrap=240, p1c=1, lrswap=0, block=960, target=2400, nbuf=3,
+def make_ctl(slot=1, gate=1, flags=F_PAYCRC, secs=20, wrap=240, p1c=1, lrswap=4 << 8, block=480, target=3000, nbuf=3,
              hint=64, start=0, maxsf=0, mem_arm=0, mem_lo=0, mem_hi=0, totest=0):
     params = [slot, gate | (totest << 8), flags, secs, wrap, p1c, lrswap, block, target, nbuf, hint, start, maxsf]
     return params + [mem_arm, mem_lo, mem_hi] if flags & F_MEM else params
@@ -114,7 +116,10 @@ def report(d, info=None):
         print('  flips: %d intervals, paced %d; <14 ms %d, 20-34 ms %d, 34-50 ms %d, >50 ms %d; max %.1f ms' % (
             d['fl_n'], d['fl_wait'], d['fl_f14'], d['fl_f20'], d['fl_f34'], d['fl_f50'], d['fl_max'] / CPM))
     if d.get('a_blocks'):
-        print('  audio rate match: step offset %+.0f ppm (implies sink/source %+.0f ppm)' % (L.s32(d['fl_blk']) * 15.26, -L.s32(d['fl_blk']) * 15.26))
+        print('  audio rate match: step offset %+.0f ppm; sink rate %.2f Hz (TMU clock); sink ring min %d, ring empty %d; backlog cuts %d' % (
+            L.s32(d['fl_blk']) * 15.26, d['rate_mhz'] / 1000.0, d['r_min'] if d['r_min'] != 0xFFFFFFFF else -1, d['r_zero'], d['a_resync']))
+    print('  first frame shown %d ms after session start' % d['stuck_ms'])
+    print('  sessions %d, source left %d, ctx %08X -> %08X, DU re-asserted %d, mute at route %04X, keys %d, restarts %d' % (d['sess'], d['ctx_chg'], d['ctx_a'], d['ctx_b'], d['du_fix'], d['mute_a'], d['keys'], d['restarts']))
     if d['du']:
         print('  display: state %X (1 = took array 0, |100 = restored), buffer reuse waits %d, pace waits %d' % (
             d['du'], d['reuse_waits'], d['pace_waits']))
@@ -155,10 +160,10 @@ def main(argv):
     ap.add_argument('--wrap', type=int, default=240)
     ap.add_argument('--p1c', type=int, choices=(0, 1), default=1)
     ap.add_argument('--lrswap', type=int, choices=(0, 1), default=0)
-    ap.add_argument('--block', type=int, default=960)
-    ap.add_argument('--target', type=int, default=2400)
+    ap.add_argument('--block', type=int, default=480)
+    ap.add_argument('--target', type=int, default=3000)
     ap.add_argument('--nbuf', type=int, choices=(2, 3), default=3)
-    ap.add_argument('--pref', action='store_true')
+    ap.add_argument('--pref', action='store_true', help='bench: the old rnvo decoder instead of rnvf, for A/B')
     ap.add_argument('--nopace', action='store_true')
     ap.add_argument('--iis', action='store_true', help='switch the DSP input to IIS via 805F3A94(3) once the SSI runs; restore on exit')
     ap.add_argument('--poll', type=float, default=5.0, help='seconds between status reads over CAN (the reads stall the unit)')
@@ -168,7 +173,15 @@ def main(argv):
     ap.add_argument('--scan', action='store_true', help='on a stall, scan all tasks for SD/FS code on the stack (~60 s)')
     ap.add_argument('--tlv', action='store_true', help='also check decoded CRCs in audio/av modes (+~5 ms per frame)')
     ap.add_argument('--info', default='')
-    ap.add_argument('--ring', action='store_true', help='bench: print the DSP_DEC ring fill at each poll')
+    ap.add_argument('--ring', action='store_true', help='bench: print the DSP_DEC ring fill + route state at each poll')
+    ap.add_argument('--sink', type=int, default=4, help='blocks allowed in the DSP_DEC ring (latency = this x block)')
+    ap.add_argument('--sinktone', type=int, default=0, help='bench: 1 = steady 1 kHz at the sink instead of the stream audio')
+    ap.add_argument('--scan2', dest='scan', type=int, default=0, help='bench: 1 = check a steady tone for jumps at FIFO input and in the FIFO at exit, words at 8F72FFD0')
+    ap.add_argument('--herectx', type=int, default=0, help='bench: --standby waits for the source it started on, not TV')
+    ap.add_argument('--tcbscan', type=float, default=0, help='bench: at T s list tasks in ACON code (slow)')
+    ap.add_argument('--nohop', action='store_true', help='switch straight to IIS, no hop through the FM input')
+    ap.add_argument('--standby', action='store_true', help='after the user leaves TV: idle, resume on TV re-entry')
+    ap.add_argument('--press', action='append', default=[], metavar='T:CMD', help='bench: at T s, CMD = radio|media|tv (panel key via queue 6 / direct select)')
     ap.add_argument('--full-log', action='store_true', help='also read the 32 KB per-superframe log (~80 s)')
     ap.add_argument('--memory', action='store_true', help='enable channel-3 memory service (emulator only, --wrap 0)')
     ap.add_argument('--memory-write-window', metavar='START:END', help='arm RAM patches inside this explicit window (end exclusive)')
@@ -196,8 +209,8 @@ def main(argv):
         if a.slot is None:
             ap.error('--slot is required (sdprobe S2 tells which)')
         fl = MODES[a.mode] | (0 if a.nopace or not a.wrap else F_PACE) | (F_PREF if a.pref else 0) | \
-            (F_TLVCRC if a.tlv else 0) | (F_MEM if a.memory else 0) | (256 if a.novcrc else 0)
-        params = make_ctl(a.slot, {'none': 0, 'high': 1, 'low': 2}[a.gate] | (16 if a.steal else 0) | (32 if a.iis else 0), fl, a.secs, a.wrap, a.p1c, a.lrswap,
+            (F_TLVCRC if a.tlv else 0) | (F_MEM if a.memory else 0) | (256 if a.novcrc else 0) | (F_STANDBY if a.standby else 0)
+        params = make_ctl(a.slot, {'none': 0, 'high': 1, 'low': 2}[a.gate] | (16 if a.steal else 0) | (32 if a.iis else 0) | (64 if a.nohop else 0), fl, a.secs, a.wrap, a.p1c, a.lrswap | (a.sink << 8) | (a.sinktone << 16) | (a.scan << 17) | (a.herectx << 18),
                           a.block, a.target, a.nbuf, mem_arm=mem_arm, mem_lo=mem_lo, mem_hi=mem_hi, totest=a.totest)
         rnse_bench.log('PLAN sdstream mode %s flags %X slot %d wrap %d secs %d p1c %d; calls 80653598%s%s' % (
             a.mode, fl, a.slot, a.wrap, a.secs, a.p1c, ', Snd_*' if fl & F_AUDIO else '',
@@ -221,7 +234,10 @@ def main(argv):
             if b.read(0x805F3A94, 8).hex() != '2fc62fd62fe64f22' or b.read(0x8047C8E4, 8).hex() != '0102030405060809':
                 raise RuntimeError('805F3A94 or table 8047C8E4 differ - refusing --iis')
             print('DSP input now: cache %s status %s mute %s' % (b.read(0x8E9F08C4, 1).hex(), b.read(0x8E9F08CC, 1).hex(), b.read(0x8E9E0216, 2).hex()))
+        KEYS = {'radio': 0xAC000180, 'media': 0xAC000140, 'tv': 0xAC000200, 'pradio': 0xAC000380, 'pmedia': 0xAC000340, 'ctx1': 0xAC000401, 'ctx7': 0xAC000407, 'mr': 0xAC000500}
+        presses = sorted((float(x.split(':')[0]), KEYS[x.split(':')[1]]) for x in a.press)
         b.start('sdstream', params, tag=a.mode)
+        t_run = time.monotonic()
         stall = {'seq': None, 'hb': None, 't': time.monotonic(), 'n': 0}
 
         def show2(st):                         # stall detector: dump task 159's TCB when the heartbeat stops
@@ -248,13 +264,29 @@ def main(argv):
                             print('    id %02X prio %02X state %s wait %s sp %08X code %s' % (
                                 tid, int.from_bytes(tc[2:4], 'big'), tc[4:6].hex(), tc[6:8].hex(), tsp, ' '.join(w[:10])))
             extra = ''
+            if a.tcbscan and time.monotonic() - t_run >= a.tcbscan and not stall.get('scanned'):
+                stall['scanned'] = 1
+                base = L.TCB159 - 0x9F * 0x40
+                for tid in range(1, 0xA0):
+                    tc = b.read(base + tid * 0x40, 0x30)
+                    stw = int.from_bytes(tc[4:6], 'big')
+                    tsp = int.from_bytes(tc[0x2C:0x30], 'big')
+                    if stw == 0x10 or not stw or not tsp:
+                        continue
+                    fr = b.read((tsp & 0x1FFFFFFF) | 0x80000000, 0x140) if tc[6:8] in (b'',) or int.from_bytes(tc[2:4], 'big') >= 0x20 else b''
+                    w = [fr[i:i + 4].hex() for i in range(0, len(fr), 4) if fr[i] == 0x80 and 0x40 <= fr[i + 1] <= 0x7F]
+                    print('    id %02X prio %02X state %s wait %s sp %08X code %s' % (tid, int.from_bytes(tc[2:4], 'big'), tc[4:6].hex(), tc[6:8].hex(), tsp, ' '.join(w[:14])))
+            while presses and time.monotonic() - t_run >= presses[0][0]:
+                b.poke(0x8F72FFF0, presses.pop(0)[1])
+                extra = ' [press]'
             if a.ring:                         # DSP_DEC ring: elem size, n, read count, write count (8062E98A = fill); +in-flight DMAs; a_blocks vs PC time
                 r = L.words(b.read(0x8EA19874, 16)) ; fl = b.u32(0x8EA18C98)
                 now = time.monotonic()
                 if 'rb' in stall:
-                    extra = ' | ring el %d n %d fill %d dma %d blk/s %.2f (%.1f Hz)' % (r[0], r[1], r[3] - r[2], fl, (d['a_blocks'] - stall['rb']) / (now - stall['rt']), (d['a_blocks'] - stall['rb']) * a.block / (now - stall['rt']))
+                    extra += ' | ring el %d n %d fill %d dma %d blk/s %.2f (%.1f Hz)' % (r[0], r[1], r[3] - r[2], fl, (d['a_blocks'] - stall['rb']) / (now - stall['rt']), (d['a_blocks'] - stall['rb']) * a.block / (now - stall['rt']))
                 else:
-                    extra = ' | ring el %d n %d fill %d dma %d' % (r[0], r[1], r[3] - r[2], fl)
+                    extra += ' | ring el %d n %d fill %d dma %d' % (r[0], r[1], r[3] - r[2], fl)
+                extra += ' ctx %s cache %s status %s mute %s e219 %s kslot %s kreq %s' % (b.read(0x8E9DFF50, 4).hex(), b.read(0x8E9F08C4, 1).hex(), b.read(0x8E9F08CC, 1).hex(), b.read(0x8E9E0216, 2).hex(), b.read(0x8E9E0219, 1).hex(), b.read(0x8F72FFF4, 8).hex(), b.read(0x8F72FFF0, 4).hex())
                 stall['rb'], stall['rt'] = d['a_blocks'], now
             return show(st) + ' rd %d err %d retry %d' % (d['rd_calls'], d['rd_err'], d['retry']) + extra
 

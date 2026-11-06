@@ -3,7 +3,7 @@
 #pragma once
 #include <stdint.h>
 
-#define FW_VERSION "sdemu 0.3 (2026-11-04, touch, live stream)"
+#define FW_VERSION "sdemu 0.4 (2026-11-05, touch, live stream, pool 1500)"
 
 // ---------------------------------------------------------------- pins (SPEC 1.2)
 // Teensy pin   pad          FLEXIO2   SD signal (SD card pin / microSD pin)
@@ -44,6 +44,13 @@
 //   T1 = CMD word timer  (S1 CMD TX, S2 CMD RX in card mode; S1 = CMD RX in monitor mode)
 //   T2 = SDCLK edge counter (frequency meter, IRQ every FREQ_DIV clocks)
 #define FREQ_DIV 256
+
+// ---------------------------------------------------------------- live stream pool (fxsd.cpp), wire images of 528 B
+// 1500 sectors: about 9.7 superframes at the 155-sector target (4.75 MB/s), 8.8 at the 170-sector maximum.
+// OCRAM keeps about 20 KB of heap: free_list 3 KB + avs_selftest 12.7 KB transient. Numbers checked against firmware.elf:
+// see the fixes report. DTCM shares its RAM with the stack; about 50 KB stays free for it.
+#define AVS_POOL_OCRAM 928
+#define AVS_POOL_DTCM  572
 
 // ---------------------------------------------------------------- VDD sense
 // divider: slot VDD -- 10k -- pin14 -- 20k -- GND   => Vpin = Vslot * 2/3

@@ -1,5 +1,5 @@
-NOTE: paths such as ../../link, rnse_proto/sdgen.py and test/run_tests.py refer to the author's private working tree;
-the PC test suite is not part of this repo.
+NOTE: paths such as ../../link, rnse_proto/sdgen.py and video/out in this file refer to the author's private working tree.
+In this repo: rnse_proto = rnse/, tests are pi/avlink/test/ (stages 2 and 3 need sdgen.py and source clips that are not here: use --skip-sdgen).
 
 avlink -- Pi 5 side of the RNS-E A/V-over-SD link (2026-11-04)
 =============================================================
@@ -8,6 +8,15 @@ Reads RNV2 video (pienc/rnv2enc output) and 48 kHz PCM, packs superframes per ..
 sends them to the Teensy over USB CDC with the SPEC 5 protocol and STATUS credits.
 
 STATUS: host-tested only (WSL x86-64). NOT run on a Pi, NOT run against a real Teensy, no RNS-E.
+
+LIVE LATENCY (test/test_live.py checks all of this, real tick and credits, no hardware)
+  Reader working: at most 8 superframes ahead of it on the Teensy; at most 2 frames in avlink's buffer, pipe 16 KB, then the encoder blocks and wlcap drops.
+  No new superframe served for 400 ms: every frame discarded on arrival, one audio-only superframe per 200 ms (per tick while the reader polls). Reader back: key
+  at once. More than 7 frames waiting above USB for 300 ms: discarded too. After a discard no delta goes out until a key, so the decoder keeps its picture.
+  All of this needs --keyctl. CONFIG stale_ms 400 live, 1500 batch and around a bootstrap image.
+WHOLE-SUPERFRAME HOLD (off by default, for the stuck-read tests): the Teensy holds only before sector 0, until the superframe is complete: no mid-read holds.
+  Switch: avlink --whole-sf 1, or live printf WSF1 > /tmp/avlink_sdctl (WSF0 off), or the Teensy console cfg wholesf 1 when avlink is not running
+  (console bytes written during a stream can land inside a message). It stays set until changed or Teensy reboot; avlink without the option leaves it alone.
 
 FILES
   avlink.c   main: options, video source + fragmenter, superframe builder, live/batch loop, USB writer
@@ -59,7 +68,7 @@ BENCH STEPS (when the hardware is here)
   B0  Pi + Teensy only. Flash teensy/build or `pio run -t upload` (README there). On the Pi:
         ls /dev/ttyACM*            (sudo usermod -aG dialout $USER, re-login)
         ./avlink --video ../../video/out/v2_real/highway110_night.rnv --dev /dev/ttyACM0 --stats 1 --console
-      expect: "teensy status=" growing ~20/s, free=1072/1072, slots=8 at first. With NO RNS-E reading, the
+      expect: "teensy status=" growing ~20/s, free=1500/1500, slots=8 at first. With NO RNS-E reading, the
       Teensy evicts unread slots after 200 ms: evicted grows, sent keeps up with built, late stays ~0.
       In the Teensy console (other terminal is not possible on the same port: use `--console` output, or stop
       avlink and `screen /dev/ttyACM0`): `link` shows slots / counters.

@@ -28,16 +28,17 @@ done
 # decoder objects (shared): rnvo = plain, rnvp = with PREF, ref = video/dec/rnv2dec.c logic (builtins allowed)
 ${X}gcc $CF -DRNV_PF=0 -c src/rnv2sh.c -o out/rnvo.o
 ${X}gcc $CF -DRNV_PF=1 -c src/rnv2sh.c -o out/rnvp.o
+${X}gcc $CF -DRNV_FAST=1 -c src/rnv2sh.c -o out/rnvf.o
 ${X}gcc $CF -c src/rnv2tab.c -o out/rnvtab.o
 ${X}gcc ${CF/-fno-builtin/} -Wno-sign-compare -c src/rnv2ref.c -o out/rnvref.o
 ${X}gcc $CF -c src/avlib.c -o out/avlib.o
 ${X}gcc $CF -c src/decbench.c -o out/decbench.o
-link decbench 0x20000 out/decbench.o out/avlib.o out/rnvtab.o out/rnvo.o out/rnvp.o out/rnvref.o
+link decbench 0x20000 out/decbench.o out/avlib.o out/rnvtab.o out/rnvo.o out/rnvp.o out/rnvf.o out/rnvref.o
 if [ -f src/sdstream.c ]; then
-  ${X}gcc $CF -c src/sdstream.c -o out/sdstream.o
+  ${X}gcc $CF ${XCF} -c src/sdstream.c -o out/sdstream.o
   ${X}gcc $CF -c src/sdmem.c -o out/sdmem.o
   ${X}gcc $CF -c src/sdmem_target.c -o out/sdmem_target.o
-  link sdstream 0x20000 out/sdstream.o out/sdmem.o out/sdmem_target.o out/avlib.o out/rnvtab.o out/rnvo.o out/rnvp.o
+  link sdstream 0x20000 out/sdstream.o out/sdmem.o out/sdmem_target.o out/avlib.o out/rnvtab.o out/rnvo.o out/rnvf.o
 fi
 # resident SD bootstrap (SDBOOT.txt): no crt0, no .data/.bss, entry first
 ${X}gcc ${CF/-O2/-Os} -c src/sdboot.c -o out/sdboot.o

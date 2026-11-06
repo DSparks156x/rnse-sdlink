@@ -43,3 +43,6 @@ tramp_slot.txt
 # firmware dumps and extracted vendor data must never be committed
 fw/
 *.payload.bin
+pienc/rnv2enc_count
+pienc/rnv2enc_emu
+pi/wlcap/wlcap

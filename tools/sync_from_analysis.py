@@ -33,7 +33,26 @@ PATCHES = {   # dest -> [(old, new)]: the CAN transport lives in rnse/can/ here 
     'docs/PROTOCOL.md': [
         ("Design on paper. Nothing in this folder has touched the car or the bench.", NOTE_SPEC)],
     'pi/avlink/README.txt': [
-        ("avlink -- Pi 5 side", "NOTE: paths such as ../../link, rnse_proto/sdgen.py and test/run_tests.py refer to the author's private working tree;\nthe PC test suite is not part of this repo.\n\navlink -- Pi 5 side")],
+        ("avlink -- Pi 5 side", "NOTE: paths such as ../../link, rnse_proto/sdgen.py and video/out in this file refer to the author's private working tree.\nIn this repo: rnse_proto = rnse/, tests are pi/avlink/test/ (stages 2 and 3 need sdgen.py and source clips that are not here: use --skip-sdgen).\n\navlink -- Pi 5 side")],
+    'pi/avlink/test/run_tests.py': [
+        ("PROTO = os.path.join(ROOT, 'rnse_proto')", "PROTO = os.path.join(ROOT, 'rnse')"),
+        ("import sdgen    # noqa: E402",
+         "try:\n    import sdgen    # noqa: E402  (reference generator + source clips are not in this repo)\nexcept ImportError:\n    sdgen = None"),
+        ("    ap.add_argument('--skip-live', action='store_true')",
+         "    ap.add_argument('--skip-live', action='store_true')\n"
+         "    ap.add_argument('--skip-sdgen', action='store_true', help='skip stages 2 and 3 (they need sdgen.py and the source clips)')"),
+        ("    build(not a.skip_e2e)",
+         "    if a.skip_sdgen or sdgen is None:\n        a.skip_e2e = True\n    build(not a.skip_e2e)"),
+        ("    print('[2] superframes vs sdgen.py')\n    res['sdgen'], refs = test_sdgen(cases)\n",
+         "    if a.skip_sdgen or sdgen is None:\n"
+         "        print('[2][3] superframes vs sdgen.py, end to end: skipped (need sdgen.py and the source clips, not in this repo)')\n"
+         "        refs = None\n"
+         "    else:\n"
+         "        print('[2] superframes vs sdgen.py')\n"
+         "        res['sdgen'], refs = test_sdgen(cases)\n")],
+    'pi/scripts/car/CAR_INSTALL.md': [
+        ("# A/V over SD: car install",
+         "> Note: R61.md, rebuild.py, sim_r61.py and tva_bench.py named below are the author's private firmware tooling and are not in this repo; the Pi side (install_car.sh, services, hud2.sh) is.\n\n# A/V over SD: car install")],
     'rnse/rnse_bench.py': [
         ("sys.path.insert(0, os.path.join(ROOT, 'analysis', 'soc_caps_v1'))", "sys.path.insert(0, os.path.join(HERE, 'can'))")],
     'rnse/can/probe.py': [

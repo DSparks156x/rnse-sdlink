@@ -56,6 +56,14 @@ static int sd_load(u32 slot, u32 lba, u32 nsect)
     return r;
 }
 
+/* CCR 00000101 on this unit (read 2026-11-05): WT=0, CB=0: P1 write-through, P0 copy-back; MMUCR.AT=0, so P0 = phys. Variant 3 decodes through P0 and writes the frame back. */
+#define P0A(x) ((x) & 0x1FFFFFFFu)
+static void oc_wb(u32 a, u32 n)
+{
+    u32 e = a + n;
+    for (a &= ~31u; a < e; a += 32) __asm__ volatile("ocbwb @%0" : : "r"(a) : "memory");
+}
+
 static int fb_index(const u8 *p) { return p == (u8 *)FB0 ? 0 : p == (u8 *)FB1 ? 1 : 2; }
 
 /* display: before writing buffer p, make sure >= 17 ms passed since it stopped being displayed */
@@ -67,6 +75,116 @@ static void wait_reuse(const u8 *p, int disp)
         ST(D_REUSE_WAITS)++;
         while (tick() - replaced[i] < REUSE_MS) dly_tsk(1);
     }
+}
+
+/* ---- p13 = 1: what a whole 6000-block frame costs on each memory path, min of 5, ms*1000 at RES_BASE+0xD040. No display. */
+#define MT_R 8
+#define WD(p) (*(volatile u32 *)(p))
+static volatile u32 mt_sink;
+static void __attribute__((noinline)) mt_write_wt(u32 d)
+{ u32 y, x, r; for (y = 0; y < 480; y += 8) for (x = 0; x < 1600; x += 16) { u32 *q = (u32 *)(d + y * 1600 + x); for (r = 0; r < MT_R; r++) { q[0] = r; q[1] = r; q[2] = r; q[3] = r; q += 400; } } }
+static void __attribute__((noinline)) mt_read(u32 s)
+{ u32 y, x, r, a = 0; for (y = 0; y < 480; y += 8) for (x = 0; x < 1600; x += 16) { const u32 *q = (const u32 *)(s + y * 1600 + x); for (r = 0; r < MT_R; r++) { a += q[0] + q[1] + q[2] + q[3]; q += 400; } } mt_sink = a; }
+static void __attribute__((noinline)) mt_copy(u32 d, u32 s)
+{ u32 y, x, r; for (y = 0; y < 480; y += 8) for (x = 0; x < 1600; x += 16) { u32 *q = (u32 *)(d + y * 1600 + x); const u32 *p = (const u32 *)(s + y * 1600 + x); for (r = 0; r < MT_R; r++) { u32 a = p[0], b = p[1], c = p[2], e = p[3]; q[0] = a; q[1] = b; q[2] = c; q[3] = e; q += 400; p += 400; } } }
+static void __attribute__((noinline)) mt_copy_line_movca(u32 d0, u32 s)   /* P0: 32-B line copy, movca + ocbwb per line */
+{ u32 y, x; for (y = 0; y < 480; y++) for (x = 0; x < 1600; x += 32) { u32 *q = (u32 *)(d0 + y * 1600 + x); const u32 *p = (const u32 *)(s + y * 1600 + x); u32 a = p[0];
+    __asm__ volatile("mov %1,r0\n\tmovca.l r0,@%0" : : "r"(q), "r"(a) : "r0", "memory");
+    q[1] = p[1]; q[2] = p[2]; q[3] = p[3]; q[4] = p[4]; q[5] = p[5]; q[6] = p[6]; q[7] = p[7];
+    __asm__ volatile("ocbwb @%0" : : "r"(q) : "memory"); } }
+static void __attribute__((noinline)) mt_copy_line_sq(u32 d, u32 s)        /* store queue: 32-B burst per line */
+{ u32 y, x; u32 phys = d & 0x1FFFFFFFu; R32(0xFF000038u) = (phys >> 24) & 0x1Cu; R32(0xFF00003Cu) = (phys >> 24) & 0x1Cu;
+  for (y = 0; y < 480; y++) for (x = 0; x < 1600; x += 32) { u32 o = (phys + y * 1600 + x) & 0x03FFFFE0u; volatile u32 *q = (volatile u32 *)(0xE0000000u | o); const u32 *p = (const u32 *)(s + y * 1600 + x);
+    q[0] = p[0]; q[1] = p[1]; q[2] = p[2]; q[3] = p[3]; q[4] = p[4]; q[5] = p[5]; q[6] = p[6]; q[7] = p[7];
+    __asm__ volatile("pref @%0" : : "r"(q) : "memory"); }
+  R32(0xFF000038u) = 0; R32(0xFF00003Cu) = 0; }
+static void __attribute__((noinline)) mt_copy_line_wt(u32 d, u32 s)        /* P1 write-through, whole lines */
+{ u32 y, x; for (y = 0; y < 480; y++) for (x = 0; x < 1600; x += 32) { u32 *q = (u32 *)(d + y * 1600 + x); const u32 *p = (const u32 *)(s + y * 1600 + x);
+    u32 a = p[0], b = p[1], c = p[2], e = p[3], f = p[4], g = p[5], h = p[6], i = p[7]; q[0] = a; q[1] = b; q[2] = c; q[3] = e; q[4] = f; q[5] = g; q[6] = h; q[7] = i; } }
+static void __attribute__((noinline)) mt_flush_only(u32 a) { oc_wb(a, FB_BYTES); }
+static void __attribute__((noinline)) mt_alu(void) { u32 i, a = 1; for (i = 0; i < 1000000u; i++) { a += a >> 1; __asm__ volatile("" : "+r"(a)); } mt_sink = a; }
+static void __attribute__((noinline)) mt_pref(u32 s)   /* PREF every line only: does it block? */
+{ u32 y, x; for (y = 0; y < 480; y++) for (x = 0; x < 1600; x += 32) __builtin_prefetch((const void *)(s + y * 1600 + x)); }
+static void __attribute__((noinline)) mt_copy_pref(u32 d, u32 s)   /* decoder copy, PREF the next pair's 8 rows before each pair */
+{ u32 y, x, r; for (y = 0; y < 480; y += 8) for (x = 0; x < 1600; x += 16) { u32 *q = (u32 *)(d + y * 1600 + x); const u32 *p = (const u32 *)(s + y * 1600 + x);
+    if (!(x & 16)) { const u8 *n = (const u8 *)p + 32; for (r = 0; r < MT_R; r++) __builtin_prefetch(n + r * 1600); }
+    for (r = 0; r < MT_R; r++) { u32 a = p[0], b = p[1], c = p[2], e = p[3]; q[0] = a; q[1] = b; q[2] = c; q[3] = e; q += 400; p += 400; } } }
+static void __attribute__((noinline)) mt_copy_pref1(u32 d, u32 s)  /* copy rows, PREF next row of this block before each row */
+{ u32 y, x, r; for (y = 0; y < 480; y += 8) for (x = 0; x < 1600; x += 16) { u32 *q = (u32 *)(d + y * 1600 + x); const u32 *p = (const u32 *)(s + y * 1600 + x);
+    for (r = 0; r < MT_R; r++) { u32 a, b, c, e; __builtin_prefetch(p + 400); a = p[0]; b = p[1]; c = p[2]; e = p[3]; q[0] = a; q[1] = b; q[2] = c; q[3] = e; q += 400; p += 400; } } }
+static void __attribute__((noinline)) mt_compute(void) { volatile u32 sink; u32 i, a = 1; for (i = 0; i < 24000u; i++) { u32 k; for (k = 0; k < 90u; k++) { a += a >> 1; __asm__ volatile("" : "+r"(a)); } } sink = a; (void)sink; }
+static void __attribute__((noinline)) mt_compute_pref(u32 s)  /* 90-loop compute per line, with a PREF of a new line each time: full overlap? */
+{ volatile u32 sink; u32 i, a = 1; const u8 *p = (const u8 *)s; for (i = 0; i < 24000u; i++) { u32 k; __builtin_prefetch(p); p += 32; for (k = 0; k < 90u; k++) { a += a >> 1; __asm__ volatile("" : "+r"(a)); } } sink = a; (void)sink; }
+#define MT_RUN(k, call) do { u32 n, best = ~0u; for (n = 0; n < 5; n++) { u32 c0; dly_tsk(1); c0 = now_counts(); call; c0 = now_counts() - c0; if (c0 < best) best = c0; } mt[k] = best; } while (0)
+static void memtest(void)
+{
+    volatile u32 *mt = (volatile u32 *)(RES_BASE + 0xD040u);
+    u32 i; for (i = 0; i < 16; i++) mt[i] = 0;
+    MT_RUN(0, mt_alu());
+    MT_RUN(1, mt_write_wt(FB2));
+    MT_RUN(2, mt_read(FB0));
+    MT_RUN(3, mt_copy(FB2, FB0));
+    MT_RUN(4, (mt_copy(P0A(FB2), FB0), oc_wb(P0A(FB2), FB_BYTES)));
+    MT_RUN(5, mt_flush_only(P0A(FB2)));
+    MT_RUN(6, mt_copy_line_wt(FB2, FB0));
+    MT_RUN(7, mt_copy_line_movca(P0A(FB2), FB0));
+    MT_RUN(8, mt_copy_line_sq(FB2, FB0));
+    MT_RUN(9, mt_read(FB0));
+    MT_RUN(10, mt_pref(FB0));
+    MT_RUN(11, mt_copy_pref(FB2, FB0));
+    MT_RUN(12, mt_copy_pref1(FB2, FB0));
+    MT_RUN(13, mt_compute());
+    MT_RUN(14, mt_compute_pref(FB0));
+}
+
+/* ---- p13 & 2: SD reads running while decode is timed, as sdstream's reader does: is the in-stream decode time the bus, or something else? */
+#define RD_TASK 0x2Fu
+#define TCB_OF(id) (0x8E8D53ACu + (u32)(id) * 0x40u)
+#define FW_STA_TSK 0x804D026Cu
+#define FW_SD_RDCORE 0x8067D108u
+#define SD_BUSY0 (*(volatile u32 *)0x8EAAC970u)
+#define RBUF 0x8F900000u
+static volatile u32 rd_stop, rd_done, rd_n, rd_bad, rd_counts;
+void rd_main(void)
+{
+    u32 seq = 0, due = now_counts();
+    while (!rd_stop) {
+        volatile int cnt = 130;
+        int r; u32 c0 = now_counts();
+        R32(0x8EAD1254u) = 0x00000100u;
+        SD_BUSY0 = 1;
+        r = ((int (*)(u32, void *, volatile int *, u32, int))FW_SD_RDCORE)(0, (void *)RBUF, &cnt, 0x10000u + (seq & 255u) * 256u, 65);
+        SD_BUSY0 = 0;
+        rd_counts += now_counts() - c0;
+        if ((short)r != 0 || cnt != 130) rd_bad++;
+        oc_inval(RBUF, 130 * 512);
+        rd_n++; seq++;
+        due += 208125u;                       /* 16.667 ms */
+        while ((s32)(now_counts() - due) < 0) dly_tsk(1);
+    }
+    rd_done = 1;
+    ((void (*)(void))0x804D027Cu)();
+}
+__asm__(".text\n.align 2\n_rd_entry:\n  mov.l 1f,r15\n  mov.l 2f,r0\n  jmp @r0\n  nop\n  .align 2\n1: .long 0x8F9B0000\n2: .long _rd_main\n");
+extern void rd_entry(void);
+static u32 rd_saved;
+static int rd_start(void)
+{
+    u32 tcb = TCB_OF(RD_TASK);
+    if ((R32(tcb + 4) >> 16) != 0x10) return -1;
+    rd_saved = R32(tcb + 0x20);
+    R32(tcb + 0x20) = (u32)rd_entry;
+    if (((int (*)(int, int))FW_STA_TSK)((int)RD_TASK, 0)) { R32(tcb + 0x20) = rd_saved; return -1; }
+    return 0;
+}
+static void rd_finish(void)
+{
+    u32 tcb = TCB_OF(RD_TASK);
+    volatile u32 *pr = (volatile u32 *)(RES_BASE + 0xD000u);
+    rd_stop = 1;
+    while ((R32(tcb + 4) >> 16) != 0x10) dly_tsk(1);
+    R32(tcb + 0x20) = rd_saved;
+    pr[5] = rd_n; pr[6] = rd_bad; pr[7] = rd_counts;
 }
 
 int main(void)
@@ -88,7 +206,7 @@ int main(void)
     ST(D_VARIANT) = variant; ST(D_NBUF) = nbuf; ST(D_PARAM_LOOPS) = loops; ST(D_PARAM_CRC) = crcm;
     ST(D_PARAM_DISPLAY) = disp;
     if (src > 1 || slot > 1 || (s32)lba < 0 || nsect > DEC_STREAM_MAX / 512 || (src == 1 && nsect < 1) ||
-        loops < 1 || loops > 100 || variant > 2 || (nbuf != 2 && nbuf != 3) || crcm > 2 || disp > 1 ||
+        loops < 1 || loops > 100 || variant > 4 || (nbuf != 2 && nbuf != 3) || crcm > 2 || disp > 1 ||
         pace > 1000 || hold > 30000 || maxf > MAXFR || gate > 2) { st_end(PROG_DECBENCH, E_PARAM); return 0; }
 
     crc32_init();
@@ -140,6 +258,7 @@ int main(void)
     rnv_tables_init();
     t_start = tick();
     if (variant == 2) rnvref_init(&rd, (u8 *)FB0, (u8 *)FB1);
+    else if (variant == 3) rnv_state_init(&st, (u8 *)P0A(FB0), (u8 *)P0A(FB1), (u8 *)P0A(FB2), (int)nbuf);
     else rnv_state_init(&st, (u8 *)FB0, (u8 *)FB1, (u8 *)FB2, (int)nbuf);
     ST(D_BLACK_MS) = tick() - t_start;
     if (disp) {
@@ -150,6 +269,10 @@ int main(void)
         last_flip = tick();
     }
 
+    { volatile u32 *pr = (volatile u32 *)(RES_BASE + 0xD000u);   /* read-only register snapshot, read by decbench.py */
+      pr[0] = R32(0xFF00001Cu); pr[1] = R32(0xFF000010u); pr[2] = R32(0xFF000038u); pr[3] = R32(0xFF00003Cu); pr[4] = R32(0xFF000024u); }
+    if (CTL_P(13) & 1) memtest();
+    if (CTL_P(13) & 2) { if (rd_start()) { st_end(PROG_DECBENCH, E_PARAM); return 0; } dly_tsk(30); }
     ST(ST_STAGE) = 5;
     t_start = tick();
     for (lp = 0; lp < loops && err == E_OK; lp++) {
@@ -160,7 +283,8 @@ int main(void)
             } else {
                 for (i = 0; i < nbuf; i++) if (disp && (u32)st.buf[i] != front) wait_reuse(st.buf[i], 1);
                 /* black reset; with display on, the shown buffer turns black for one frame between loops */
-                rnv_state_init(&st, (u8 *)FB0, (u8 *)FB1, (u8 *)FB2, (int)nbuf);
+                if (variant == 3) rnv_state_init(&st, (u8 *)P0A(FB0), (u8 *)P0A(FB1), (u8 *)P0A(FB2), (int)nbuf);
+                else rnv_state_init(&st, (u8 *)FB0, (u8 *)FB1, (u8 *)FB2, (int)nbuf);
             }
         }
         for (i = 0; i < nf; i++) {
@@ -175,9 +299,10 @@ int main(void)
             c0 = now_counts();
             if (variant == 2) out = rnvref_decode(&rd, (const u8 *)fptr[i], flen[i]);
             else {
-                e = variant == 1 ? rnvp_decode(&st, (const u8 *)fptr[i], flen[i])
+                e = variant == 4 ? rnvf_decode(&st, (const u8 *)fptr[i], flen[i]) : variant == 1 ? rnvp_decode(&st, (const u8 *)fptr[i], flen[i])
                                  : rnvo_decode(&st, (const u8 *)fptr[i], flen[i]);
                 out = st.buf[st.last];
+                if (variant == 3) oc_wb((u32)out, FB_BYTES);
             }
             c1 = now_counts();
             dt = c1 - c0;
@@ -218,6 +343,7 @@ int main(void)
         }
         ST(D_LOOPS_DONE) = lp + (err == E_OK ? 1 : 0);
     }
+    if (CTL_P(13) & 2) rd_finish();
     ST(D_MS_TOTAL) = tick() - t_start;
     ST(D_TMIN) = tmin; ST(D_TMAX) = tmax; ST(D_TSUM_LO) = sum_lo; ST(D_TSUM_HI) = sum_hi;
     ST(D_NTIMED) = ST(D_DECODES);

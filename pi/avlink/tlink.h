@@ -30,7 +30,8 @@ typedef struct {
     uint16_t silent_ms;       /* Pi silent longer than this -> IDLE instead of NOT_READY (100) */
     uint16_t stale_ms;        /* complete, never-read, not newest slot is evicted after this (200) */
     uint8_t status_hz;        /* periodic STATUS rate (20) */
-    uint8_t rsv[7];
+    uint8_t whole_sf;         /* 0 leave as it is, 1 off, 2 on: Teensy holds only before sector 0, until the superframe is complete (no mid-read holds) */
+    uint8_t rsv[6];
 } tl_config;                  /* 16 B */
 
 /* STATUS payload, Teensy -> Pi. Credits: free_sectors - (sectors sent - rx_sectors), same for slots. */

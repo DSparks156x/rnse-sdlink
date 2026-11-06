@@ -167,7 +167,7 @@ class Bench:
         uploaded = self._boot_resident()
         load_id = int(time.time() * 1000) & 0x7FFFFFFF
         ctl = L.ctl_words(params)
-        ms_usb = sdfast.send_image(load_id, base, img, base, win, ctl)
+        ms_usb, lba = sdfast.send_image(load_id, base, img, base, win, ctl)
         stamp = os.path.join(OUT, '.%s.uploaded' % prog)
         try:
             os.remove(stamp)                                        # the image in RAM is about to change
@@ -181,22 +181,23 @@ class Bench:
             entry = self.next_slot()
             self.write_block(entry, bytes(tr))
         self.poke(L.STAT_BASE, 0)
-        self.poke(L.SDBOOT_ARG, L.SDBOOT_LBA)
+        self.poke(L.SDBOOT_ARG, lba)
         self.bus.poke(L.TCB159 + L.ENTRY_OFF, entry)
+        res = None
         try:
             self.bus.send([0xB8, 0x5A, 0, 0, 0, 0, 0, 0])
-            line = sdfast.wait_served(1.5)                          # the Pi saw the unit read every sector
-        except sdfast.FastFail as e:
-            line = 'no reply (%s)' % e
+            end = time.monotonic() + 1.5
+            while time.monotonic() < end:                           # the id is written by the running bootstrap: proof sta_tsk has happened
+                res = struct.unpack('>8I', self.read(L.SDBOOT_RES, 32))
+                if res[0] == sdfast.RES_MAGIC and res[1] == load_id and res[2] >= 2:
+                    break
+                time.sleep(0.01)
         finally:
-            self.bus.poke(L.TCB159 + L.ENTRY_OFF, L.DOOM_ENTRY)
-        res = None
-        end = time.monotonic() + 1.0
-        while time.monotonic() < end:                               # the result word is written before the jump
-            res = struct.unpack('>8I', self.read(L.SDBOOT_RES, 32))
-            if res[0] == sdfast.RES_MAGIC and res[1] == load_id and res[2] >= 2:
-                break
-            time.sleep(0.02)
+            self.bus.poke(L.TCB159 + L.ENTRY_OFF, L.DOOM_ENTRY)     # not before that proof: a late sta_tsk would otherwise start Doom
+        try:
+            line = sdfast.wait_served(0.2)
+        except sdfast.FastFail:
+            line = '(no served line)'
         if not (res and res[0] == sdfast.RES_MAGIC and res[1] == load_id and res[2] == sdfast.CODE_JUMP):
             code = res[2] if res else 0
             msg = 'bootstrap: %s (code %d, id %08X want %08X, tries %d, Pi said: %s)' % (

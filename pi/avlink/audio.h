@@ -10,6 +10,7 @@
 #include <stdint.h>
 #include <stddef.h>
 
+#define AUDIO_PRIME_MS 50
 typedef struct {
     int fd;              /* -1: no input (silence) */
     int be;              /* input is big-endian */
@@ -19,6 +20,9 @@ typedef struct {
     size_t have, cap;
     uint64_t frames_in, frames_silence, frames_dropped;
     int gain_q15;   /* 0 or 32768 = unity */
+    int primed;     /* live: margin reached, see audio_take */
+    uint64_t raw_bytes;  /* everything read from the input */
+    int last_arrival;    /* set by a read, cleared by the tick clock: audio is flowing */
 } audio_stage;
 
 int audio_open(audio_stage *a, const char *path, int be, int live);   /* path NULL = silence */

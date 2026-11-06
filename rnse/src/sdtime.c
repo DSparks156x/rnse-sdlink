@@ -27,6 +27,7 @@
  *      0x800 = delayed DMA start: the copy does not start the DMA itself (806832D4 mov #1,r5 -> #0); a hook in the wait call
  *      (literal 806834E8) waits for the first data, then starts it. For auto-request DCR values, which have no pacing,
  *      0x1000 = CPU copy: with 0x800, the hook reads the port itself instead of starting the DMA (measurement; uses all the CPU),
+ *      0x2000 = trace: with 0x800, the hook times every DMA count change during the read (last call of the run is kept),
  *      p8..p13 DCR values.
  * STAT: 8..15 header, 16.. timing (min, max per row), 40..47 mem, 64.. passes (R_N words each), 280.. dump (addr, value). */
 #include "rnse.h"
@@ -305,6 +306,28 @@ static void pio_read(void)
         hook_seen++;
     }
 }
+#define ST_TR 520u                                  /* 32 histogram words, 2 summary, then 32 gaps (position, ticks) */
+static volatile u32 tr_on;
+static void trace_dma(u32 total)
+{
+    u32 i, last = R32(DMA_CH + 0x20), tl = now_counts(), t0 = tl, big = 0, ng = 0;
+    for (i = 0; i < 32; i++) ST(ST_TR + i) = 0;
+    while ((s32)(now_counts() - t0) < 12488 * 60) {
+        u32 v = R32(DMA_CH + 0x20);
+        if (v != last) {
+            u32 t = now_counts(), dt = t - tl, m = last - v, b = m ? dt / m : 31;
+            ST(ST_TR + (b > 31 ? 31 : b)) += m;
+            if (dt > 12u) {                             /* 12 ticks, about 1 us: a pause, not a slow word */
+                big += dt;
+                if (ng < 32) { ST(ST_TR + 34 + 2 * ng) = total - v; ST(ST_TR + 35 + 2 * ng) = dt; ng++; }
+            }
+            last = v; tl = t;
+            if (!v) break;
+        }
+    }
+    ST(ST_TR + 32) = now_counts() - t0;
+    ST(ST_TR + 33) = big | (ng << 24);
+}
 static int start_hook(int tmo)
 {
     if (arm && pio_on) { arm = 0; pio_read(); }
@@ -314,6 +337,7 @@ static int start_hook(int tmo)
         while ((s32)(now_counts() - t0) < 12488 * 5) if (R16(SD_BASE + 0x1E) & 0x100u) { ok = 1; break; }
         if (ok) hook_seen++; else hook_miss++;
         R32(DMA_CH + 0x2C) = 1;
+        if (tr_on) trace_dma(pio_n << 8);
     }
     return ((int (*)(int))0x806539FAu)(tmo);
 }
@@ -413,6 +437,7 @@ int main(void)
             sync_code(COPY_OF(0x806832D4u), 2); sync_code(COPY_OF(0x806834E8u), 4);
             use_hook = 1;
             pio_on = (CTL_P(7) & 0x1000) ? 1 : 0;
+            tr_on = (CTL_P(7) & 0x2000) ? 1 : 0;
         }
         if (CTL_P(7) & 0x400) R16(SD_BASE + 0xE4) = 0x0101u;
         ST(SB_ERRDETAIL) = (u32)R16(SD_BASE + 0xE4) << 16;

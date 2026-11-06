@@ -50,12 +50,10 @@ Knobs K = {
 // ---------------------------------------------------------------- live stream pool (SPEC 1.7, 5.1)
 // Wire images from the Pi, 528 B each: OCRAM (DMAMEM, cached; only the CPU reads it -- the read engine copies an
 // image into imgs[] in DTCM before the eDMA sees it, so no cache maintenance is needed) + a DTCM bank.
-#define POOL_OCRAM 880
-#define POOL_DTCM  192
-DMAMEM static AvsSector pool_ocram[POOL_OCRAM] __attribute__((aligned(32)));
-static AvsSector pool_dtcm[POOL_DTCM];
+DMAMEM static AvsSector pool_ocram[AVS_POOL_OCRAM] __attribute__((aligned(32)));
+static AvsSector pool_dtcm[AVS_POOL_DTCM];
 static AvsSector *const pool_banks[2] = {pool_ocram, pool_dtcm};
-static const uint16_t pool_bank_n[2] = {POOL_OCRAM, POOL_DTCM};
+static const uint16_t pool_bank_n[2] = {AVS_POOL_OCRAM, AVS_POOL_DTCM};
 static uint32_t avs_now(void) { return micros(); }
 static void avs_tx(const uint8_t *p, int n) { if (Serial) Serial.write(p, (size_t)n); }
 
@@ -74,7 +72,7 @@ static const uint8_t FXPIN[6] = {FX_CLK, FX_CMD, FX_DAT0, FX_DAT0 + 1, FX_DAT0 +
 // ---------------------------------------------------------------- state
 static DMAChannel dtx(false), crx(false), drx(false);
 #define CRING_WORDS 2048u
-#define DRING_WORDS 16384u
+#define DRING_WORDS 1024u                    // monitor/loopback sniff only (idle in card mode, lbk 0). Was 64 KB, plus a 51 KB alignment hole: now stream pool
 static uint32_t cring[CRING_WORDS] __attribute__((aligned(CRING_WORDS * 4)));
 static uint32_t dring[DRING_WORDS] __attribute__((aligned(DRING_WORDS * 4)));
 static volatile uint32_t crx_laps, drx_laps;
@@ -127,7 +125,7 @@ static const uint8_t *small_ptr; static int small_len;
 static Img fast; static uint8_t fast_ready, fast_bus4;
 
 // log ring
-#define LOG_N 512
+#define LOG_N 100                            // console command log, off by default (K.log). Was 20 KB
 static LogRec logr[LOG_N];
 static volatile uint16_t log_head, log_tail;
 volatile uint32_t fx_log_dropped;
@@ -388,7 +386,7 @@ FASTRUN static void start_read(uint32_t lba, uint8_t multi, const uint8_t *small
   if (!drive_ok) return;
   rd_multi = multi; rd_small = small ? 1 : 0; small_ptr = small; small_len = slen;
   rd_next_lba = lba; built_cnt = 0; rd_hold = 0;
-  AVS.read_begin();
+  AVS.read_begin(lba);                     // anchor ownership to the command, not speculative queued images
   rd_active = 1;
   SHIFTCTL(0) = s0ctl | SCTL_PINCFG(3);      // drive idle ones until the first image (start-bit hold)
   NVIC_SET_PENDING(IRQ_SOFTWARE);
@@ -413,6 +411,8 @@ static inline uint32_t stat(int app) {
 }
 static inline int illegal(void) { C.illegal++; if (K.illegal) pend_err |= R1_ILLEGAL_CMD; return 0; }
 
+static uint8_t host_reset_seen;              // CMD0 since this firmware started; see resume in card_cmd
+
 static void card_reset(void) {
   stop_read();
   q_n = 0; tx_start = 0;
@@ -424,6 +424,14 @@ static void card_reset(void) {
 FASTRUN static int card_cmd(uint8_t idx, uint32_t arg, uint8_t app) {
   uint8_t r[6];
   uint8_t st = S.card_state;
+  // We restarted (Pi reboot dropped USB power, reflash) under a host that already mounted us: it never re-inits by itself, it just goes on reading
+  // (bench: 0 commands while idle, then failed reads for ever). A data-phase command before any CMD0 can only come from such a host: carry on as selected.
+  // Also after a power cycle or sleep: the host may keep polling with no CMD0 (bench 2026-11-05: CMD13 once a second, unanswered, for ever). In IDLE a host doing a real init only sends CMD0, CMD8, CMD55/ACMD41, so this can't take one over.
+  if (st == ST_IDLE && !app && (idx == 16 || idx == 17 || idx == 18 || (idx == 13 && (arg >> 16) == CARD_RCA))) {
+    set_width(1);
+    st = S.card_state = ST_TRAN;
+    log_event(0x52, idx);
+  }
   if (app) {
     switch (idx) {
       case 41: {
@@ -466,6 +474,7 @@ FASTRUN static int card_cmd(uint8_t idx, uint32_t arg, uint8_t app) {
   switch (idx) {
     case 0:
       C.cmd0++;
+      host_reset_seen = 1;
       card_reset();
       return 0;
     case 8:

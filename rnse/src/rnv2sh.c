@@ -14,6 +14,21 @@
 #define DECODE_FN rnvo_decode
 #define PF(p) ((void)0)
 #endif
+/* RNV_FAST = rnvf_decode: same bitstream, same pixels, fewer instructions (bench 2026-11-05: IPC is about 1 and memory is under a quarter of the time).
+ * Coefficients through a register bit window and a level/sign table, no sign branch, residual added straight in the second transform pass. */
+#ifndef RNV_FAST
+#define RNV_FAST 0
+#endif
+#if RNV_FAST
+#undef DECODE_FN
+#define DECODE_FN rnvf_decode
+#endif
+/* PREF does not stall (bench 2026-11-05: 56 ns against 150 ns for a read miss, a full-frame reference copy drops 5.70 -> 4.31 ms). Guessing the next pair's reference at coded blocks was worse: not done. */
+#if RNV_FAST && !defined(RNV_HOST)
+#define RP(p) __builtin_prefetch((const void *)(p))
+#else
+#define RP(p) ((void)0)
+#endif
 
 #define AI static inline __attribute__((always_inline))
 #define S RNV_STRIDE
@@ -93,6 +108,18 @@ AI void copy8(rnv_u8 *d, int ds, const rnv_u8 *s, int ss)
         d += ds; s += ss;
     }
 }
+/* copy from the reference: same, with the next row on its way before this one is read */
+AI void copy8r(rnv_u8 *d, int ds, const rnv_u8 *s, int ss)
+{
+    int r;
+    _Pragma("GCC unroll 8") for (r = 0; r < 8; r++) {
+        rnv_u32 a, b, c, e;
+        RP(s + ss);
+        a = LDW(s); b = LDW(s + 4); c = LDW(s + 8); e = LDW(s + 12);
+        STW(d, a); STW(d + 4, b); STW(d + 8, c); STW(d + 12, e);
+        d += ds; s += ss;
+    }
+}
 AI void fill8(rnv_u8 *d, int ds, rnv_u32 v)
 {
     int r;
@@ -103,12 +130,14 @@ AI void rawcopy(rnv_u8 *d, const rnv_u8 *s)
 {
     rnv_u32 k = (rnv_u32)(unsigned long)s & 3u;
     int r;
-    if (!k) { copy8(d, S, s, 16); return; }
+    if (!k) { copy8r(d, S, s, 16); return; }
     {
         const rnv_u8 *b = s - k;
         rnv_u32 sh = 8 * k, rs = 32 - sh, a0 = LDW(b);
         _Pragma("GCC unroll 8") for (r = 0; r < 8; r++) {
-            rnv_u32 a1 = LDW(b + 4), a2 = LDW(b + 8), a3 = LDW(b + 12), a4 = LDW(b + 16);
+            rnv_u32 a1, a2, a3, a4;
+            RP(b + 36);
+            a1 = LDW(b + 4); a2 = LDW(b + 8); a3 = LDW(b + 12); a4 = LDW(b + 16);
             STW(d, (a0 << sh) | (a1 >> rs)); STW(d + 4, (a1 << sh) | (a2 >> rs));
             STW(d + 8, (a2 << sh) | (a3 >> rs)); STW(d + 12, (a3 << sh) | (a4 >> rs));
             a0 = a4; b += 16; d += S;
@@ -121,7 +150,7 @@ AI void rawcopy(rnv_u8 *d, const rnv_u8 *s)
  *   even: E[w] = SW(xs+2w) = a_w,              O[w] = SW(xs+2w+1) = ODDW(a_w, a_w+1)
  *   odd:  E[w] = ODDW(a_w, a_w+1),             O[w] = a_w+1
  * integer: E | h: AVG4(E,O) | v: AVG4(E_r, E_r+1) | hv: AVG4(AVG4(E_r,O_r), AVG4(E_r+1,O_r+1))  (= reference) */
-#define LD5(b) rnv_u32 a0 = LDW(b), a1 = LDW((b) + 4), a2 = LDW((b) + 8), a3 = LDW((b) + 12), a4 = LDW((b) + 16)
+#define LD5(b) RP((b) + S); RP((b) + S + 16); rnv_u32 a0 = LDW(b), a1 = LDW((b) + 4), a2 = LDW((b) + 8), a3 = LDW((b) + 12), a4 = LDW((b) + 16)
 #define EO(odd) \
     rnv_u32 E0 = odd ? ODDW(a0, a1) : a0, E1 = odd ? ODDW(a1, a2) : a1, E2 = odd ? ODDW(a2, a3) : a2, \
             E3 = odd ? ODDW(a3, a4) : a3; \
@@ -175,7 +204,7 @@ static void mc(rnv_u8 *d, int ds, const rnv_u8 *refblk, int mvx, int mvy)
         }
     } else {
         switch (fx | (fy << 1)) {
-        case 0: copy8(d, ds, b, S); break;
+        case 0: copy8r(d, ds, b, S); break;
         case 1: mc_case(d, ds, b, 0, 1, 0); break;
         case 2: mc_case(d, ds, b, 0, 0, 1); break;
         default: mc_case(d, ds, b, 0, 1, 1); break;
@@ -244,6 +273,78 @@ AI void add_cdc(rnv_u8 *pr, const rnv_u8 *c, const int sh)
         }
 }
 
+#if RNV_FAST
+/* First pass (columns), clearing the coefficients as it goes; second pass (rows) adds to the prediction bytes directly.
+ * Only for |residual| <= 384, which sum(|coef|) <= 1536 guarantees: same result as iwht4 + add_y / add_c. Byte order in memory is Y0 Cb Y1 Cr on the SH and on the host. */
+AI void wht_p1(rnv_s32 *c, rnv_s32 *t)
+{
+    int i;
+    _Pragma("GCC unroll 4") for (i = 0; i < 4; i++) {
+        rnv_s32 a = c[i], b = c[4 + i], d = c[8 + i], e = c[12 + i];
+        rnv_s32 s0 = a + b, s1 = a - b, t0 = d + e, t1 = d - e;
+        c[i] = 0; c[4 + i] = 0; c[8 + i] = 0; c[12 + i] = 0;
+        t[i] = s0 + t0; t[4 + i] = s0 - t0; t[8 + i] = s1 - t1; t[12 + i] = s1 + t1;
+    }
+}
+#define BYA(p, o) ((p) = CL[(int)(p) + (o)])
+#define WHT_FN static __attribute__((noinline))
+typedef struct { rnv_u32 wb, wn; const rnv_u8 *wq; int pos; rnv_u32 sl; } rnv_win;
+/* z * 4: stored directly as a byte offset into cf */
+static const rnv_u8 ZZ4[16] = {0, 4, 16, 32, 20, 8, 12, 24, 36, 48, 52, 40, 28, 44, 56, 60};
+/* Runs until the last coefficient of a subblock (returns 0). Stops before consuming anything on an escape or a code over 10 bits (rnv_cf level >= LVMAX, returns 1), or on a run past the block (returns 2). */
+static __attribute__((noinline)) int coefs_fast(rnv_win *w, rnv_s32 *cf, const rnv_s32 *lvt)
+{
+    const rnv_u32 *CF = rnv_cf;
+    const rnv_u8 *zz = ZZ4, *q = w->wq;
+    rnv_u32 wb = w->wb, wn = w->wn, sl = w->sl, ent, lv, l;
+    rnv_s32 v;
+    int pos = w->pos, r = 0;
+    do {
+        ent = CF[wb >> (32 - RNV_L1BITS)];
+        lv = (ent >> 16) & 0xFF;
+        if (__builtin_expect(lv >= RNV_LVMAX, 0)) { r = 1; break; }
+        l = ent & 0xFF;
+        pos += (ent >> 8) & 0xFF;
+        if (__builtin_expect(pos > 15, 0)) { pos -= (ent >> 8) & 0xFF; r = 2; break; }
+        wb <<= l;
+        v = lvt[2 * lv + (wb >> 31)];
+        wb <<= 1;
+        wn -= l + 1;
+        sl += lv;
+        *(rnv_s32 *)((char *)cf + zz[pos]) = v;
+        if (wn < 17) { RP(q + 32); wb |= LDH(q) << (16 - wn); q += 2; wn += 16; }
+    } while (!(ent >> 24));
+    w->wb = wb; w->wn = wn; w->wq = q; w->pos = pos; w->sl = sl;
+    return r;
+}
+WHT_FN void wht_add_y(rnv_s32 *c, rnv_u8 *pr, const rnv_u8 *CL)
+{
+    rnv_s32 t[16];
+    const rnv_s32 *q = t;
+    int y;
+    wht_p1(c, t);
+    _Pragma("GCC unroll 4") for (y = 0; y < 4; y++, q += 4, pr += 16) {
+        rnv_s32 a = q[0], b = q[1], d = q[2], e = q[3];
+        rnv_s32 s0 = a + b + 2, s1 = a - b + 2, t0 = d + e, t1 = d - e;
+        BYA(pr[0], (s0 + t0) >> 2); BYA(pr[2], (s0 - t0) >> 2);
+        BYA(pr[4], (s1 - t1) >> 2); BYA(pr[6], (s1 + t1) >> 2);
+    }
+}
+WHT_FN void wht_add_c(rnv_s32 *c, rnv_u8 *pr, const rnv_u8 *CL)   /* pr = first sample: Cb at +1, Cr at +3 */
+{
+    rnv_s32 t[16];
+    const rnv_s32 *q = t;
+    int y;
+    wht_p1(c, t);
+    _Pragma("GCC unroll 4") for (y = 0; y < 4; y++, q += 4, pr += 16) {
+        rnv_s32 a = q[0], b = q[1], d = q[2], e = q[3];
+        rnv_s32 s0 = a + b + 2, s1 = a - b + 2, t0 = d + e, t1 = d - e;
+        BYA(pr[0], (s0 + t0) >> 2); BYA(pr[4], (s0 - t0) >> 2);
+        BYA(pr[8], (s1 - t1) >> 2); BYA(pr[12], (s1 + t1) >> 2);
+    }
+}
+#endif
+
 /* ------------------------------------------------------------------ frame */
 static rnv_u32 rd32(const rnv_u8 *p) { return ((rnv_u32)p[0] << 24) | ((rnv_u32)p[1] << 16) | ((rnv_u32)p[2] << 8) | p[3]; }
 
@@ -274,6 +375,10 @@ int DECODE_FN(rnv_state *s, const rnv_u8 *f, rnv_u32 len)
     int qp, step, blk = 0, x0 = 0, y0 = 0, off = 0, mvx = 0, mvy = 0, fy = 128, fu = 128, fv = 128, code = 0, bad = 0;
     const int sat = s->nbuf - 1;
     int i;
+#if RNV_FAST
+    rnv_s32 lvt[2 * RNV_LVMAX + 2];
+    rnv_win W;
+#endif
 
     if (len < 24) return fail(s, RNV_E_LEN, 0);
     if (f[0] != 'R' || f[1] != '2') return fail(s, RNV_E_MAGIC, 0);
@@ -289,6 +394,13 @@ int DECODE_FN(rnv_state *s, const rnv_u8 *f, rnv_u32 len)
     BR_INIT(w2, p2, e2, f + 24 + l0 + l1, l2);
     s3 = f + 24 + l0 + l1 + l2; s3e = s3 + l3;
     for (i = 0; i < 16; i++) cf[i] = 0;
+#if RNV_FAST
+    for (i = 1; i <= RNV_LVMAX; i++) { lvt[2 * i] = i * step; lvt[2 * i + 1] = -(i * step); }
+#define WSYNC() ((rnv_u32)(W.wq - w2) * 8 - W.wn)
+#define WLOAD(p) do { rnv_u32 p_ = (p); W.wq = w2 + ((p_ >> 3) & ~3u); W.wb = LDW(W.wq) << (p_ & 31); W.wn = 32 - (p_ & 31); W.wq += 4; \
+                      if (W.wn < 17) { W.wb |= LDH(W.wq) << (16 - W.wn); W.wq += 2; W.wn += 16; } } while (0)
+    WLOAD(p2);
+#endif
 
     while (blk < RNV_NB) {
         rnv_u32 run = ue(w0, &p0, &bad);
@@ -298,7 +410,7 @@ int DECODE_FN(rnv_state *s, const rnv_u8 *f, rnv_u32 len)
             int a = age[blk];
             if (a < sat) {
                 if (RNV_PF && !(x0 & 8)) { int r; for (r = 0; r < 8; r++) PF(ref + off + 32 + r * S); }
-                copy8(cur + off, S, ref + off, S);
+                copy8r(cur + off, S, ref + off, S);
                 age[blk] = (rnv_u8)(a + 1);
             }
             ADV();
@@ -328,8 +440,8 @@ int DECODE_FN(rnv_state *s, const rnv_u8 *f, rnv_u32 len)
             if (!cbp) { mc(cur + off, S, ref + off, mvx, mvy); age[blk] = 0; ADV(); continue; }
             mc(pb, 16, ref + off, mvx, mvy);
         } else if (mode == ZRES) {
-            if (!cbp) { copy8(cur + off, S, ref + off, S); age[blk] = 0; ADV(); continue; }
-            copy8(pb, 16, ref + off, S);
+            if (!cbp) { copy8r(cur + off, S, ref + off, S); age[blk] = 0; ADV(); continue; }
+            copy8r(pb, 16, ref + off, S);
         } else {
             rnv_u32 o;
             fy += se(w1, &p1, &bad); fu += se(w1, &p1, &bad); fv += se(w1, &p1, &bad);
@@ -338,6 +450,65 @@ int DECODE_FN(rnv_state *s, const rnv_u8 *f, rnv_u32 len)
             if (!cbp) { fill8(cur + off, S, o); age[blk] = 0; ADV(); continue; }
             fill8(pb, 16, o);
         }
+#if RNV_FAST
+        /* coded subblocks in bit order 0..7: Y TL TR BL BR, Cb top, Cb bottom, Cr top, Cr bottom */
+        for (i = 0; i < 8; i++) {
+            int pos;
+            rnv_u32 sl;
+            if (!(cbp & (1 << i))) continue;
+            W.pos = -1; W.sl = 0;
+            for (;;) {
+                int r = coefs_fast(&W, cf, lvt);
+                rnv_u32 q, ent, x;
+                int lv, last;
+                rnv_s32 v;
+                if (!r) break;
+                if (r == 2) BAD(RNV_E_COEF);
+                q = WSYNC();
+                ent = rnv_cf[W.wb >> (32 - RNV_L1BITS)];
+                if (((ent >> 16) & 0xFF) == RNV_LVMAX) {      /* an escape with a short code */
+                    q += ent & 0xFF;
+                    lv = RNV_LVMAX; W.pos += (ent >> 8) & 0xFF; last = (int)(ent >> 24);
+                } else {                                  /* code longer than 10 bits */
+                    int e = hslow(&rnv_hc, peek32(w2, q), &q);
+                    if (e < 0) BAD(RNV_E_HUFF);
+                    lv = (e & 15) + 1; W.pos += ((e >> 4) & 15) + 1; last = e >> 8;
+                }
+                if (W.pos > 15) BAD(RNV_E_COEF);
+                x = 0;
+                if (lv == RNV_LVMAX) {                    /* escape: level += ue(), then the sign */
+                    x = ue(w2, &q, &bad);
+                    if (bad || x > 4096) BAD(RNV_E_COEF);
+                }
+                v = (lv + (int)x) * step;
+                W.sl += (rnv_u32)lv + x;
+                if (getb(w2, &q, 1)) v = -v;
+                WLOAD(q);
+                cf[ZZ[W.pos]] = v;
+                if (last) break;
+            }
+            pos = W.pos; sl = W.sl;
+            if (pos == 0) {                                /* DC only: constant residual */
+                int dc = (cf[0] + 2) >> 2;
+                cf[0] = 0;
+                if (dc < -384) dc = -384; else if (dc > 384) dc = 384;   /* never for valid streams */
+                if (i < 4) add_ydc(pb + (i >> 1) * 64 + (i & 1) * 8, CL + dc);
+                else add_cdc(pb + (i & 1) * 64, CL + dc, i < 6 ? 16 : 0);
+                continue;
+            }
+            if (__builtin_expect(sl * (rnv_u32)step > 1536, 0)) {   /* |res| could leave the clamp table: never for valid streams */
+                int k;
+                iwht4(cf, res);
+                for (k = 0; k < 16; k++) { cf[k] = 0; res[k] = res[k] < -384 ? -384 : res[k] > 384 ? 384 : res[k]; }
+                if (i < 4) add_y(pb + (i >> 1) * 64 + (i & 1) * 8, res, CL);
+                else if (i < 6) add_c(pb + (i & 1) * 64, res, CL, 16);
+                else add_c(pb + (i & 1) * 64, res, CL, 0);
+                continue;
+            }
+            if (i < 4) wht_add_y(cf, pb + (i >> 1) * 64 + (i & 1) * 8, CL);
+            else wht_add_c(cf, pb + (i & 1) * 64 + (i < 6 ? 1 : 3), CL);
+        }
+#else
         /* coded subblocks in bit order 0..7: Y TL TR BL BR, Cb top, Cb bottom, Cr top, Cr bottom */
         for (i = 0; i < 8; i++) {
             int pos = -1, n = 0, dc;
@@ -394,10 +565,14 @@ int DECODE_FN(rnv_state *s, const rnv_u8 *f, rnv_u32 len)
             else if (i < 6) add_c(pb + (i & 1) * 64, res, CL, 16);
             else add_c(pb + (i & 1) * 64, res, CL, 0);
         }
+#endif
         copy8(cur + off, S, pb, 16);
         age[blk] = 0;
         ADV();
     }
+#if RNV_FAST
+    p2 = WSYNC();
+#endif
     if (p0 > e0 || p1 > e1 || p2 > e2) { code = RNV_E_OVERRUN; goto out_err; }
     s->last = s->cur;
     if (++s->cur == s->nbuf) s->cur = 0;

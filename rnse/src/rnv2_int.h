@@ -8,9 +8,11 @@
 #if defined(RNV_HOST) && defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
 static inline rnv_u32 LDW(const void *p) { rnv_u32 v; __builtin_memcpy(&v, p, 4); return __builtin_bswap32(v); }
 static inline void STW(void *p, rnv_u32 v) { v = __builtin_bswap32(v); __builtin_memcpy(p, &v, 4); }
+static inline rnv_u32 LDH(const void *p) { rnv_u16 v; __builtin_memcpy(&v, p, 2); return __builtin_bswap16(v); }
 #else
 #define LDW(p) (*(const rnv_u32 *)(const void *)(p))
 #define STW(p, v) (*(rnv_u32 *)(void *)(p) = (v))
+#define LDH(p) ((rnv_u32)*(const rnv_u16 *)(const void *)(p))
 #endif
 
 #define RNV_PACK(y0, cb, y1, cr) (((rnv_u32)(y0) << 24) | ((rnv_u32)(cb) << 16) | ((rnv_u32)(y1) << 8) | (rnv_u32)(cr))
@@ -24,12 +26,13 @@ static inline void STW(void *p, rnv_u32 v) { v = __builtin_bswap32(v); __builtin
 #define RNV_L1BITS 10
 
 typedef struct {
-    rnv_u16 l1[1 << RNV_L1BITS];   /* (info << 5) | code length, 0 = longer than 10 bits */
+    rnv_u16 l1[1 << RNV_L1BITS];   /* (info << 5) | code length, level LVMAX + 1 = longer than 10 bits */
     int first[18], cnt[18], off[18];
     rnv_u16 info[RNV_NSYM];        /* coef: last<<8 | run<<4 | (level-1); cbp: symbol */
 } rnv_huff;
 
 extern rnv_huff rnv_hc, rnv_hbl, rnv_hbc;
+extern rnv_u32 rnv_cf[1 << RNV_L1BITS];   /* coefficient fast table of rnvf: len | (run + 1) << 8 | level << 16 | last << 24, level LVMAX + 1 = longer than 10 bits */
 extern rnv_u8 rnv_clamp[1024];
 extern rnv_u8 rnv_clz8[256];
 const int *rnv_qstep(void);

@@ -3,6 +3,7 @@
 #include "link.h"
 #include <errno.h>
 #include <fcntl.h>
+#include <limits.h>
 #include <poll.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -60,20 +61,25 @@ uint8_t *link_msg(link_t *l, uint16_t type, uint32_t len)
 
 int link_credits(const link_t *l)
 {
-    if (!l->have_status) return -1;
-    return (int)l->st.free_sectors - (int)(uint32_t)(l->sent_sectors - l->st.rx_sectors);
+    if (!l->have_status || l->credit_error) return -1;
+    uint32_t pending = l->sent_sectors - l->ack_sectors;
+    if (pending > INT_MAX) return -1;
+    return (int)l->st.free_sectors - (int)pending;
 }
 
 int link_slots(const link_t *l)
 {
-    if (!l->have_status) return -1;
-    return (int)l->st.free_slots - (int)(uint32_t)(l->sent_begins - l->st.begun);
+    if (!l->have_status || l->credit_error) return -1;
+    uint32_t pending = l->sent_begins - l->ack_begins;
+    if (pending > INT_MAX) return -1;
+    return (int)l->st.free_slots - (int)pending;
 }
 
 size_t link_pending(const link_t *l) { return l->olen - l->opos; }
 
 int link_write(link_t *l)
 {
+    if (l->credit_error) { errno = EPROTO; return -1; }
     while (l->opos < l->olen) {
         ssize_t w = write(l->fd, l->out + l->opos, l->olen - l->opos);
         if (w > 0) { l->opos += (size_t)w; continue; }
@@ -86,10 +92,11 @@ int link_write(link_t *l)
 
 int link_drain(link_t *l, int timeout_ms)
 {
+    if (l->credit_error) { errno = EPROTO; return -1; }
     while (link_pending(l) && timeout_ms > 0) {
         struct pollfd p = {l->fd, POLLOUT | POLLIN, 0};
         if (poll(&p, 1, 10) > 0) {
-            if (p.revents & POLLIN) link_read(l);
+            if ((p.revents & POLLIN) && link_read(l) < 0) return -1;
             if (link_write(l) < 0) return -1;
         }
         timeout_ms -= 10;
@@ -98,12 +105,42 @@ int link_drain(link_t *l, int timeout_ms)
     return link_pending(l) ? -1 : 0;
 }
 
-static void on_msg(link_t *l, uint16_t type, const uint8_t *p, uint32_t len)
+static int credit_fault(link_t *l)
 {
-    if (type == TL_STATUS && len >= 8) {
+    l->credit_error = 1;
+    l->hup = 1;                   /* existing callers terminate rather than continuing with stale credits */
+    errno = EPROTO;
+    return -1;
+}
+
+static int on_msg(link_t *l, uint16_t type, const uint8_t *p, uint32_t len)
+{
+    if (type == TL_STATUS) {
         tl_status s;
-        memset(&s, 0, sizeof s);
-        memcpy(&s, p, len < sizeof s ? len : sizeof s);      /* both ends little-endian */
+        if (len != sizeof s) return credit_fault(l);
+        memcpy(&s, p, sizeof s);      /* both ends little-endian */
+        if (s.ver != 1 || s.size != sizeof s || !s.pool_sectors || s.pool_sectors > 65534u ||
+            s.free_sectors > s.pool_sectors || s.free_slots > 256u)
+            return credit_fault(l);
+        if (!l->have_status) {
+            /* The receiver totals survive DTR reconnects. No credited SF traffic can have been queued yet;
+             * use this snapshot as the connection origin, not as acknowledgements of this process's data.
+             * A no-credit diagnostic that sent before STATUS cannot be safely reconciled here. */
+            if (l->sent_sectors || l->sent_begins) return credit_fault(l);
+            l->ack_sectors = l->ack_begins = 0;
+        } else {
+            uint32_t sectors = s.rx_sectors - l->st.rx_sectors;
+            uint32_t begins = s.begun - l->st.begun;
+            uint32_t pending_sectors = l->sent_sectors - l->ack_sectors;
+            uint32_t pending_begins = l->sent_begins - l->ack_begins;
+            /* Unsigned deltas support ordinary u32 wrap. A reset/backward acknowledgement normally
+             * becomes a huge delta; never reinterpret it as a new origin while data may be in flight. */
+            if (s.pool_sectors != l->st.pool_sectors || pending_sectors > INT_MAX || pending_begins > INT_MAX ||
+                sectors > pending_sectors || begins > pending_begins)
+                return credit_fault(l);
+            l->ack_sectors += sectors;
+            l->ack_begins += begins;
+        }
         l->st = s;
         l->have_status = 1;
         l->n_status++;
@@ -113,18 +150,21 @@ static void on_msg(link_t *l, uint16_t type, const uint8_t *p, uint32_t len)
         l->last_served_t = rd32le(p + 4);
     }
     /* HOST_WRITE / UPLINK / CMDLOG: out of scope here (uplink agent) -- ignored */
+    return 0;
 }
 
 int link_read(link_t *l)
 {
-    int nmsg = 0;
+    if (l->credit_error) { errno = EPROTO; return -1; }
+    int nmsg = 0, hard = 0;
     for (;;) {
         if (l->ilen == l->icap) { l->rx_junk += l->ilen; l->ilen = 0; }
         ssize_t r = read(l->rfd, l->in + l->ilen, l->icap - l->ilen);
         if (r > 0) l->ilen += (size_t)r;
         else if ((r == 0 && !l->is_tty) || (r < 0 && errno != EAGAIN && errno != EINTR)) {
-            /* a raw tty with VMIN=0 returns 0 for "no data"; only EIO (USB unplugged) or EOF on a non-tty is a hangup */
-            if (!l->ilen) { l->hup = 1; return -1; }
+            /* a raw tty with VMIN=0 returns 0 for "no data"; only EIO (USB unplugged) or EOF on a non-tty is a hangup.
+             * Whatever is left in the buffer: with no credits nothing is being written, so nothing else would notice. */
+            hard = 1;
         }
         /* parse: skip console text until the magic */
         size_t i = 0;
@@ -142,11 +182,12 @@ int link_read(link_t *l)
             uint32_t len = rd32le(l->in + i + 8);
             if (len > TL_MAX_PAYLOAD) { i++; l->rx_junk++; continue; }
             if (i + TL_HDR + len > l->ilen) break;
-            on_msg(l, rd16le(l->in + i + 4), l->in + i + TL_HDR, len);
+            if (on_msg(l, rd16le(l->in + i + 4), l->in + i + TL_HDR, len) < 0) return -1;
             nmsg++;
             i += TL_HDR + len;
         }
         if (i) { memmove(l->in, l->in + i, l->ilen - i); l->ilen -= i; }
+        if (hard) { l->hup = 1; return -1; }
         if (r <= 0) break;
     }
     return nmsg;

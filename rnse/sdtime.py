@@ -18,7 +18,8 @@ L.PROG_ID.setdefault('sdtime', 7)
 
 R_N = 16
 ST_TIME, ST_MEM, ST_PASS, ST_DUMP = 16, 56, 64, 300
-NSTAT = 0x800
+NSTAT = 0xA00
+ST_TR = 520
 ST_RATE = 430
 RATE_NAMES = ['ch8', 'ch0', 'ch1', 'ch2', 'ch3', 'ch7', 'ch10', 'ch11', 'ch13', 'ch14', 'ch0 burst', 'ch1 burst', 'ch2 burst', 'ch3 burst', 'ch8+9 together', 'ch12+13 together']
 RATE_N = 4096
@@ -70,6 +71,7 @@ def decode(st):
         p['us_sector'] = p['counts'] / L.TMU_HZ * 1e6 / p['sect'] if p['sect'] else 0
         p['mb_s'] = p['sect'] * 512 / (p['counts'] / L.TMU_HZ) / 1e6 if p['counts'] else 0
         d['passes'].append(p)
+    d['tr'] = w[ST_TR:ST_TR + 98] if len(w) >= ST_TR + 98 else []
     d['rate'] = [w[ST_RATE + 4 * i:ST_RATE + 4 * i + 4] for i in range(16)] if len(w) > ST_RATE + 64 else []
     d['rate_lock'] = w[ST_RATE - 1] if len(w) > ST_RATE else 0
     d['dump'] = [(w[ST_DUMP + 2 * i], w[ST_DUMP + 2 * i + 1]) for i in range(min(d['ndump'], 60))]
@@ -92,6 +94,12 @@ def report(d):
         for (name, n), c in zip(MEM, d['mem']):
             if c:
                 print('    %-26s %8.1f MB/s' % (name, n / (c / L.TMU_HZ) / 1e6))
+    if d['tr'] and d['tr'][32]:
+        tr = d['tr']; tick = 1e6 / L.TMU_HZ; total = sum(tr[:32]); big = tr[33] & 0xFFFFFF; ng = tr[33] >> 24
+        print('  DMA trace, last call: %d transfers in %.1f us; pauses over 1 us: %d, total %.1f us (%.2f us per sector)' % (
+            total, tr[32] * tick, ng, big * tick, big * tick / max(total / 256.0, 1)))
+        print('  ticks per transfer (1 tick = 80 ns): ' + ' '.join('%d:%d' % (i, c) for i, c in enumerate(tr[:32]) if c))
+        print('  first pauses, position in sector and length us: ' + ' '.join('%d:%.1f' % (tr[34 + 2 * i] % 256, tr[35 + 2 * i] * tick) for i in range(min(ng, 32))))
     if any(r[1] for r in d['rate']):
         print('  DMA alone, auto-request, %d transfers (lock ret %X):' % (RATE_N, d['rate_lock']))
         for name, r in zip(RATE_NAMES, d['rate']):
@@ -135,6 +143,7 @@ def main(argv):
     ap.add_argument('--hostmode', action='store_true', help='also set SD +E4=0101 during the copy passes')
     ap.add_argument('--delayed', action='store_true', help='copy starts the DMA only after first data; for auto-request DCR values')
     ap.add_argument('--pio', action='store_true', help='with --delayed: CPU copy instead of DMA (measurement)')
+    ap.add_argument('--trace', action='store_true', help='with --delayed: time each DMA count change during the read')
     ap.add_argument('--once', action='store_true', help='copy only, no retries: the first error stops it and its bits survive')
     a = ap.parse_args(argv)
     import rnse_bench
@@ -149,7 +158,7 @@ def main(argv):
         dcr = [int(x, 16) for x in a.dcr.split(',') if x] if a.read else []
         if len(dcr) > 6:
             ap.error('at most 6 --dcr values')
-        params = make_ctl(mode, a.slot, a.lba, a.sectors, a.chunk, a.timeout, a.clock, dcr, a.once, (0x200 if a.w32 else 0) | (0x400 if a.hostmode else 0) | (0x800 if a.delayed else 0) | (0x1000 if a.pio else 0))
+        params = make_ctl(mode, a.slot, a.lba, a.sectors, a.chunk, a.timeout, a.clock, dcr, a.once, (0x200 if a.w32 else 0) | (0x400 if a.hostmode else 0) | (0x800 if a.delayed else 0) | (0x1000 if a.pio else 0) | (0x2000 if a.trace else 0))
         rnse_bench.log('PLAN sdtime mode %X slot %d lba %d sectors %d chunk %d timeout %d clock %X dcr %s' % (
             mode, a.slot, a.lba, a.sectors, a.chunk, a.timeout, a.clock & 0xFFFFFFFF, ' '.join('%08X' % v for v in dcr)))
         b.start('sdtime', params, tag='mode %X' % mode)

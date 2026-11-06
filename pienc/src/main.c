@@ -92,20 +92,24 @@ static void metrics(const uint8_t *src, const uint8_t *rY, const uint8_t *rU, co
 #define GH_RMS 6
 #define GH_OLD 4
 #define GH_SETTLE 30
+#define GH_Q 16
 typedef struct {
     uint8_t (*old)[GH_OLD][64], *nold; uint8_t (*cur)[64]; uint16_t *age; int started; FILE *f;
     double s_err, s_ghost, a3, a6, a12, a30; int max_err, max_ghost, max_age;
-    int since, peak, settled, ev, setmax; double setsum; int chg_peak;
+    int since, peak, settled, ev, setmax; double setsum; int chg_peak; int settled3, ev3, set3max; double set3sum;
+    /* glass-time view: the frame on the panel at tick i is the newest one whose last byte has crossed the link (4.4e6/60 B per tick) by then */
+    uint8_t *rq[GH_Q]; int fq[GH_Q]; double q, s_gerr, s_gghost; int gmax_err, gmax_ghost, shown;
 } ghost_t;
 static void ghost_init(ghost_t *g, const char *path) {
     memset(g, 0, sizeof *g);
     g->old = malloc(6000 * GH_OLD * 64); g->nold = calloc(6000, 1); g->cur = malloc(6000 * 64); g->age = calloc(6000, 2);
     if (path && strcmp(path, "-")) g->f = fopen(path, "w");
-    if (g->f) fprintf(g->f, "# i nchg nerr nghost age3 age12 since\n");
+    { int i; for (i = 0; i < GH_Q; i++) { g->rq[i] = malloc(800 * 480); g->fq[i] = -1; } }
+    if (g->f) fprintf(g->f, "# i nchg nerr nghost age3 age12 since gerr gghost\n");
 }
 static inline uint32_t sse64(const uint8_t *a, const uint8_t *b) { uint32_t s = 0; int i; for (i = 0; i < 64; i++) { int d = (int)a[i] - b[i]; s += (uint32_t)(d * d); } return s; }
-static void ghost_frame(ghost_t *g, int fn, const uint8_t *rY, const uint8_t *tY) {
-    int by, bx, r, nchg = 0, nerr = 0, ngh = 0, a3 = 0, a12 = 0;
+static void ghost_frame(ghost_t *g, int fn, const uint8_t *rY, const uint8_t *tY, size_t bytes) {
+    int by, bx, r, nchg = 0, nerr = 0, ngh = 0, a3 = 0, a12 = 0, n3 = 0;
     for (by = 0; by < 60; by++) for (bx = 0; bx < 100; bx++) {
         int b = by * 100 + bx, k; uint8_t T[64], R[64]; uint32_t e;
         for (r = 0; r < 8; r++) { memcpy(T + 8 * r, tY + (by * 8 + r) * 800 + bx * 8, 8); memcpy(R + 8 * r, rY + (by * 8 + r) * 800 + bx * 8, 8); }
@@ -117,6 +121,7 @@ static void ghost_frame(ghost_t *g, int fn, const uint8_t *rY, const uint8_t *tY
         }
         memcpy(g->cur[b], T, 64);
         e = sse64(R, T);
+        if (e >= 3 * 3 * 64) n3++;
         if (e >= GH_RMS * GH_RMS * 64) {
             int isg = 0;
             nerr++;
@@ -130,17 +135,32 @@ static void ghost_frame(ghost_t *g, int fn, const uint8_t *rY, const uint8_t *tY
             if (g->age[b] >= 30) g->a30++;
         } else g->age[b] = 0;
     }
+    { /* glass time */
+        int slot = fn % GH_Q, k, best = -1, gerr = 0, gg = 0; const double R = 4.4e6 / 60;
+        g->q += (double)bytes; memcpy(g->rq[slot], rY, 800 * 480); g->fq[slot] = fn + (int)((g->q - 1) / R); g->q -= R; if (g->q < 0) g->q = 0;
+        for (k = 0; k < GH_Q; k++) { int j = fn - k; if (j < 0) break; if (g->fq[j % GH_Q] >= 0 && g->fq[j % GH_Q] <= fn) { best = j % GH_Q; break; } }
+        if (best >= 0) for (by = 0; by < 60; by++) for (bx = 0; bx < 100; bx++) {
+            int b = by * 100 + bx; uint8_t T[64], R8[64]; uint32_t e; const uint8_t *sh = g->rq[best];
+            for (r = 0; r < 8; r++) { memcpy(T + 8 * r, tY + (by * 8 + r) * 800 + bx * 8, 8); memcpy(R8 + 8 * r, sh + (by * 8 + r) * 800 + bx * 8, 8); }
+            e = sse64(R8, T);
+            if (e >= GH_RMS * GH_RMS * 64) { int isg = 0; gerr++; for (k = 0; k < g->nold[b] && !isg; k++) isg = 2 * sse64(R8, g->old[b][k]) < e; gg += isg; }
+        }
+        g->s_gerr += gerr; g->s_gghost += gg; if (gerr > g->gmax_err) g->gmax_err = gerr; if (gg > g->gmax_ghost) g->gmax_ghost = gg;
+        g->shown = gerr * 65536 + gg;
+    }
     g->started = 1;
     g->s_err += nerr; g->s_ghost += ngh;
     if (nerr > g->max_err) g->max_err = nerr;
     if (ngh > g->max_ghost) g->max_ghost = ngh;
     if (nchg > 0) { if (nchg > g->chg_peak || g->since > 0) g->chg_peak = nchg; g->since = 0; g->settled = 0; } else g->since++;
+    if (nchg > 0) g->settled3 = 0;
+    if (nchg == 0 && !g->settled3 && g->chg_peak >= 600 && n3 < GH_SETTLE) { g->settled3 = 1; g->ev3++; g->set3sum += g->since; if (g->since > g->set3max) g->set3max = g->since; }
     if (nchg == 0 && !g->settled && g->chg_peak >= 600 && nerr < GH_SETTLE) { g->settled = 1; g->ev++; g->setsum += g->since; if (g->since > g->setmax) g->setmax = g->since; }
-    if (g->f) fprintf(g->f, "%d %d %d %d %d %d %d\n", fn, nchg, nerr, ngh, a3, a12, g->since);
+    if (g->f) fprintf(g->f, "%d %d %d %d %d %d %d %d %d\n", fn, nchg, nerr, ngh, a3, a12, g->since, g->shown >> 16, g->shown & 65535);
 }
 static void ghost_summary(ghost_t *g, int fn) {
-    fprintf(stderr, "GHOST frames %d err_mean %.1f err_max %d ghost_mean %.2f ghost_max %d | blockframes age>=3 %.0f >=6 %.0f >=12 %.0f >=30 %.0f max_age %d | settle events %d mean %.1f max %d\n",
-            fn, g->s_err / fn, g->max_err, g->s_ghost / fn, g->max_ghost, g->a3, g->a6, g->a12, g->a30, g->max_age, g->ev, g->ev ? g->setsum / g->ev : 0.0, g->setmax);
+    fprintf(stderr, "GHOST frames %d err_mean %.1f err_max %d ghost_mean %.2f ghost_max %d | blockframes age>=3 %.0f >=6 %.0f >=12 %.0f >=30 %.0f max_age %d | settle events %d mean %.1f max %d | settle3 %d mean %.1f max %d | glass err %.1f/%d ghost %.1f/%d\n",
+            fn, g->s_err / fn, g->max_err, g->s_ghost / fn, g->max_ghost, g->a3, g->a6, g->a12, g->a30, g->max_age, g->ev, g->ev ? g->setsum / g->ev : 0.0, g->setmax, g->ev3, g->ev3 ? g->set3sum / g->ev3 : 0.0, g->set3max, g->s_gerr / fn, g->gmax_err, g->s_gghost / fn, g->gmax_ghost);
     if (g->f) fclose(g->f);
 }
 
@@ -212,6 +232,7 @@ static void usage(void) {
 }
 
 int main(int argc, char **argv) {
+    int keydefer = 180; size_t lastbytes = 0;
     int keyint = 0, iskey = 0;   /* --keyint N: key frame every N frames; top bit of the .rnv length marks it */
     rnv2enc_params p; const char *in = NULL, *outp = NULL, *recp = NULL, *tgtp = NULL, *crcp = NULL, *statp = NULL, *dmgp = NULL;
     enum rnv2_fmt fmt = RNV2_RGB24; int stride = 0, nmax = 0, i, bench = 0, quiet = 0, domet = 0, autod = 0, skipn = 0;
@@ -221,6 +242,8 @@ int main(int argc, char **argv) {
     double s_p666 = 0, s_p666c = 0, s_py = 0, s_vs = 0, s_vc = 0, s_vf = 0, min_p666c = 99, min_py = 99, cycmax = 0;
     rnv2enc *e; linkctl_t lc = {-1, 0, {0}, 0, 0}; const char *ghostp = NULL; ghost_t gh;
     struct timespec cpu0, cpu1; double tdmg = 0;
+    int refill = 0, srcticks = 1; double simsf = 0, sim_t = 0, sim_free = 0, sim_fin[4096], sim_b[4096], tw = 0; int sim_h = 0, sim_n = 0; /* --refill */
+    int keystill = 0, last_nch = 6000; double keymax = 300; FILE *fmodes = NULL; int simstill = 0; FILE *fsim = NULL; /* --simstill N: a frame identical to the last one came N ticks later, as wlcap's 10 fps refresh of a still screen; periodic keys then follow simulated time, as on a pipe */
     rnv2enc_default_params(&p);
     for (i = 1; i < argc; i++) {
         const char *a = argv[i];
@@ -233,6 +256,7 @@ int main(int argc, char **argv) {
         else if (!strcmp(a, "--skip")) skipn = atoi(ARG);
         else if (!strcmp(a, "--threads")) p.threads = atoi(ARG);
         else if (!strcmp(a, "--keyint")) keyint = atoi(ARG);
+        else if (!strcmp(a, "--keydefer")) keydefer = atoi(ARG);
         else if (!strcmp(a, "--qpmin")) p.qp_min = atoi(ARG);
         else if (!strcmp(a, "--lamk")) p.lam_k = atof(ARG);
         else if (!strcmp(a, "--kappa")) p.kappa = atof(ARG);
@@ -262,6 +286,38 @@ int main(int argc, char **argv) {
         else if (!strcmp(a, "--qppred")) p.qp_pred = atoi(ARG);
         else if (!strcmp(a, "--rtrc")) p.rt_rc = atoi(ARG);
         else if (!strcmp(a, "--exact")) { p.rt_rc = 0; p.me_level = 3; p.me_win_max = 1 << 30; } /* rnv2.py parity preset */
+        else if (!strcmp(a, "--refine")) p.refine_static = atoi(ARG);
+        else if (!strcmp(a, "--mask")) { if (!atoi(ARG)) { p.refine_static = 0; p.max_frame = 0; p.stale_d = p.stale_w = 0; p.burst_probe = 0; p.mu_relax = 0; p.qp_drop = 2; p.fast_refine = 0; keydefer = 0; } } /* --mask 0: the old rate control, bit for bit */
+        else if (!strcmp(a, "--lagtarget")) p.lag_target = atof(ARG);
+        else if (!strcmp(a, "--maxframe")) p.max_frame = atof(ARG);
+        else if (!strcmp(a, "--staled")) p.stale_d = atof(ARG);
+        else if (!strcmp(a, "--stalew")) p.stale_w = atof(ARG);
+        else if (!strcmp(a, "--burstprobe")) p.burst_probe = atoi(ARG);
+        else if (!strcmp(a, "--murelax")) p.mu_relax = atoi(ARG);
+        else if (!strcmp(a, "--qpdrop")) p.qp_drop = atoi(ARG);
+        else if (!strcmp(a, "--fastrefine")) p.fast_refine = atoi(ARG);
+        else if (!strcmp(a, "--sfbudget")) p.sf_budget = atof(ARG);
+        else if (!strcmp(a, "--maxvid")) p.sf_budget = atof(ARG) * 512;   /* same value as avlink --maxvid */
+        else if (!strcmp(a, "--trimratio")) p.trim_ratio = atof(ARG);
+        else if (!strcmp(a, "--trimmax")) p.trim_max = atof(ARG);
+        else if (!strcmp(a, "--spillqp")) p.spill_qp = atoi(ARG);
+        else if (!strcmp(a, "--spillsf")) p.spill_sf = atoi(ARG);
+        else if (!strcmp(a, "--spillgap")) p.spill_gap = atoi(ARG);
+        else if (!strcmp(a, "--spillcarry")) p.spill_carry = atoi(ARG);
+        else if (!strcmp(a, "--spillcyc")) p.spill_cyc = atof(ARG);
+        else if (!strcmp(a, "--converge")) { p.converge = atoi(ARG); keystill = p.converge; }
+        else if (!strcmp(a, "--convsf")) p.conv_sf = atoi(ARG);
+        else if (!strcmp(a, "--cscfit")) p.csc_fit = atoi(ARG);
+        else if (!strcmp(a, "--keystill")) keystill = atoi(ARG);   /* 1: no periodic key while the source is still: a key would throw the settled picture away.  A key asked for on --linkctl still goes at once */
+        else if (!strcmp(a, "--keymax")) keymax = atof(ARG);
+        else if (!strcmp(a, "--modes-out")) fmodes = fopen(ARG, "wb");
+        else if (!strcmp(a, "--refill")) { const char *f = ARG; refill = !strcmp(f, "wall") ? 1 : !strcmp(f, "sim") ? 2 : !strcmp(f, "frame") ? 0 : (usage(), 0); } /* frame: one 1/fps per frame (old).  wall: the clock.  sim: the link model below, reproducible, for offline runs */
+        else if (!strcmp(a, "--srcticks")) srcticks = atoi(ARG);          /* sim: the source offers a frame every N ticks */
+        else if (!strcmp(a, "--simstill")) simstill = atoi(ARG);
+        else if (!strcmp(a, "--simlog")) fsim = fopen(ARG, "w");
+        else if (!strcmp(a, "--simsf")) simsf = atof(ARG);                /* sim: bytes per superframe if not --sfbudget */
+        else if (!strcmp(a, "--dither")) p.dither = atoi(ARG);
+        else if (!strcmp(a, "--ditherrange")) p.dither_range = atoi(ARG);
         else if (!strcmp(a, "--no-static-skip")) p.static_skip = 0;
         else if (!strcmp(a, "--scalar")) p.simd = 0;
         else if (!strcmp(a, "--damage")) dmgp = ARG;
@@ -305,22 +361,27 @@ int main(int argc, char **argv) {
     if (ghostp) ghost_init(&gh, ghostp);
     e = rnv2enc_create(&p);
     if (!quiet) fprintf(stderr, "rnv2enc: kernels %s, %d thread(s)\n", rnv2enc_kernel_name(e), p.threads);
-    if (fs) fprintf(fs, "# i bytes qp tries cycles mu fill searched forced  SKIP MC MCR ZRES INTRA RAW  psnr_y psnr_666 psnr_666c psnr_rgb vis_src vis_cod vis_fmt  t_csc t_gme t_me t_ana t_dec t_- t_commit t_total  ngmv  level  linkcap\n");
+    if (fs) fprintf(fs, "# i bytes qp tries cycles mu fill searched forced  SKIP MC MCR ZRES INTRA RAW  psnr_y psnr_666 psnr_666c psnr_rgb vis_src vis_cod vis_fmt  t_csc t_gme t_me t_ana t_dec t_- t_commit t_total  ngmv  level  linkcap  spill trims nchanged nexact nraw_conv\n");
     clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &cpu0);
     for (fn = 0;; fn++) {
         const uint8_t *out; size_t olen; rnv2enc_info inf; rnv2_rect dr[64]; int nd = -1; double t0, t1, td0, td1; uint8_t *cur;
         if (nmax && fn >= nmax) break;
         if (bench) { if (fn >= nall) break; cur = all[fn]; }
         else { if (fread(frame, 1, fsz, fi) != fsz) break; cur = frame; }
+        if (refill == 1) { double tn = now_ms(); if (fn) rnv2enc_set_elapsed(e, (tn - tw) / 1000.0); tw = tn; } /* taken after the read returned: frame arrival, not encoder speed */
         td0 = now_ms();
         if (fd) { char line[8192]; if (fgets(line, sizeof line, fd)) nd = parse_damage(line, dr, 64); }
         else if (autod) { nd = auto_damage(cur, fn ? prevframe : NULL, stride, bpp_of(fmt), dr); }
         td1 = now_ms() - td0;
         { double cv = linkctl_poll(&lc); if (cv > 0) rnv2enc_set_linkcap(e, cv); }
         { /* keyint: frames from a file; real time (keyint/60 s) from a pipe, where a still screen delivers few frames and a key must still come */
-            static int since = 0; static double tk = 0; double tn = now_ms(); int live = !strcmp(in, "-"), due;
+            static int since = 0; static double tk = 0; double tn = refill == 2 && simstill ? 1 + sim_t * 1000.0 / p.fps : now_ms(); int live = !strcmp(in, "-") || (refill == 2 && simstill), due; static int deferred = 0;
             if (!tk) tk = tn;
             due = keyint > 0 && (live ? tn - tk >= keyint * 1000.0 / 60 : since >= keyint - 1);
+            /* a periodic key is a 250 KB burst: on a still or quiet screen nobody sees it, in motion it starves the frames after it.  Wait for a quiet frame, within limits; a key the link asked for goes at once */
+            if (keystill) { /* a key rebuilds the whole screen from black.  A still screen or a small update (a selector move) must not pay for it: the periodic key waits for a large change, where nothing is lost, or for --keymax seconds.  A key asked for on --linkctl goes at once */
+                if (due && !lc.key && last_nch < 3000 && (tn - tk) / 1000.0 < keymax) due = 0;
+            } else if (due && !lc.key && keydefer > 0 && lastbytes > 20000 && deferred < keydefer) { due = 0; deferred++; } else if (due) deferred = 0;
             iskey = fn > 0 && (due || lc.key); lc.key = 0;
             if (iskey) { since = 0; tk = tn; } else since++;
         }
@@ -328,10 +389,31 @@ int main(int argc, char **argv) {
         t0 = now_ms();
         rnv2enc_encode(e, cur, stride, fmt, dr, nd, &out, &olen, &inf);
         t1 = now_ms();
+        last_nch = inf.nchanged;
+        if (fmodes) { static uint8_t ml[6000]; rnv2enc_modes(e, ml); fwrite(ml, 1, 6000, fmodes); }
         tdmg += td1;   /* damage scan (outside t_total); stats column t_- = decide passes + 100 x analysis passes this frame */
         ttot += t1 - t0; if (t1 - t0 > tmax) tmax = t1 - t0;
         for (i = 0; i < 8; i++) tph[i] += inf.t_ms[i];
-        tbytes += (long long)olen; if (inf.cycles > cycmax) cycmax = inf.cycles;
+        if (refill == 2) { /* the link as avlink runs it: one fragment per tick; the encoder blocks once VSRC_HIGH + a pipe of bytes wait.  Same model as budget/link_model.py */
+            double B = simsf > 0 ? simsf : p.sf_budget, t1s, q = 0; int k, fr = B > 0 ? (int)ceil((double)olen / B) : 1; if (fr < 1) fr = 1;
+            if (sim_free < sim_t) sim_free = sim_t;
+            sim_free += fr; sim_fin[(sim_h + sim_n) % 4096] = sim_free; sim_b[(sim_h + sim_n) % 4096] = (double)olen; if (sim_n < 4095) sim_n++; else sim_h = (sim_h + 1) % 4096;
+            t1s = sim_t + srcticks;
+            if (fsim) fprintf(fsim, "%d %.0f %d %zu\n", fn, sim_t, fr, olen);
+            if (simstill) { /* the next frame's distance from this one: known here only for a file source, peek at it */
+                long pos = ftell(fi); uint8_t *nx = malloc(fsz);
+                if (fread(nx, 1, fsz, fi) == fsz && !memcmp(nx, cur, fsz)) t1s = sim_t + simstill;
+                fseek(fi, pos, SEEK_SET); free(nx);
+            }
+            for (;;) {
+                while (sim_n && sim_fin[sim_h] <= t1s) { sim_h = (sim_h + 1) % 4096; sim_n--; }
+                for (q = 0, k = 0; k < sim_n; k++) q += sim_b[(sim_h + k) % 4096];
+                if (q <= (256 << 10) + (64 << 10) || !sim_n) break;
+                t1s = sim_fin[sim_h];
+            }
+            rnv2enc_set_elapsed(e, (t1s - sim_t) / p.fps); sim_t = t1s;
+        }
+        lastbytes = olen; tbytes += (long long)olen; if (inf.cycles > cycmax) cycmax = inf.cycles;
         if (nh == cap_h) { cap_h = cap_h ? cap_h * 2 : 1024; bytes_hist = realloc(bytes_hist, sizeof(double) * cap_h); }
         bytes_hist[nh++] = (double)olen;
         if (fo) { uint8_t h4[4] = {(uint8_t)((olen >> 24) | (iskey ? 0x80 : 0)), (uint8_t)(olen >> 16), (uint8_t)(olen >> 8), (uint8_t)olen}; fwrite(h4, 1, 4, fo); fwrite(out, 1, olen, fo); fflush(fo); }
@@ -344,15 +426,15 @@ int main(int argc, char **argv) {
                 rnv2enc_planes(e, &rY, &rU, &rV, &tY, &tU, &tV);
                 to_rgb(cur, fmt, stride, rgb);
                 metrics(rgb, rY, rU, rV, tY, tU, tV, go, gc, &m);
-                if (ghostp) ghost_frame(&gh, fn, rY, tY);
+                if (ghostp) ghost_frame(&gh, fn, rY, tY, olen);
                 s_p666 += m.p666; s_p666c += m.p666c; s_py += m.py; s_vs += m.vsrc; s_vc += m.vcod; s_vf += m.vfmt;
                 if (m.p666c < min_p666c) min_p666c = m.p666c; if (m.py < min_py) min_py = m.py;
             }
-            if (fs) fprintf(fs, "%d %d %d %d %.0f %.4f %.0f %d %d  %d %d %d %d %d %d  %.3f %.3f %.3f %.3f %d %d %d  %.3f %.3f %.3f %.3f %.3f %.3f %.3f %.3f  %d  %d  %.0f\n",
+            if (fs) fprintf(fs, "%d %d %d %d %.0f %.4f %.0f %d %d  %d %d %d %d %d %d  %.3f %.3f %.3f %.3f %d %d %d  %.3f %.3f %.3f %.3f %.3f %.3f %.3f %.3f  %d  %d  %.0f  %d %d %d %d %d\n",
                             fn, inf.bytes, inf.qp, inf.tries, inf.cycles, inf.mu, inf.fill, inf.n_searched, inf.n_skip_forced,
                             inf.modes[0], inf.modes[1], inf.modes[2], inf.modes[3], inf.modes[4], inf.modes[5],
                             m.py, m.p666, m.p666c, m.prgb, m.vsrc, m.vcod, m.vfmt,
-                            inf.t_ms[0], inf.t_ms[1], inf.t_ms[2], inf.t_ms[3], inf.t_ms[4], inf.t_ms[5], inf.t_ms[6], t1 - t0, inf.gmv_n, inf.level, inf.link_cap);
+                            inf.t_ms[0], inf.t_ms[1], inf.t_ms[2], inf.t_ms[3], inf.t_ms[4], inf.t_ms[5], inf.t_ms[6], t1 - t0, inf.gmv_n, inf.level, inf.link_cap, inf.spill, inf.trims, inf.nchanged, inf.nexact, inf.nraw_conv);
         }
         if (autod) { /* this frame becomes the previous one without a copy */
             if (bench) prevframe = cur;

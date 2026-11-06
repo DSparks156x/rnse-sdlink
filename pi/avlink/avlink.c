@@ -18,6 +18,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/ioctl.h>
 #include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
@@ -28,6 +29,23 @@
 #include "wire.h"
 
 #define AV_DELAY 2400            /* video_pts - audio_pts (D = 50 ms), SPEC 3.6 */
+
+/* Live latency limits. Video is delta-coded and the tick takes one fragment, so a backlog above the Teensy never drains while the source runs at the tick rate.
+ * Three things bound it. Slow reader: the encoder blocks early (RD_WINDOW, VSRC_MAX_FRAMES, small pipe) and wlcap's newest-wins buffer drops before encoding.
+ * Reader gone (RD_STALL_US): every frame is discarded on arrival. Backlog left standing (BACKLOG_*): discarded in one go.
+ * After a discard no delta goes out until a key arrives (the decoder holds its picture), and a key is requested. Audio shares the superframes, so it stays with the picture. */
+#define RD_STALL_US      400000u   /* no new superframe served for this long: no reader. Longer than a stuck read + retry (122 ms measured) */
+#define RD_POLLING_US    100000u   /* the reader touched the window this recently (holds, NOTREADY...): it needs the next superframe now */
+#define RD_WINDOW        8         /* superframes the sender may be ahead of the reader: 133 ms, covers a stuck read without using the slots */
+#define AWAY_PERIOD_US   200000u   /* reader gone: one audio-only superframe this often, so a returning reader finds something recent */
+#define BACKLOG_TICKS    7         /* frames waiting above the USB queue: 117 ms */
+#define BACKLOG_HOLD_US  300000u   /* ... without a break for this long. Must outlast the frames that queue behind a multi-superframe key */
+#define DISCARD_GAP_US   1000000u  /* at most this often, under sustained overload a key costs more than the wait */
+#define VSRC_PIPE_BYTES  16384     /* encoder pipe, rounded up to the page size */
+#define VSRC_MAX_FRAMES  2
+#define STALE_LIVE_MS    400       /* unread superframe older than this is useless live, the reader is told to jump. Longer than RD_WINDOW at 30 superframes/s */
+#define STALE_BATCH_MS   1500      /* batch files, and a queued RNS-E bootstrap image: wait for a slow reader instead of evicting */
+#define IMG_HOLD_US      3000000u
 
 /* ------------------------------------------------------------------ options */
 static struct {
@@ -66,6 +84,7 @@ static int vsrc_open(vsrc *v, const char *path, int live)
     if (live && fstat(v->fd, &st) == 0 && !S_ISREG(st.st_mode)) {
         fcntl(v->fd, F_SETFL, fcntl(v->fd, F_GETFL) | O_NONBLOCK);
         v->nonblock = 1;
+        if (S_ISFIFO(st.st_mode)) (void)fcntl(v->fd, F_SETPIPE_SZ, VSRC_PIPE_BYTES);   /* the default 64 KB holds 21 frames of 3 KB, and a still-screen frame is 28 B */
     }
     v->cap = 1 << 20; v->buf = malloc(v->cap);
     return v->buf ? 0 : -1;
@@ -80,16 +99,33 @@ static void vsrc_read(vsrc *v, size_t want)
     else if (r == 0 || (errno != EAGAIN && errno != EINTR)) v->eof = 1;
 }
 
+/* complete frames buffered, counting stops at limit */
+static int vsrc_count(const vsrc *v, int limit)
+{
+    size_t off = 0;
+    int n = 0;
+    while (n < limit && off + 4 <= v->have) {
+        size_t L = get_be32(v->buf + off) & 0x7FFFFFFFu;
+        if (off + 4 + L > v->have) break;
+        off += 4 + L;
+        n++;
+    }
+    return n;
+}
+
 /* live: how much encoded video may wait here before the pipe is left full. Superframes go out at the link's pace and video is delta-coded, so nothing can be
- * dropped after the encoder: without a limit a slow or absent reader grows this buffer without end, and every frame stays that late until a still screen drains it.
- * With it the encoder blocks on the pipe, then wlcap's newest-wins buffer does the dropping, before encoding. About 3.5 frames at 4.4 MB/s. */
+ * dropped after the encoder without a key: without a limit a slow reader grows this buffer without end, and every frame stays that late until a still screen drains it.
+ * With it the encoder blocks on the pipe, then wlcap's newest-wins buffer does the dropping, before encoding. The byte limit alone let 3 KB frames queue for 1.8 s. */
 #define VSRC_HIGH (256u << 10)
 static int vsrc_wants_input(const vsrc *v)
 {
     if (v->fd < 0 || v->eof) return 0;
+    if (vsrc_count(v, VSRC_MAX_FRAMES) >= VSRC_MAX_FRAMES) return 0;
     if (v->have < VSRC_HIGH) return 1;
     return v->have < 4 + (size_t)(get_be32(v->buf) & 0x7FFFFFFFu);   /* a single frame larger than the limit must still complete */
 }
+int avlink_test_wants(int fd, int eof, uint8_t *buf, size_t have);   /* test/test_stall.c */
+int avlink_test_wants(int fd, int eof, uint8_t *buf, size_t have) { vsrc v; memset(&v, 0, sizeof v); v.fd = fd; v.eof = eof; v.buf = buf; v.have = have; return vsrc_wants_input(&v); }
 
 /* next complete frame -> malloc'd copy; 1 = got one, 0 = not yet (live) or end of stream (v->eof) */
 static uint32_t g_vkey;
@@ -175,6 +211,13 @@ static audio_stage g_aud;
 static vsrc g_vid;
 static link_t g_link;
 static int g_have_link;
+/* reader tracking, live only. stalled starts true: there is no reader until one has been seen. */
+static struct { int have, stalled, returned; uint64_t n_served; uint32_t served, activity; uint64_t t_served, t_act; } g_rd = {.stalled = 1};
+static int g_can_discard;           /* live, with a link, credits, a pipe and a way to ask for a key */
+static int g_wait_key;              /* a delta was discarded: nothing but a key may follow */
+static uint64_t g_vavg;             /* mean encoded frame, bytes */
+static uint32_t g_discards, g_vdiscarded, g_stalls, g_window_waits, g_away_ticks;
+static int g_whole_sf, g_cfg_dirty;  /* CONFIG whole_sf: 0 = not set by us, every CONFIG byte as before */
 static FILE *g_dump_sf, *g_dump_wire;
 static uint32_t g_seq, g_built, g_planned, g_first_total, g_last_fid, g_audio_pts;
 static int g_video_done;
@@ -196,6 +239,11 @@ static void plan_fill(int blocking)
         uint8_t *fr; uint32_t len;
         if (O.k && g_frames_in >= (uint32_t)O.k) { g_video_done = 1; break; }
         if (!vsrc_frame(&g_vid, blocking, &fr, &len)) { if (g_vid.eof) g_video_done = 1; break; }
+        g_vavg = g_vavg ? (uint64_t)((int64_t)g_vavg + ((int64_t)len - (int64_t)g_vavg) / 8) : len;
+        if (g_wait_key) {
+            if (!g_vkey) { uint32_t c; crc_for_frame(&c); free(fr); g_vdiscarded++; continue; }
+            g_wait_key = 0;
+        }
         if (O.k) {
             uint32_t cap = (uint32_t)O.maxvid * 512, nch = (len + cap - 1) / cap;
             if (g_planned + nch > (uint32_t)O.k) { free(fr); g_video_done = 1; break; }
@@ -204,6 +252,8 @@ static void plan_fill(int blocking)
         fragment_frame(fr, len);
     }
 }
+
+#include "sdctl.h"
 
 /* build superframe g_seq from the head fragment (or REPEAT) + one tick of audio */
 static void build_sf(int blocking)
@@ -217,6 +267,7 @@ static void build_sf(int blocking)
     uint32_t ab = 0;
     if (!O.no_audio) { audio_take(&g_aud, af, abuf, blocking); ab = (uint32_t)af * 4; }
     int batch = O.k > 0;
+    if (g_stop_tlv > 0) { sf_tlv(&h, TLV_STOP, "STOP", 4); g_stop_tlv--; }
     h.seq = g_seq;
     h.audio_pts = g_audio_pts;
     h.video_pts = g_audio_pts + AV_DELAY;
@@ -274,17 +325,43 @@ static void build_sf(int blocking)
     g_audio_pts += af;
 }
 
+/* Tick clock. Each tick sends a fixed 800 frames, so the tick must run at the audio source's rate: in the car a DAC clocks the PipeWire sink, not the Pi clock.
+ * The period follows the fill of the input buffer (filtered: PipeWire delivers in bursts up to 30 ms), so there are no periodic drops or pads and the ticks stay even for video.
+ * +-1000 ppm is reached at +-AUDIO_LEVEL_SPAN frames. With no audio arriving for 250 ms (nothing to follow), the Pi clock rules, unchanged. */
+#define TICK_SPAN_US 30                   /* +-0.18% */
+static int64_t g_lvl_q8; static int g_lvl_have; static uint64_t g_last_audio_us; static int32_t g_tick_adj;
+static uint64_t tick_period(uint64_t period, uint64_t t)
+{
+    if (O.no_audio || g_aud.fd < 0) return period;
+    if (g_aud.last_arrival) { g_aud.last_arrival = 0; g_last_audio_us = t; }
+    if (!g_aud.primed || !g_last_audio_us || t - g_last_audio_us > 250000u) { g_lvl_have = 0; g_tick_adj = 0; return period; }
+    int64_t lvl = (int64_t)(g_aud.have / 4) << 8;
+    if (!g_lvl_have) { g_lvl_q8 = lvl; g_lvl_have = 1; }
+    g_lvl_q8 += (lvl - g_lvl_q8) >> 5;            /* ~0.5 s */
+    int64_t err = (g_lvl_q8 >> 8) - (48 * AUDIO_PRIME_MS + 400);   /* frames over the level we want after a tick, mean of the burst sawtooth */
+    int64_t adj = err * TICK_SPAN_US / 300;
+    if (adj > TICK_SPAN_US) adj = TICK_SPAN_US;
+    if (adj < -TICK_SPAN_US) adj = -TICK_SPAN_US;
+    g_tick_adj = (int32_t)adj;
+    return (uint64_t)((int64_t)period - adj);
+}
+
 /* ------------------------------------------------------------------ USB writer */
 static void put32(uint8_t *p, uint32_t v) { memcpy(p, &v, 4); }   /* LE host */
 static void put16(uint8_t *p, uint16_t v) { memcpy(p, &v, 2); }
 
 static void tx_pump(void)
 {
+    /* Even the no-credit USB diagnostic needs a receiver-counter origin before SF traffic.
+     * CONFIG is sent separately, so waiting here does not block the initial STATUS handshake. */
+    if (!g_link.have_status || g_link.credit_error) { if (tq_n) g_credit_waits++; return; }
     int wbytes = O.wire == 4 ? WIRE4_BYTES : WIRE1_BYTES;
     while (tq_n && link_pending(&g_link) < (256u << 10)) {
         txsf *t = &tq[tq_head];
         if (t->state == 0) {
             if (!O.nocredits && link_slots(&g_link) <= 0) { g_credit_waits++; return; }
+            /* Keep the queue on the Teensy short while a reader is working: what it cannot take waits above the encoder, where it can be dropped. Not while it makes no progress: it may be polling for this very superframe. */
+            if (!O.k && !O.nocredits && !g_rd.stalled && g_link.n_served && (int32_t)(t->seq - g_link.last_served_seq) > RD_WINDOW) { g_window_waits++; return; }
             uint8_t *p = link_msg(&g_link, TL_SF_BEGIN, 8);
             put32(p, t->seq); put16(p + 4, t->total); put16(p + 6, 0);
             g_link.sent_begins++;
@@ -320,45 +397,113 @@ static void tx_pump(void)
     }
 }
 
+static int g_img_stale;
 static void send_config(void)
 {
     tl_config c;
     memset(&c, 0, sizeof c);
     c.status_hz = 20;
-    c.stale_ms = 1500;   /* wait for a slow reader (credits back-pressure) instead of evicting: an eviction breaks video until the next key */
+    c.stale_ms = (O.k || g_img_stale) ? STALE_BATCH_MS : STALE_LIVE_MS;
+    c.whole_sf = (uint8_t)g_whole_sf;
     memcpy(link_msg(&g_link, TL_CONFIG, sizeof c), &c, sizeof c);
 }
 
 /* video was lost on the way to the RNS-E (the decoder now waits for a key): ask the encoder for one at once, not at the next keyint */
 static int g_keyfd = -1;
 static uint32_t g_key_reqs;
+static uint64_t g_key_t;
 static void key_feedback(uint64_t t)
 {
-    static uint32_t last; static int have; static uint64_t last_t;
+    static uint32_t last; static int have;
     const tl_status *s = &g_link.st;
     uint32_t lost = s->expired + s->evicted + s->notready;
     if (!have) { last = lost; have = g_link.n_status != 0; return; }
-    static uint32_t last_srv; static uint64_t srv_t;
-    int back = 0;                                   /* the reader was gone (unit stall or sdstream just started): its decoder needs a key */
-    if (s->served_seq != last_srv) { back = srv_t && t - srv_t > 500000u; last_srv = s->served_seq; srv_t = t; }
-    else if (t - srv_t > 500000u) { last = lost; return; }   /* no reader right now: a key would be lost too */
-    if ((lost == last && !back) || t - last_t < 500000u) return;
-    last = lost; last_t = t;
+    if (g_rd.stalled) { last = lost; return; }     /* no reader right now: a key would be lost too */
+    /* video lost, or the reader is back (its decoder needs a key), or frames were discarded and the key has not arrived: ask again */
+    if ((lost == last && !g_rd.returned && !g_wait_key) || t - g_key_t < 500000u) return;
+    last = lost; g_key_t = t; g_rd.returned = 0;
     if (g_keyfd >= 0 && write(g_keyfd, "key\n", 4) == 4) g_key_reqs++;
+}
+
+/* Drop every complete frame in the pipe and in vsrc, keep a partial one for its end. Called while nothing may wait. */
+static void video_drop_input(void)
+{
+    if (g_vid.fd < 0 || g_vid.eof) return;
+    for (int i = 0; i < 64; i++) { size_t h = g_vid.have; vsrc_read(&g_vid, 65536); if (g_vid.have == h) break; }
+    size_t off = 0;
+    while (off + 4 <= g_vid.have) {
+        size_t L = get_be32(g_vid.buf + off) & 0x7FFFFFFFu;
+        if (L > 64u << 20 || off + 4 + L > g_vid.have) break;     /* a bad length stays for vsrc_frame, which stops the video */
+        off += 4 + L;
+        uint32_t c; crc_for_frame(&c);
+        g_vdiscarded++;
+    }
+    if (off) { memmove(g_vid.buf, g_vid.buf + off, g_vid.have - off); g_vid.have -= off; }
+}
+
+/* Everything not yet built into a superframe goes. Built superframes stay in order: they are older deltas, the chain up to here is intact. */
+static void video_discard(void)
+{
+    while (fq_n) { frag_t *f = &fq[fq_head]; fq_head = (fq_head + 1) % FQ_N; fq_n--; g_vdiscarded += f->off + f->len == f->f->len; frame_unref(f->f); }
+    video_drop_input();
+    g_wait_key = 1;
+    g_discards++;
+}
+
+/* Who is reading: SERVED (new superframe read) and every counter a read of the window moves. Lifetime counters, so the first STATUS is only a baseline. */
+static void reader_update(uint64_t t)
+{
+    const tl_status *s = &g_link.st;
+    if (!g_link.n_status) return;
+    uint32_t act = s->sectors_served + s->holds + s->hold_timeouts + s->notready + s->expired + s->idle;
+    if (!g_rd.have) { g_rd.have = 1; g_rd.served = s->served_seq; g_rd.activity = act; g_rd.n_served = g_link.n_served; }
+    if (g_link.n_served != g_rd.n_served || s->served_seq != g_rd.served) {
+        g_rd.n_served = g_link.n_served; g_rd.served = s->served_seq;
+        g_rd.t_served = t; g_rd.t_act = t;
+    }
+    if (act != g_rd.activity) { g_rd.activity = act; g_rd.t_act = t; }
+    int stalled = !g_rd.t_served || t - g_rd.t_served > RD_STALL_US;
+    if (stalled && !g_rd.stalled) {
+        g_stalls++;
+        if (g_can_discard) video_discard();
+    } else if (!stalled && g_rd.stalled) {
+        g_rd.returned = 1; g_key_t = 0;            /* the key goes at once */
+    }
+    g_rd.stalled = stalled;
+    if (stalled && g_can_discard) video_drop_input();
+}
+
+/* A backlog that outlives a return, or a stall shorter than RD_STALL_US: the tick takes one frame and the source brings one, so it would stay. Frames, not bytes. */
+static int backlog_ticks(void)
+{
+    int n = fq_n + vsrc_count(&g_vid, 64), inpipe = 0;
+    if (g_vid.fd >= 0 && g_vid.nonblock && ioctl(g_vid.fd, FIONREAD, &inpipe) == 0 && inpipe > 0)
+        n += g_vavg ? (int)((uint64_t)inpipe / (g_vavg + 4)) : 1;
+    return n;
+}
+
+static void backlog_check(uint64_t t)
+{
+    static uint64_t since, last;
+    if (!g_can_discard || g_rd.stalled || g_wait_key || backlog_ticks() <= BACKLOG_TICKS) { since = 0; return; }
+    if (!since) since = t;
+    if (t - since >= BACKLOG_HOLD_US && t - last >= DISCARD_GAP_US) { video_discard(); last = t; since = 0; }
 }
 
 static void print_stats(const char *tag)
 {
     if (O.quiet) return;
     const tl_status *s = &g_link.st;
-    fprintf(stderr, "%s sf built=%u sent=%u repeat=%u late=%u frames=%u drop=%u audio_in=%llu silence=%llu adrop=%llu "
+    fprintf(stderr, "%s sf built=%u sent=%u repeat=%u late=%u frames=%u drop=%u audio_in=%llu silence=%llu adrop=%llu raw=%llu adj=%d "
             "credit_waits=%u keyreq=%u | teensy status=%llu free=%u/%u slots=%u newest=%u served=%u srv_sect=%u holds=%u "
-            "timeouts=%u notready=%u expired=%u idle=%u evicted=%u conv=%u rxerr=%u bus=%u junk=%llu\n",
+            "timeouts=%u notready=%u expired=%u idle=%u evicted=%u conv=%u rxerr=%u bus=%u junk=%llu "
+            "| rd_stalled=%d stalls=%u discards=%u vdiscarded=%u waitkey=%d window_waits=%u away_ticks=%u\n",
             tag, g_built, g_sent_sf, g_repeat_sf, g_late_ticks, g_frames_in, g_frames_dropped,
-            (unsigned long long)g_aud.frames_in, (unsigned long long)g_aud.frames_silence, (unsigned long long)g_aud.frames_dropped, g_credit_waits, g_key_reqs,
+            (unsigned long long)g_aud.frames_in, (unsigned long long)g_aud.frames_silence, (unsigned long long)g_aud.frames_dropped, (unsigned long long)g_aud.raw_bytes / 4, (int)g_tick_adj, g_credit_waits, g_key_reqs,
             (unsigned long long)g_link.n_status, s->free_sectors, s->pool_sectors, s->free_slots, s->newest_seq,
             s->served_seq, s->sectors_served, s->holds, s->hold_timeouts, s->notready, s->expired, s->idle, s->evicted,
-            s->converted, s->rx_errors, s->bus_width, (unsigned long long)g_link.rx_junk);
+            s->converted, s->rx_errors, s->bus_width, (unsigned long long)g_link.rx_junk,
+            g_rd.stalled, g_stalls, g_discards, g_vdiscarded, g_wait_key, g_window_waits, g_away_ticks);
 }
 
 /* ------------------------------------------------------------------ --wire-test: wire images of a raw file */
@@ -393,7 +538,10 @@ static void usage(void)
         "  --nocredits        ignore STATUS credits (USB throughput tests only)\n"
         "  --dump-sf FILE     write the superframes (= sdgen.py .rsav)   --dump-wire FILE  write the wire images\n"
         "  --wire-test IN OUT wire images of every 512-B sector of IN (unit test vs sd_wire.py), then exit\n"
-        "  --keyctl FIFO      rnv2enc --linkctl FIFO: write key when the Teensy reports lost superframes\n"
+        "  --keyctl FIFO      rnv2enc --linkctl FIFO: write key when the Teensy reports lost superframes. Live, also enables the backlog\n"
+        "                     discard: no reader, or a standing queue, drops frames until a key (without it: back-pressure only)\n"
+        "  --whole-sf 1|0     Teensy holds only before sector 0, until the superframe is complete; default: leave the Teensy's setting (off after boot).\n"
+        "                     Live also: printf WSF1 > /tmp/avlink_sdctl, WSF0 to turn it off\n"
         "  --console          copy Teensy console text to stderr      --stats N  stats line every N s   -q\n");
 }
 
@@ -423,6 +571,7 @@ int main(int argc, char **argv)
         else if (!strcmp(a, "--dump-wire")) O.dump_wire = ARG;
         else if (!strcmp(a, "--wire-test")) { wt_in = ARG; wt_out = ARG; }
         else if (!strcmp(a, "--keyctl")) O.keyctl = ARG;
+        else if (!strcmp(a, "--whole-sf")) g_whole_sf = atoi(ARG) ? 2 : 1;
         else if (!strcmp(a, "--console")) O.console = 1;
         else if (!strcmp(a, "--stats")) O.stats_s = atoi(ARG);
         else if (!strcmp(a, "-q")) O.quiet = 1;
@@ -454,11 +603,15 @@ int main(int argc, char **argv)
     if (O.keyctl && (g_keyfd = open(O.keyctl, O_RDWR | O_NONBLOCK)) < 0) { perror(O.keyctl); return 1; }
     signal(SIGINT, on_sig); signal(SIGTERM, on_sig); signal(SIGPIPE, SIG_IGN);
     g_seq = O.seq0;
+    if (g_have_link && live) sdctl_open();
+    /* A discard needs a key to end it, and only a pipe can be left full or drained. Otherwise: back-pressure only, as batch and --nocredits. */
+    g_can_discard = g_have_link && live && !O.nocredits && g_keyfd >= 0 && g_vid.nonblock;
+    g_wait_key = g_can_discard;
     g_t0 = now_us();
     uint64_t period = (uint64_t)(1e6 / O.fps), next_tick = g_t0, next_stats = g_t0 + (uint64_t)O.stats_s * 1000000u;
     int rc = 0;
     uint64_t last_status_t = g_t0, last_cfg_t = g_t0;
-    uint64_t last_nstatus = 0;
+    uint64_t last_nstatus = 0, away_t = 0, img_t = 0;
     while (!g_stop) {
         uint64_t t = now_us();
         /* 1. build */
@@ -467,30 +620,38 @@ int main(int argc, char **argv)
             if (g_built >= (uint32_t)O.k && (!g_have_link || (!tq_n && !link_pending(&g_link)))) break;
         } else if (t >= next_tick) {
             plan_fill(0);
+            backlog_check(t);
             int ended = g_video_done && !fq_n && (O.no_audio || g_aud.fd < 0 || g_aud.eof) &&
                         (g_vid.fd >= 0 || g_aud.fd >= 0);
             if (ended) {
                 if (!g_have_link || (!tq_n && !link_pending(&g_link))) break;
             } else if (g_have_link && tq_n >= O.maxq) {
                 g_late_ticks++;                    /* USB/credits behind: don't consume a seq, encoder backs up */
-            } else build_sf(0);
-            next_tick += period;
+            } else if (g_can_discard && g_rd.stalled && !g_stop_tlv && t - g_rd.t_act > RD_POLLING_US && t - away_t < AWAY_PERIOD_US) {
+                g_away_ticks++;                    /* nobody reading: no point filling the Teensy, audio stays current in the audio stage */
+            } else { build_sf(0); away_t = t; }
+            next_tick += tick_period(period, t);
             if (t > next_tick + 4 * period) next_tick = t + period;   /* fell far behind: resync the clock */
         }
         /* 2. USB */
         if (g_have_link) {
             /* The Teensy sends STATUS only after a message, and drops the link if a message beats its DTR debounce (~15 ms after
-             * open). So keep asking until STATUS flows; this also recovers from a Teensy reboot. Credits come only from STATUS. */
+             * open). Keep asking until STATUS flows. A later counter reset fails closed; seamless reboot recovery needs an epoch handshake. */
             if (g_link.n_status != last_nstatus) { last_nstatus = g_link.n_status; last_status_t = t; }
             else if (t - last_status_t > 300000u && t - last_cfg_t > 200000u) { send_config(); last_cfg_t = t; }
+            if (live) reader_update(t);
             key_feedback(t);
+            sdctl_poll();
+            if (g_img_wait) img_t = t;             /* a bootstrap image is read once, later: it must outlast the stream around it */
+            if (live && !!g_img_wait != g_img_stale && (g_img_wait || t - img_t > IMG_HOLD_US)) { g_img_stale = !!g_img_wait; send_config(); }
+            if (g_cfg_dirty) { g_cfg_dirty = 0; send_config(); }
             tx_pump();
             if (link_write(&g_link) < 0) { fprintf(stderr, "avlink: write error: %s\n", strerror(errno)); rc = 1; break; }
         }
         /* 3. wait for input / output / tick */
         struct pollfd p[3]; int np = 0;
         if (g_have_link) { p[np].fd = g_link.fd; p[np].events = POLLIN | (link_pending(&g_link) ? POLLOUT : 0); np++; }
-        if (live && g_vid.nonblock && vsrc_wants_input(&g_vid)) { p[np].fd = g_vid.fd; p[np].events = POLLIN; np++; }
+        if (live && g_vid.nonblock && (vsrc_wants_input(&g_vid) || (g_vid.fd >= 0 && !g_vid.eof && g_can_discard && (g_wait_key || g_rd.stalled)))) { p[np].fd = g_vid.fd; p[np].events = POLLIN; np++; }
         if (live && audio_poll_fd(&g_aud) >= 0) { p[np].fd = g_aud.fd; p[np].events = POLLIN; np++; }
         int64_t wait_us = 5000;                 /* to the microsecond: rounding down to whole ms made poll(0) spin through the last ms of every tick */
         if (live) { wait_us = (int64_t)(next_tick - now_us()); if (wait_us < 0) wait_us = 0; if (wait_us > 5000) wait_us = 5000; }
@@ -498,7 +659,12 @@ int main(int argc, char **argv)
         ppoll(p, (nfds_t)np, &wait_ts, NULL);
         for (int i = 0; i < np; i++) {
             if (g_have_link && p[i].fd == g_link.fd && (p[i].revents & (POLLIN | POLLHUP | POLLERR))) {
-                if (link_read(&g_link) < 0 && g_link.hup) { fprintf(stderr, "avlink: device hung up\n"); rc = 1; g_stop = 1; }
+                if (link_read(&g_link) < 0 && g_link.hup) {
+                    fprintf(stderr, "avlink: %s\n", g_link.credit_error
+                            ? "credit accounting lost synchronization; restart the sender"
+                            : "device hung up");
+                    rc = 1; g_stop = 1;
+                }
             } else if (p[i].fd == g_vid.fd && (p[i].revents & (POLLIN | POLLHUP))) {
                 vsrc_read(&g_vid, 65536);
             } else if (p[i].fd == g_aud.fd && (p[i].revents & (POLLIN | POLLHUP))) {
@@ -508,6 +674,7 @@ int main(int argc, char **argv)
         if (O.stats_s && now_us() >= next_stats) { print_stats("STAT"); next_stats += (uint64_t)O.stats_s * 1000000u; }
     }
     if (g_have_link) { link_drain(&g_link, 2000); link_read(&g_link); }
+    sdctl_close();
     print_stats("END");
     if (g_dump_sf) fclose(g_dump_sf);
     if (g_dump_wire) fclose(g_dump_wire);

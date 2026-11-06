@@ -3,10 +3,18 @@
 //   USB RX bytes -> TLNK parser -> wire-sector pool (528 B images from the Pi, stored as received)
 //   slot table by seq (16 resident superframes; LBA 0x10000 + (seq mod 256) * 256)
 //   get(lba): the read engine's sector source for the window: pool image / hold / NOT_READY / EXPIRED / IDLE / zeros
-//   poll(): slot reclaim (mode A: freed when 2 newer superframes were served; stale unread slots after stale_ms),
+//   poll(): slot reclaim (mode A: freed once a newer superframe was served; stale unread slots after stale_ms),
 //           STATUS (credits) and SERVED messages to the Pi.
 // Concurrency on the Teensy: get() runs in the read-engine interrupt (prio 64); feed()/poll() run in the main loop
 // and change shared state only inside AVS_LOCK. get() never blocks: AVS_HOLD = "not yet, ask again".
+// The resident superframe targeted by the last read command is pinned across CMD12/CMD17/18 and non-window
+// reads, for split reads and retries. A command targeting another resident superframe transfers the pin.
+// Speculative get() calls beyond the command's starting window cannot transfer it. Pressure/resends cannot discard it;
+// FLUSH and reset_link deliberately can. At most one slot is pinned, with no timeout while the host is paused, until the
+// stream is more than 128 superframes past it: then its window number means a newer superframe, so it stops answering and
+// is released (slot_stale). A retry never needs that old: the reader treats it as expired and moves on.
+// Mode A reads each superframe with a separate command. Cross-window get() returns zero filler without read/served
+// side effects, so the engine's speculative queue cannot advance ownership. Cross-superframe CMD18 is unsupported.
 // Must match ../../pi/avlink/tlink.h (message layout).
 #pragma once
 #include <stdint.h>
@@ -38,7 +46,9 @@ struct AvsStatus {                   // = tl_status in pi/avlink/tlink.h (80 B, 
   uint32_t pool_sectors;
 };
 
-struct AvsConfig { uint16_t hold_cut_ms, hold_future_ms, silent_ms, stale_ms; uint8_t status_hz; };
+// whole_sf: 1 = hold only before sector 0, until the whole superframe has arrived, so a read has no mid-read holds. Off by default.
+// Same bound as a cut-through hold (hold_cut_ms, at most AVS_MAX_HOLD_MS), then NOT_READY. Set by CONFIG or the console (cfg wholesf).
+struct AvsConfig { uint16_t hold_cut_ms, hold_future_ms, silent_ms, stale_ms; uint8_t status_hz; uint8_t whole_sf; };
 
 struct AvsSlot {
   uint8_t used, ended, served;
@@ -61,7 +71,7 @@ class AvStream {
   void poll(void);                                          // main loop
   // read engine (IRQ): window sector -> wire image (+1 pad word). bus4 = current width. Returns AVS_*.
   int get(uint32_t lba, int bus4, uint32_t *out, uint16_t *nwords);
-  void read_begin(void);           // a new CMD17/18 started (resets the per-command hold state)
+  void read_begin(uint32_t lba);    // command start LBA; resets hold state and anchors split-read/retry pin
   void info(uint8_t *p, int n);    // big-endian summary for the 0x40000 info sector (n >= 40)
 
   // card-side values reported in STATUS (set by the sketch)
@@ -86,12 +96,14 @@ class AvStream {
   void free_sector(uint16_t i);
   // slots
   AvsSlot slots[AVS_NSLOT];
+  volatile int read_slot;            // IRQ-owned retry pin; main tests it while holding AVS_LOCK
   uint8_t have_begun, have_complete, have_served;
   uint32_t newest_begun, newest_complete;
-  void free_slot(int s);
+  int free_slot(int s, int force = 0, int evict = 0); // atomically unpublish, then release storage outside lock
   int find_slot(uint32_t seq) const;
   int find_slot_idx(uint32_t win_idx) const;   // resident slot with seq % 256 == win_idx
   int new_slot(uint32_t seq, uint16_t total);
+  int slot_stale(uint32_t seq) const;          // > 128 superframes behind the newest: its window now means a newer one
   void reclaim(uint32_t now);
   // parser
   uint8_t ps, mpos;
@@ -106,7 +118,7 @@ class AvStream {
   void wire_byte_chunk(const uint8_t *p, int n);
   void sector_done(void);
   // hold / synthetic state (IRQ side)
-  volatile uint32_t read_gen; uint32_t my_gen;
+  volatile uint32_t read_gen; volatile int read_win; uint32_t my_gen;
   uint32_t hold_lba, hold_t0; uint8_t holding;
   int sticky_win; uint8_t sticky_kind; uint32_t sticky_seq, sticky_arg;    // per-command synthetic answer
   uint8_t degraded;                                            // cut-through timed out in this command

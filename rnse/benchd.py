@@ -51,16 +51,41 @@ def serve():
                 last = h
             time.sleep(0.5)
 
+    mtimes = {}
+
+    def refresh():
+        """Edited rnse_bench / layout / sdfast take effect without a restart (a restart costs the CowCAN and the keep-alive)."""
+        import sdfast
+        for m in (L, sdfast, rnse_bench):
+            f = m.__file__
+            t = os.path.getmtime(f)
+            if mtimes.setdefault(f, t) != t:
+                mtimes[f] = t
+                if m is sdfast:
+                    sdfast._pi.close()
+                importlib.reload(m)
+        bench.__class__ = rnse_bench.Bench
+        rnse_bench.open_bench = lambda: bench
+
+    refresh()
+
     class H(socketserver.StreamRequestHandler):
         def handle(self):
             argv = self.rfile.readline().decode().strip().split('\x1f')
             w = _Writer(self.connection)
             if argv[0] == 'abort':             # no lock: a running program holds it. Asks the running RAM program to stop (CTL stop word)
+                try:                           # SD first: milliseconds, no CAN stall (SDBOOT.txt)
+                    import sdfast
+                    sdfast.stop_stream()
+                    print('stop sent over SD', file=w)
+                except Exception as e:
+                    print('no SD stop: %s' % e, file=w)
                 bench.stop()
                 print('stop requested', file=w)
                 return
             with lock, contextlib.redirect_stdout(w), contextlib.redirect_stderr(w):
                 try:
+                    refresh()
                     if argv[0] == 'quit':
                         stop.set()
                     elif argv[0] == 'sdstream':
@@ -80,10 +105,18 @@ def serve():
                         import sdbench
                         importlib.reload(sdbench)
                         sdbench.main(argv[1:])
+                    elif argv[0] == 'decbench':
+                        import decbench
+                        importlib.reload(decbench)
+                        decbench.main(argv[1:])
                     elif argv[0] == 'sdtime':
                         import sdtime
                         importlib.reload(sdtime)
                         sdtime.main(argv[1:])
+                    elif argv[0] == 'sdload':          # sdload N [secs]: SD load test (SDBOOT.txt)
+                        import sdload_test
+                        importlib.reload(sdload_test)
+                        sdload_test.main(argv[1:])
                     elif argv[0] == 'reboot':          # RAM only: cold reset as proven in r52 (VBR=0, jmp A0000000); no flash
                         code = bytes.fromhex('0002' 'cbf0' '400e' 'e000' '402e' 'd101' '412b' '0009' 'a0000000')
                         st, ent = bench.task_state()

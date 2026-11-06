@@ -13,6 +13,7 @@
 #define _GNU_SOURCE
 #include "rnv2enc.h"
 #include "kern.h"
+#include "csc_common.h"
 #include "rnv2_tables.h"
 #include <stdlib.h>
 #include <string.h>
@@ -43,6 +44,7 @@ enum { CY_FRAME = 20000, CY_SKIP = 6, CY_MEM = 306, CY_SKIPCOPY = 100 + 306, CY_
 static const int WSB[8] = {20, 20, 20, 20, 44, 44, 33, 33}; /* 1, 2.2, 1.65 (rnv2.WCB/WCR) x20 */
 #define DSCALE 320.0                                         /* pd8 is x16, weights x20 */
 #define MAXG 8
+#define BURST_QP_OCT 5.0 /* qp per halving of the frame size around qp 15-30, measured on fades: 4.8 */
 
 typedef struct {
     uint32_t ds[8], dm[8], di[8];
@@ -83,6 +85,8 @@ struct rnv2enc {
     uint32_t mc0[NB], mc1[NB];
     blkstat *bs; blkdec *bd;
     double fill, rate_pf, buf, mu; int qp, fn;
+    uint8_t fitted[NB]; uint8_t exact[NB]; uint32_t berr[NB]; /* converge: block equals the target; its squared error */
+    double pend_dt, dtf; int since_spill; /* rnv2enc_set_elapsed; frames since the last deliberate spill */
     /* headroom-driven quality: operating point ladder lvl 0 (near-exact) .. nlev-1 (= --lamk/--kappa/--thr) */
     int nlev, lvl, alvl, l0cool, since; double lamk; uint8_t skl[NB];
     _Atomic double pend_cap; /* live link capacity request (B/s), 0 = none; applied at the next encode call */
@@ -102,6 +106,8 @@ struct rnv2enc {
     uint8_t key, tvalid, cscneed[NB]; /* key = coded from black; tvalid: tY/U/V = csc(refrgb) everywhere (not before the first frame) */
     uint16_t act[NB]; int nact, ncoded, nprev_act;
     uint16_t hx0[BH], hx1[BH];        /* x range of the blocks written to each band (half-pel update range) */
+    double lastn, bmu;
+    uint8_t *drgb, rng[NB], dith[NB]; /* --dither: source with the static pattern, per-block channel range, blocks dithered now */
     int kl0;                          /* last key at level 0: 0 unknown, 1 fitted, 2 did not fit */
     double pbpa, pkey; int pq, pkq;    /* bytes per active block / of the last key at the classic point, at qp pq / pkq: first-qp prediction */
     blkstat *bs2; int bs2_cls, bs2_qp; /* the other analysis class, kept so a failed level-0 probe does not re-run the level-1 analysis */
@@ -309,7 +315,7 @@ static inline void line8_rgb(const uint8_t *s, enum rnv2_fmt f, uint8_t *d) {
  * group one row up (already converted: same band, or an unchanged block) or to the group on its left reuses that output.  UI and map
  * content is mostly flat or vertically uniform, and this kernel is the most expensive per-pixel step in the encoder. */
 static void csc_seg(rnv2enc *e, int y, int x, int npairs, int r) {
-    const uint8_t *rgb = e->refrgb + ((size_t)y * W + x) * 3;
+    const uint8_t *rgb = (e->p.dither ? e->drgb : e->refrgb) + ((size_t)y * W + x) * 3;
     uint8_t *Y = e->tY + y * W + x, *U = e->tU + y * CW + x / 2, *V = e->tV + y * CW + x / 2;
     int p = 0;
     while (p < npairs) {
@@ -320,31 +326,10 @@ static void csc_seg(rnv2enc *e, int y, int x, int npairs, int r) {
         p += n;
     }
 }
-static void job_csc(rnv2enc *e, int by) {
-    int bx, r, y0 = by * 8, bx0 = 0, bx1 = BW, first = e->first;
-    const uint8_t *dmg = e->damaged + by * BW; int bpp = e->fmt == RNV2_RGB24 || e->fmt == RNV2_BGR24 ? 3 : 4;
-    if (!first) { /* x range of the damage in this band; none: nothing to convert or compare */
-        while (bx0 < BW && !dmg[bx0]) bx0++;
-        while (bx1 > bx0 && !dmg[bx1 - 1]) bx1--;
-        if (bx0 >= bx1) { memset(e->changed + by * BW, 0, BW); memset(e->forced + by * BW, 1, BW); memset(e->cscneed + by * BW, 0, BW); return; }
-    }
-    for (bx = 0; bx < BW; bx++) {
-        int b = by * BW + bx, diff = 0, need; uint8_t line[24];
-        if (!dmg[bx] && !first) { e->changed[b] = 0; e->forced[b] = 1; e->cscneed[b] = 0; continue; }
-        for (r = 0; r < 8; r++) { /* compare against, and update, the RGB24 copy of the previous source in one pass */
-            const uint8_t *sp = e->cur + (size_t)(y0 + r) * e->curstride + (size_t)bx * 8 * bpp, *lp = sp; uint8_t *rp = e->refrgb + (size_t)(y0 + r) * W * 3 + bx * 24;
-            if (e->fmt != RNV2_RGB24) { line8_rgb(sp, e->fmt, line); lp = line; }
-            if (!e->tvalid || memcmp(lp, rp, 24)) { memcpy(rp, lp, 24); diff = 1; }
-        }
-        need = diff;
-        e->cscneed[b] = (uint8_t)need; /* a key frame recodes every block, but the target of an unchanged source block is still valid */
-        if (first) diff = 1;
-        e->changed[b] = (uint8_t)diff;
-        /* unchanged source, SKIP last frame, and the block was last evaluated at a qp / mu no lower than now (a lower
-           qp or mu could make rnv2.py refine it): the decision cannot change -> SKIP without evaluation */
-        e->forced[b] = (uint8_t)(!diff && e->p.static_skip && e->prevmode[b] == SKIP && e->qp0 >= e->skq[b] && e->mu0 >= e->skmu[b] && e->lvl >= e->skl[b]);
-    }
-    for (r = 0; r < 8; r++) { /* CSC on runs of blocks that need it */
+/* static-skip rule: unchanged source, SKIP last frame, and last evaluated at a qp / mu / level no finer than now: the decision cannot change */
+static void csc_row(rnv2enc *e, int by, int bx0, int bx1) { /* CSC on runs of blocks that need it */
+    int r, bx, y0 = by * 8;
+    for (r = 0; r < 8; r++) {
         int y = y0 + r;
         for (bx = bx0; bx < bx1;) {
             int b0 = bx;
@@ -354,6 +339,63 @@ static void job_csc(rnv2enc *e, int by) {
         }
     }
 }
+static inline int can_force(const rnv2enc *e, int b) { return (e->p.converge && e->exact[b]) || (e->p.static_skip && e->prevmode[b] == SKIP && e->qp0 >= e->skq[b] && e->mu0 >= e->skmu[b] && e->lvl >= e->skl[b]); } /* a block equal to the target with an unchanged source has nothing left to gain */
+static void job_csc(rnv2enc *e, int by) {
+    int bx, r, y0 = by * 8, bx0 = 0, bx1 = BW, first = e->first;
+    const uint8_t *dmg = e->damaged + by * BW; int bpp = e->fmt == RNV2_RGB24 || e->fmt == RNV2_BGR24 ? 3 : 4;
+    if (!first) { /* x range of the damage in this band; none: nothing to convert or compare */
+        while (bx0 < BW && !dmg[bx0]) bx0++;
+        while (bx1 > bx0 && !dmg[bx1 - 1]) bx1--;
+        if (bx0 >= bx1) { memset(e->changed + by * BW, 0, BW); memset(e->cscneed + by * BW, 0, BW); if (e->p.refine_static) { for (bx = 0; bx < BW; bx++) e->forced[by * BW + bx] = (uint8_t)can_force(e, by * BW + bx); } else memset(e->forced + by * BW, 1, BW); return; }
+    }
+    for (bx = 0; bx < BW; bx++) {
+        int b = by * BW + bx, diff = 0, need; uint8_t line[24];
+        if (!dmg[bx] && !first) { e->changed[b] = 0; e->forced[b] = e->p.refine_static ? (uint8_t)can_force(e, b) : 1; e->cscneed[b] = 0; continue; }
+        for (r = 0; r < 8; r++) { /* compare against, and update, the RGB24 copy of the previous source in one pass */
+            const uint8_t *sp = e->cur + (size_t)(y0 + r) * e->curstride + (size_t)bx * 8 * bpp, *lp = sp; uint8_t *rp = e->refrgb + (size_t)(y0 + r) * W * 3 + bx * 24;
+            if (e->fmt != RNV2_RGB24) { line8_rgb(sp, e->fmt, line); lp = line; }
+            if (!e->tvalid || memcmp(lp, rp, 24)) { memcpy(rp, lp, 24); diff = 1; }
+        }
+        need = diff;
+        if (need && e->p.dither) { /* max-min per channel of this block */
+            int mn[3] = {255, 255, 255}, mx[3] = {0, 0, 0}, x, c, m = 0;
+            for (r = 0; r < 8; r++) { const uint8_t *rp = e->refrgb + (size_t)(y0 + r) * W * 3 + bx * 24; for (x = 0; x < 8; x++) for (c = 0; c < 3; c++) { int v = rp[3 * x + c]; if (v < mn[c]) mn[c] = v; if (v > mx[c]) mx[c] = v; } }
+            for (c = 0; c < 3; c++) if (mx[c] - mn[c] > m) m = mx[c] - mn[c];
+            e->rng[b] = (uint8_t)m;
+        }
+        e->cscneed[b] = (uint8_t)need; /* a key frame recodes every block, but the target of an unchanged source block is still valid */
+        if (first) diff = 1;
+        e->changed[b] = (uint8_t)diff;
+        /* unchanged source, SKIP last frame, and the block was last evaluated at a qp / mu no lower than now (a lower
+           qp or mu could make rnv2.py refine it): the decision cannot change -> SKIP without evaluation */
+        e->forced[b] = (uint8_t)(!diff && can_force(e, b));
+    }
+    if (!e->p.dither) csc_row(e, by, bx0, bx1);
+}
+/* --dither (prototype): 6-bit panel without its own dither.  In smooth gradient blocks the source gets a screen-locked 2x2 ordered pattern before the CSC:
+ * truncation to 6 bits then averages to the true 8-bit value.  The pattern never moves, so a still picture still costs nothing.  A block is dithered when it and its
+ * 4 neighbours are all smooth (range <= dither_range: no text or edges) and at least one of them is not perfectly flat (flat UI stays exact). */
+static void dither_pass(rnv2enc *e) {
+    static const uint8_t B[2][2] = {{0, 2}, {3, 1}};
+    int b, R = e->p.dither_range;
+    for (b = 0; b < NB; b++) {
+        int bx = b % BW, by = b / BW, m = e->rng[b], a = m, d, r, x, c;
+        if (bx > 0) { int v = e->rng[b - 1]; if (v > m) m = v; a |= v; }
+        if (bx < BW - 1) { int v = e->rng[b + 1]; if (v > m) m = v; a |= v; }
+        if (by > 0) { int v = e->rng[b - BW]; if (v > m) m = v; a |= v; }
+        if (by < BH - 1) { int v = e->rng[b + BW]; if (v > m) m = v; a |= v; }
+        d = m <= R && a > 0;
+        if (d != e->dith[b]) { e->cscneed[b] = 1; if (!e->first) { e->changed[b] = 1; e->forced[b] = 0; } } /* the target of this block changes though its source did not */
+        if (!e->cscneed[b]) continue;
+        e->dith[b] = (uint8_t)d;
+        for (r = 0; r < 8; r++) {
+            const uint8_t *sp = e->refrgb + (size_t)(by * 8 + r) * W * 3 + bx * 24; uint8_t *dp = e->drgb + (size_t)(by * 8 + r) * W * 3 + bx * 24;
+            if (!d) { memcpy(dp, sp, 24); continue; }
+            for (x = 0; x < 8; x++) for (c = 0; c < 3; c++) { int v = sp[3 * x + c] + B[(by * 8 + r) & 1][x & 1]; dp[3 * x + c] = (uint8_t)(v > 255 ? 255 : v); }
+        }
+    }
+}
+static void job_csc2(rnv2enc *e, int by) { csc_row(e, by, 0, BW); }
 
 /* ------------------------------------------------------------------ phase 2: global motion from projections */
 /* Row profiles per vertical strip (4 x 200 px) and column profiles per horizontal band (3 x 160 rows) of the current
@@ -453,7 +495,7 @@ static void job_me_init(rnv2enc *e, int row) {
         const uint8_t *src = e->tY + y0_ * W + x0_;
         int bx_ = 0, by_ = 0; uint32_t bc;
         e->medone[b] = 1;
-        if (e->forced[b]) { e->mv0[b][0] = e->mv0[b][1] = 0; e->mc0[b] = 0; continue; }
+        if (e->forced[b] || (e->p.refine_static && !e->changed[b])) { e->mv0[b][0] = e->mv0[b][1] = 0; e->mc0[b] = 0; continue; } /* unchanged source: refinement in place, nothing to search */
         bc = me_cost(e, x0_, y0_, src, 0, 0, 0xFFFFFFFFu);
         if (bc) {
             int it;
@@ -592,6 +634,14 @@ static void decide_block(rnv2enc *e, int b) {
     J[ZRES] = cbp[1] ? Dc[1] + lam * (3 + B[1] + CBPB(cbp[1])) + lam * mu * (CY_HDR + CY_ZRES + cy[1]) : INFINITY;
     J[INTRA] = Dc[2] + lam * (3 + 15 + B[2] + CBPB(cbp[2])) + lam * mu * (CY_HDR + CY_FILL + cy[2]);
     J[RAW] = e->p.use_raw ? lam * (3 + 1024) + lam * mu * (CY_HDR + CY_RAW) : INFINITY;
+    if (e->p.stale_w > 0) { /* picture that stays visibly wrong costs extra: a coarse replacement beats a cheap stale block */
+        double sd = e->p.stale_d, w = e->p.stale_w;
+        if (s->Jds > sd) J[SKIP] += w * (s->Jds - sd);
+        if (s->has_mc && s->Jdm > sd) J[MC] += w * (s->Jdm - sd);
+        if (J[MCR] < INFINITY && Dc[0] > sd) J[MCR] += w * (Dc[0] - sd);
+        if (J[ZRES] < INFINITY && Dc[1] > sd) J[ZRES] += w * (Dc[1] - sd);
+        if (Dc[2] > sd) J[INTRA] += w * (Dc[2] - sd);
+    }
     best = 0;
     for (m = 1; m < 6; m++) if (J[m] < J[best]) best = m;
     d->mode = (uint8_t)best; d->cbp = 0; d->cbits = 0;
@@ -752,6 +802,59 @@ static void canon(const unsigned char *L, int n, uint32_t *code) {
     for (i = 0; i < n; i++) { int s = order[i]; if (i) { c = (c + 1) << (L[s] - prev); } prev = L[s]; code[s] = c; }
 }
 
+/* converge: does block b of the reference equal the target, and how far is it */
+static void block_exact(rnv2enc *e, int b) {
+    int by = b / BW, bx = b % BW, r, c; uint32_t sse = 0; const uint8_t *RY = e->R[e->rb][0], *RU = e->R[e->rb][1], *RV = e->R[e->rb][2];
+    for (r = 0; r < 8; r++) {
+        size_t oy = (size_t)(by * 8 + r) * W + bx * 8, oc = (size_t)(by * 8 + r) * CW + bx * 4;
+        if (memcmp(RY + oy, e->tY + oy, 8)) for (c = 0; c < 8; c++) { int d = (int)RY[oy + c] - e->tY[oy + c]; sse += (uint32_t)(d * d); }
+        if (memcmp(RU + oc, e->tU + oc, 4)) for (c = 0; c < 4; c++) { int d = (int)RU[oc + c] - e->tU[oc + c]; sse += (uint32_t)(d * d); }
+        if (memcmp(RV + oc, e->tV + oc, 4)) for (c = 0; c < 4; c++) { int d = (int)RV[oc + c] - e->tV[oc + c]; sse += (uint32_t)(d * d); }
+    }
+    e->berr[b] = sse; e->exact[b] = sse == 0;
+}
+/* panel model as csc_common.h: full range BT.601, nearest chroma, 6 bits kept.  Channels of one pixel that land on another panel level than the source */
+static inline int fit_miss(const int *s, int y, int uu, int vv) {
+    int r = y + OR_(vv), g = y + OG_(uu, vv), b = y + OB_(uu);
+    r = CL255(r); g = CL255(g); b = CL255(b);
+    return ((r >> 2) != (s[0] >> 2)) + ((g >> 2) != (s[1] >> 2)) + ((b >> 2) != (s[2] >> 2));
+}
+static inline int rnd_i(double x) { return (int)floor(x + 0.5); }
+/* re-choose the target of a still block.  The common chroma comes from the middle of the two pixels' panel levels, so values sit away from the step edges */
+static void fit_block(rnv2enc *e, int b) {
+    int by = b / BW, bx = b % BW, r, x, i;
+    for (r = 0; r < 8; r++) for (x = 0; x < 4; x++) {
+        size_t oy = (size_t)(by * 8 + r) * W + bx * 8 + 2 * x, oc = (size_t)(by * 8 + r) * CW + bx * 4 + x;
+        const uint8_t *rp = e->refrgb + oy * 3; int s[2][3], y0 = e->tY[oy], y1 = e->tY[oy + 1], u0 = e->tU[oc], v0 = e->tV[oc], cur, best, bu = u0, bv = v0, by0 = y0, by1 = y1, du, dv; double cr = 0, cg = 0, cb = 0, yc[2];
+        for (i = 0; i < 2; i++) { int k; for (k = 0; k < 3; k++) s[i][k] = rp[3 * i + k]; }
+        { int k, dd = 0; for (k = 0; k < 3; k++) { int a = s[0][k] - s[1][k]; if (a < 0) a = -a; if (a > dd) dd = a; } if (dd > 8) continue; } /* a hard edge inside the pair: shared chroma cannot serve both, the glass-aware target stays */
+        if (e->p.csc_fit == 2) { /* still-only ordered dither: the panel level is taken from source + a screen-locked 2x2 offset, mean preserved through the panel's truncation */
+            static const int D[2][2] = {{0, 2}, {3, 1}}; int k, yy = by * 8 + r, xx = bx * 8 + 2 * x;
+            for (i = 0; i < 2; i++) for (k = 0; k < 3; k++) { int a = s[i][k] + D[yy & 1][(xx + i) & 1]; s[i][k] = a > 255 ? 255 : a; }
+        }
+        cur = fit_miss(s[0], y0, u0 - 128, v0 - 128) + fit_miss(s[1], y1, u0 - 128, v0 - 128);
+        if (!cur) continue;
+        best = cur;
+        for (i = 0; i < 2; i++) { double R_ = (s[i][0] & 0xFC) + 1.5, G_ = (s[i][1] & 0xFC) + 1.5, B_ = (s[i][2] & 0xFC) + 1.5; cr += R_ / 2; cg += G_ / 2; cb += B_ / 2; yc[i] = 0.299 * R_ + 0.587 * G_ + 0.114 * B_; }
+        { int uc = rnd_i(-0.168736 * cr - 0.331264 * cg + 0.5 * cb), vc = rnd_i(0.5 * cr - 0.418688 * cg - 0.081312 * cb);
+          for (du = 0; du < 5 && best; du++) for (dv = 0; dv < 5 && best; dv++) {
+            static const int O[5] = {0, -1, 1, -2, 2}; int uu = uc + O[du], vv = vc + O[dv], tot = 0, ybest[2], dy;
+            if (uu < -128 || uu > 127 || vv < -128 || vv > 127) continue;
+            for (i = 0; i < 2; i++) {
+                int m = 4, yy0 = rnd_i(yc[i]);
+                ybest[i] = yy0;
+                for (dy = 0; dy < 7 && m; dy++) { int yy = yy0 + (dy & 1 ? (dy + 1) / 2 : -(dy / 2)), mm; if (yy < 0 || yy > 255) continue; mm = fit_miss(s[i], yy, uu, vv); if (mm < m) { m = mm; ybest[i] = yy; } }
+                tot += m;
+            }
+            if (tot < best) { best = tot; bu = uu + 128; bv = vv + 128; by0 = ybest[0]; by1 = ybest[1]; }
+          }
+        }
+        e->tY[oy] = (uint8_t)by0; e->tY[oy + 1] = (uint8_t)by1; e->tU[oc] = (uint8_t)bu; e->tV[oc] = (uint8_t)bv;
+    }
+    e->fitted[b] = 1;
+}
+void rnv2enc_modes(const rnv2enc *e, uint8_t *out) { memcpy(out, e->prevmode, NB); }
+
 /* ------------------------------------------------------------------ public API */
 void rnv2enc_default_params(rnv2enc_params *p) {
     memset(p, 0, sizeof *p);
@@ -759,6 +862,8 @@ void rnv2enc_default_params(rnv2enc_params *p) {
     p->kappa = 4; p->thr = 3; p->dz_inter = 0.22; p->dz_intra = 0.33; p->mu_min = 0.002; p->mu_max = 2.0; p->use_raw = 1;
     p->link_cap = 0; p->adapt = 1; p->nlevels = 12; p->lam_lo = 0.0025; p->lam_x = 0.01; p->kappa_lo = 16; p->thr_lo = 0; p->fill_target = 0.25; p->hyst = 0.85; p->dwell = 4; p->pin_level = -1;
     p->max_tries = 12; p->threads = 1; p->static_skip = 1; p->simd = 1; p->me_level = 2; p->me_win_thr = 0; p->me_win_max = 1024; p->rt_rc = 1; p->prune = 3; p->qp_pred = 1;
+    p->lag_target = 0.5; p->refine_static = 1; p->max_frame = 1.5; p->stale_d = 6000; p->stale_w = 2; p->burst_probe = 1; p->mu_relax = 1; p->qp_drop = 4; p->fast_refine = 1; p->dither = 0; p->dither_range = 24;
+    p->sf_budget = 0; p->trim_ratio = 1.35; p->spill_qp = 18; p->spill_sf = 2; p->spill_gap = 30; p->spill_carry = 1; p->trim_max = 3; p->spill_cyc = 1; p->converge = 0; p->conv_sf = 2; p->csc_fit = 0;
 }
 
 static void set_level(rnv2enc *e, int L);
@@ -789,7 +894,7 @@ rnv2enc *rnv2enc_create(const rnv2enc_params *p) {
     set_level(e, e->lvl);
     atomic_init(&e->pend_cap, 0.0);
     e->tY = xmalloc(W * H); e->tU = xmalloc(CW * H); e->tV = xmalloc(CW * H);
-    e->refrgb = xmalloc(W * H * 3);
+    e->refrgb = xmalloc(W * H * 3); e->drgb = xmalloc(W * H * 3);
     for (i = 0; i < 2; i++) { e->R[i][0] = xmalloc(W * H); e->R[i][1] = xmalloc(CW * H); e->R[i][2] = xmalloc(CW * H); }
     for (c = 0; c < 3; c++) for (i = 0; i < 3; i++) e->HP[c][i] = xmalloc(c ? CW * H : W * H);
     memset(e->R[0][0], 0, W * H); memset(e->R[0][1], 128, CW * H); memset(e->R[0][2], 128, CW * H);
@@ -800,7 +905,7 @@ rnv2enc *rnv2enc_create(const rnv2enc_params *p) {
     e->rec = xmalloc(128 * NB);
     e->bs = xmalloc(sizeof(blkstat) * NB); e->bs2 = xmalloc(sizeof(blkstat) * NB); e->bs2_cls = -1; e->bd = xmalloc(sizeof(blkdec) * NB);
     memset(e->prevmode, INTRA, NB); memset(e->prev_mv, 0, sizeof e->prev_mv);
-    e->rate_pf = e->p.rate / p->fps; e->buf = p->buf_frames * e->p.rate / p->fps; e->fill = 0; e->qp = p->qp_min; e->mu = p->mu_min;
+    e->rate_pf = e->p.rate / p->fps; e->buf = p->buf_frames * e->p.rate / p->fps; e->fill = 0; e->qp = p->qp_min; e->mu = p->mu_min; e->pend_dt = -1; e->dtf = 1; e->since_spill = 1 << 20;
     e->w2.cap = 0; e->s3cap = 1 << 20; e->s3 = xmalloc(e->s3cap); e->ocap = 1 << 21; e->obuf = xmalloc(e->ocap);
     run_jobs(e, job_halfpel, 3 * BH);
     e->nth = p->threads < 1 ? 1 : p->threads > 16 ? 16 : p->threads;
@@ -814,7 +919,7 @@ void rnv2enc_destroy(rnv2enc *e) {
     if (!e) return;
     pthread_mutex_lock(&e->m); e->quit = 1; pthread_cond_broadcast(&e->cv); pthread_mutex_unlock(&e->m);
     for (i = 1; i < e->nth; i++) pthread_join(e->th[i], NULL);
-    free(e->tY); free(e->tU); free(e->tV); free(e->refrgb);
+    free(e->tY); free(e->tU); free(e->tV); free(e->refrgb); free(e->drgb);
     for (i = 0; i < 2; i++) for (c = 0; c < 3; c++) free(e->R[i][c]);
     for (c = 0; c < 3; c++) for (i = 0; i < 3; i++) free(e->HP[c][i]);
     for (i = 0; i < 52; i++) { free(e->qt[i][0]); free(e->qt[i][1]); }
@@ -847,6 +952,7 @@ static void set_cap(rnv2enc *e, double cap) {
     if (e->fill > e->buf) e->fill = e->buf; /* the streamer owns whatever was already queued beyond the new bucket */
 }
 void rnv2enc_set_linkcap(rnv2enc *e, double bytes_per_s) { if (bytes_per_s > 0) atomic_store(&e->pend_cap, bytes_per_s); }
+void rnv2enc_set_elapsed(rnv2enc *e, double seconds) { e->pend_dt = seconds; }
 static void set_qp(rnv2enc *e, int qp) {
     double st = QSTEP2[qp];
     e->cqp = qp; e->step = QSTEP2[qp]; e->lam = e->lamk * (st > 2 ? st : 2) * (st > 2 ? st : 2);
@@ -856,10 +962,17 @@ static void set_qp(rnv2enc *e, int qp) {
 int rnv2enc_encode(rnv2enc *e, const uint8_t *pix, int stride, enum rnv2_fmt fmt, const rnv2_rect *dmg, int ndmg,
                    const uint8_t **out, size_t *outlen, rnv2enc_info *info) {
     double t0 = now_ms(), t1, t2, t3, ta = 0, td = 0, t5, t6, cap, soft, mu, cyc = 0; size_t n = 0; int qp, tries = 0, aqp = -1, b, i, nana = 0, rtok = 0, ad, Lprev, acls = -1, want0;
-    double alw = 0; int hint = -1, evs = 0, keytry0 = 0;
+    int Lprev0 = e->lvl; double alw = 0, hard0 = 0; int hint = -1, evs = 0, keytry0 = 0;
+    int nconv = 0, nchanged = 0; int bm = 0, spill = 0, trims = 0; double C = 0, cb = e->p.cyc_budget, n_pre = 0, alim = 1e18;
     e->bs2_cls = -1;
     if (info) memset(info, 0, sizeof *info);
     { double c = atomic_exchange(&e->pend_cap, 0.0); if (c > 0 && c != e->p.rate) set_cap(e, c); }
+    if (e->pend_dt >= 0) { /* the fill already drained one 1/fps after the last frame: correct it to the time that really passed.  The bucket bounds both ways: idle time is not banked below empty */
+        e->fill -= (e->pend_dt - 1.0 / e->p.fps) * e->p.rate; if (e->fill < 0) e->fill = 0; if (e->fill > e->buf) e->fill = e->buf;
+        /* the share of the link one frame may plan on follows the source: at 30 fps a frame has two ticks of link.  Smoothed over about 10 frames; never under one tick, never over the bucket */
+        { double tk = e->pend_dt * e->p.fps; if (tk < 1) tk = 1; if (tk > e->p.buf_frames) tk = e->p.buf_frames; e->dtf += 0.1 * (tk - e->dtf); }
+        e->pend_dt = -1;
+    }
     e->cur = pix; e->curstride = stride; e->fmt = fmt;
     if (ndmg < 0) memset(e->damaged, 1, NB);
     else {
@@ -870,7 +983,7 @@ int rnv2enc_encode(rnv2enc *e, const uint8_t *pix, int stride, enum rnv2_fmt fmt
             for (by = y0 / 8; by * 8 < y1; by++) for (bx = x0 / 8; bx * 8 < x1; bx++) e->damaged[by * BW + bx] = 1;
         }
     }
-    e->qp0 = (e->p.rt_rc && e->qp_raised) ? e->qp : e->qp - 2; /* rt_rc: hold qp after a frame that had to raise it */
+    e->qp0 = (e->p.rt_rc && e->qp_raised) ? e->qp : e->qp - e->p.qp_drop; /* rt_rc: hold qp after a frame that had to raise it */
     if (e->qp0 < e->p.qp_min) e->qp0 = e->p.qp_min;
     e->mu0 = e->mu * 0.6 > e->p.mu_min ? e->mu * 0.6 : e->p.mu_min;
 #ifdef RNV_EXACT_TEST /* test build: no key-frame shortcuts (they are the only intended bitstream change on a stream without forced keys) */
@@ -879,6 +992,11 @@ int rnv2enc_encode(rnv2enc *e, const uint8_t *pix, int stride, enum rnv2_fmt fmt
     e->key = (uint8_t)e->first;
 #endif
     { int nd = NB; if (ndmg >= 0 && !e->first) { nd = 0; for (b = 0; b < NB; b++) nd += e->damaged[b]; } run_w(e, job_csc, BH, nd, 128); }
+    if (e->p.dither) { dither_pass(e); run_jobs(e, job_csc2, BH); }
+    if (e->p.converge && e->p.csc_fit) { /* the fit is per block and lives with the block's target.  A small update (a selector, a clock) is fitted before coding, so it never shows a different texture than its neighbours; a large one (a pan) is fitted when it stops */
+        int nc = 0; for (b = 0; b < NB; b++) if (e->cscneed[b]) { e->fitted[b] = 0; nc++; }
+        if (nc <= 300 && !e->first) for (b = 0; b < NB; b++) if (e->cscneed[b]) fit_block(e, b);
+    }
     e->first = 0; e->tvalid = 1;
     /* blocks that need any work this frame; the decision of the others is SKIP for the whole frame */
     e->nprev_act = e->nact; e->nact = 0;
@@ -903,7 +1021,13 @@ int rnv2enc_encode(rnv2enc *e, const uint8_t *pix, int stride, enum rnv2_fmt fmt
     /* rnv2.py Encoder2.encode rate / cycle control */
     cap = e->buf + e->rate_pf - e->fill;
     soft = e->rate_pf + (e->buf - e->fill > 0 ? e->buf - e->fill : 0) * 0.35;
+    hard0 = cap;
+    if (e->p.max_frame > 0 && !e->key) { double rp = e->rate_pf * e->dtf, mf = e->p.max_frame * rp; if (cap > mf) cap = mf; soft = rp + (e->p.lag_target * e->buf - e->fill) * 0.35; if (soft > mf) soft = mf; if (soft < 0.6 * rp) soft = 0.6 * rp; }
+    bm = e->p.sf_budget > 0 && !e->key; C = e->p.sf_budget; /* superframe budget: every frame is cut to the ceiling unless it spills deliberately, and then it fills what it takes */
+    if (bm) { if (cap > C) cap = C; if (soft > C) soft = C; alim = C; }
     qp = e->qp0; mu = e->mu0; /* = max(qp_min, qp - 2), max(mu_min, 0.6 mu) as rnv2.py (rt_rc: see rnv2enc.h) */
+#define CANSPILL() (e->p.spill_sf > 1 && e->since_spill >= e->p.spill_gap && hard0 >= e->p.spill_sf * C)
+#define GOSPILL() do { spill = 1; cap = soft = e->p.spill_sf * C; cb = e->p.cyc_budget * e->p.spill_cyc; hint = -1; alim = cap; } while (0)
     ad = e->nlev > 2 && e->p.pin_level < 0; /* headroom-driven level selection active */
     if (e->p.qp_pred && ad) { /* the first qp comes from the size of the last comparable frame: an analysis pass that is sure to overrun the hard cap is the costliest retry */
         double est = e->key ? e->pkey : e->pbpa * e->nact; int pq = e->key ? e->pkq : e->pq;
@@ -912,15 +1036,26 @@ int rnv2enc_encode(rnv2enc *e, const uint8_t *pix, int stride, enum rnv2_fmt fmt
             if (eq > 1.15 * cap) { qp += (int)ceil(7.5 * log2(eq / cap)); if (qp > e->p.qp_max) qp = e->p.qp_max; } /* clearly over: anything near the cap is left to the normal path */
         }
     }
+    if (e->p.burst_probe && ad && !e->key && e->nact >= 1500 && e->nact > 2 * e->nprev_act + 256) { /* sudden burst, no usable history: a row sample at the coarse point sets the first qp, cheaper than one wrong analysis pass */
+        int by, nb = 0, Ls = e->nlev - 1, qs = qp > 18 ? qp : 18; double bytes = 0; /* probe at a mid qp: near qp 0 RAW saturates the size and the slope says nothing */
+        if (e->bmu > mu) mu = e->bmu; /* a burst is cycle-limited like the last one: start there, not 8 doublings below (--murelax comes back down if it is too strict) */
+        set_level(e, Ls); set_qp(e, qs); e->cmu = mu;
+        for (by = 3; by < BH; by += 8) { int bx; for (bx = 0; bx < BW; bx++) { int bk = by * BW + bx; const blkdec *d = &e->bd[bk]; analyse_block(e, bk); decide_block(e, bk); nb++; bytes += d->mode == SKIP ? 0 : d->mode == RAW ? 128 : (d->cbits + 12 + (d->mode == INTRA ? 15 : 0)) / 8.0; } }
+        bytes = bytes * NB / nb + 24;
+        { int qt = qs + (int)ceil(BURST_QP_OCT * log2(bytes / (0.9 * cap))); if (qt > qp) qp = qt > e->p.qp_max ? e->p.qp_max : qt; }
+        e->lvl = Lprev0;
+    }
+    if (bm && qp >= e->p.spill_qp && CANSPILL()) { GOSPILL(); qp -= (int)(BURST_QP_OCT * log2(e->p.spill_sf)); if (qp < e->qp0) qp = e->qp0; } /* qp_pred or the probe say one superframe cannot hold this frame at a usable quality */
     Lprev = e->lvl; want0 = ad && Lprev == 0 && (!e->key || e->kl0 != 2); if (e->l0cool > 0) e->l0cool--; /* a key that did not fit near-exact last time: no wasted analysis pass */
     keytry0 = e->key && want0;
-    alw = e->rate_pf + (e->p.fill_target * e->buf - e->fill) * 0.35; /* per-frame allowance for choosing the level: keeps (1-fill_target) of the bucket free for bursts */
-    if (alw < 0.25 * e->rate_pf) alw = 0.25 * e->rate_pf;
+    alw = e->rate_pf * e->dtf + (e->p.fill_target * e->buf - e->fill) * 0.35; /* per-frame allowance for choosing the level: keeps (1-fill_target) of the bucket free for bursts */
+    if (alw < 0.25 * e->rate_pf * e->dtf) alw = 0.25 * e->rate_pf * e->dtf;
+    if (spill) alw = 2 * cap;
 /* the previous analysis stays in bs2: going back to the class analysed just before (failed level-0 probe) needs no new pass */
 #define ANALYSE(LV) do { double t_ = now_ms(); int cl_ = (LV) ? 1 : 0; blkstat *sw_ = e->bs; e->lvl = (LV); set_level(e, e->lvl); set_qp(e, qp); e->bs = e->bs2; e->bs2 = sw_; { int c2_ = e->bs2_cls, q2_ = e->bs2_qp; e->bs2_cls = acls; e->bs2_qp = aqp; if (!(c2_ == cl_ && q2_ == qp)) { run_w(e, job_analyse, BH, e->nact, 64); nana++; } } aqp = qp; acls = cl_; ta += now_ms() - t_; } while (0)
 #define DECIDE() run_w(e, job_decide, (e->nact + DSLICE - 1) / DSLICE, e->nact, 256)
 #define EVAL(LV) do { e->lvl = (LV); set_lam(e, e->lvl); DECIDE(); frame_size(e, &n, &cyc); evs++; } while (0)
-#define FITS(LV) ((double)n <= alw * ((LV) < Lprev ? e->p.hyst : 1.0)) /* bytes only: a decode-cycle overrun is fixed by the mu loop below */
+#define FITS(LV) ((double)n <= alw * ((LV) < Lprev ? e->p.hyst : 1.0) && (double)n <= alim) /* bytes only: a decode-cycle overrun is fixed by the mu loop below */
     for (;;) {
         double tt = now_ms();
         if (!ad) {
@@ -929,8 +1064,9 @@ int rnv2enc_encode(rnv2enc *e, const uint8_t *pix, int stride, enum rnv2_fmt fmt
             DECIDE();
             frame_size(e, &n, &cyc);
         } else {
-            int lo = Lprev > 1 ? (e->since >= e->p.dwell ? Lprev - 1 : Lprev) : 1, hi = e->nlev - 1, a, bb, done = 0;
+            int lo = spill ? 1 : Lprev > 1 ? (e->since >= e->p.dwell || (e->p.fast_refine && e->lastn < 0.5 * alw) ? (e->p.fast_refine && e->lastn < 0.25 * alw && Lprev > 2 ? Lprev - 2 : Lprev - 1) : Lprev) : 1, hi = e->nlev - 1, a, bb, done = 0;
             e->cmu = mu;
+            if (e->p.max_frame > 0 && tries > 0 && qp == aqp && acls == 1 && hint >= 0 && cyc > cb) { EVAL(hint); done = 1; want0 = 0; } /* cycle retry: mu moved, the level from the last try stands */
             if (want0) { /* previous frame was near-exact: try to stay there */
                 if (qp != aqp || acls != 0) { ANALYSE(0); tt = now_ms(); }
                 EVAL(0);
@@ -962,13 +1098,43 @@ int rnv2enc_encode(rnv2enc *e, const uint8_t *pix, int stride, enum rnv2_fmt fmt
         }
         td += now_ms() - tt;
         tries++;
+        if (bm && !spill && (double)n > e->p.trim_ratio * C && (qp > 10 ? qp : 10) + BURST_QP_OCT * log2(n / C) >= e->p.spill_qp && CANSPILL()) { GOSPILL(); alw = 2 * cap; if (tries < e->p.max_tries) continue; }
         /* rt_rc: after rt_rc analysis passes accept anything within the hard bucket cap (no more qp re-analysis) */
-        rtok = e->p.rt_rc && nana >= e->p.rt_rc && (double)n <= cap;
-        if (((n <= soft || rtok) && cyc <= e->p.cyc_budget) || (qp >= e->p.qp_max && mu >= e->p.mu_max) || tries >= e->p.max_tries) break;
-        if (cyc > e->p.cyc_budget && mu < e->p.mu_max) { double r = pow(cyc / e->p.cyc_budget, 3); mu = mu * (r > 2 ? r : 2); if (mu > e->p.mu_max) mu = e->p.mu_max; }
-        if ((double)n > soft && !rtok) { int dq = (int)ceil(6 * log2(n / soft) * 0.8); qp += dq > 1 ? dq : 1; if (qp > e->p.qp_max) qp = e->p.qp_max; }
-        else if (cyc > e->p.cyc_budget && mu >= e->p.mu_max) { qp += 2; if (qp > e->p.qp_max) qp = e->p.qp_max; }
+        rtok = e->p.rt_rc && nana >= e->p.rt_rc && (double)n <= (bm ? e->p.trim_ratio * cap : e->p.max_frame > 0 && !e->key ? 1.25 * cap : cap);
+        if (e->p.max_frame > 0 && nana >= (bm ? 3 : 2) && (double)n <= hard0) rtok = 1; /* encode-time bound: the second analysis pass stands if the bucket can take it */
+        if (((n <= soft || rtok) && cyc <= cb) || (qp >= e->p.qp_max && mu >= e->p.mu_max) || tries >= e->p.max_tries) break;
+        if (cyc > cb && mu < e->p.mu_max) { double r = pow(cyc / cb, 3); mu = mu * (r > 2 ? r : 2); if (mu > e->p.mu_max) mu = e->p.mu_max; }
+        if (bm && (double)n > cap && !rtok) { int q = (qp > 10 ? qp : 10) + (int)ceil(BURST_QP_OCT * log2(n / cap)); qp = q > e->p.qp_max ? e->p.qp_max : q; } /* near qp 0 RAW saturates the size, so the slope only holds from about qp 10 */
+        else if ((double)n > soft && !rtok && !bm) { int dq = (int)ceil(6 * log2(n / soft) * 0.8); qp += dq > 1 ? dq : 1; if (qp > e->p.qp_max) qp = e->p.qp_max; }
+        else if (cyc > cb && mu >= e->p.mu_max) { qp += 2; if (qp > e->p.qp_max) qp = e->p.qp_max; }
     }
+    if (e->p.mu_relax && cyc < 0.8 * cb && mu > 4 * e->p.mu_min && e->nact >= 1000) { /* the mu of the last frames was too strict for this one: blocks are being skipped for cycles it has spare */
+        double tt = now_ms(), m0 = mu; int it;
+        for (it = 0; it < 2; it++) {
+            double mt = mu * (it ? 0.5 : 0.25); size_t n1; double c1;
+            if (mt < e->p.mu_min) mt = e->p.mu_min;
+            e->cmu = mt; DECIDE(); frame_size(e, &n1, &c1); evs++;
+            if (c1 <= 0.97 * cb && (double)n1 <= (rtok ? cap : soft)) { n = n1; cyc = c1; mu = mt; break; }
+        }
+        if (mu == m0 && it == 2) { e->cmu = mu; DECIDE(); frame_size(e, &n, &cyc); evs++; }
+        td += now_ms() - tt;
+    }
+    n_pre = (double)n;
+    if (bm) { /* last step, cheap: a frame just over its whole number of superframes is cut by a higher lambda, mode decision only (the analysis stands).  A spill that came out small returns to one superframe rather than waste the tail */
+        double T = spill && (double)n >= 1.25 * C ? cap : C, base = e->lam, x = 1; int it;
+        for (it = 0; it < 4 && (double)n > T && x < e->p.trim_max; it++) { double f = pow(n / T, 1.6); x *= f > 1.25 ? f : 1.25; if (x > e->p.trim_max) x = e->p.trim_max; e->lam = base * x; DECIDE(); frame_size(e, &n, &cyc); evs++; trims++; }
+        if ((double)n > T && trims) { e->lam = base; DECIDE(); frame_size(e, &n, &cyc); evs++; } /* cannot be cut without wrecking it: it spills anyway, at its own quality */
+    }
+    if (e->p.sf_budget > 0 && cyc > cb) { /* the cycle cap is hard in this mode: a higher lambda can turn RAW blocks into coded ones and raise the cycles, and the loop above can run out of tries.  The decode time of one frame is what starves the audio on the unit, so it wins over the byte ceiling.  mu alone pushes blocks to RAW and so over the ceiling: lambda moves with it when the frame is near the ceiling */
+        double T = bm ? (spill && n_pre >= 1.25 * C ? cap : C) : 1e18, lx = 1; int it;
+        for (it = 0; it < 16 && (cyc > cb || ((double)n > T && (double)n <= e->p.trim_ratio * T && lx < e->p.trim_max)); it++) {
+            if (cyc > cb) { double r = pow(cyc / cb, 3); mu *= r > 2 ? r : 2; if (mu > 64) { mu = 64; e->lam *= 1.5; } }
+            if ((double)n > T && (double)n <= e->p.trim_ratio * T && lx < e->p.trim_max) { lx *= 1.25; e->lam *= 1.25; }
+            e->cmu = mu; DECIDE(); frame_size(e, &n, &cyc); evs++; trims++;
+        }
+        if (cyc > cb) fprintf(stderr, "rnv2enc: frame %d over the cycle cap (%.0f > %.0f)\n", e->fn, cyc, cb);
+    }
+    if (e->nact >= 1500 && mu > 8 * e->p.mu_min) e->bmu = mu;
     e->alvl = e->lvl; if (ad) e->since = e->lvl != Lprev ? 0 : e->since + 1;
     if (e->key) {
         if (e->lvl == e->nlev - 1) { e->pkey = (double)n; e->pkq = qp; } else e->pkey = 0;
@@ -976,25 +1142,54 @@ int rnv2enc_encode(rnv2enc *e, const uint8_t *pix, int stride, enum rnv2_fmt fmt
     }
     else if (e->nact >= 128) { if (e->lvl == e->nlev - 1) { e->pbpa = (double)n / e->nact; e->pq = qp; } else e->pbpa = 0; }
     e->mu = mu;
-    if ((double)n > cap) fprintf(stderr, "rnv2enc: frame %d exceeds the bucket hard cap (%zu > %.0f)\n", e->fn, n, cap);
+    if ((double)n > hard0 && !bm) fprintf(stderr, "rnv2enc: frame %d exceeds the bucket hard cap (%zu > %.0f)\n", e->fn, n, hard0);
     e->fill = e->fill + n - e->rate_pf; if (e->fill < 0) e->fill = 0;
+    if (bm) {
+        if ((double)n > C) { e->since_spill = 0; if (!e->p.spill_carry) { e->fill -= (double)n - C; if (e->fill < 0) e->fill = 0; } } else e->since_spill++;
+    }
+    e->lastn = (double)n;
     e->qp_raised = qp > e->qp0;
     e->qp = qp;
-    if (rtok && (double)n > soft) { /* rt_rc accepted an oversize frame: raise qp for the next frame instead */
+    if (bm && trims && n_pre > soft) { /* cut by lambda: the next frame starts at a qp where it should not need that */
+        int dq = (int)ceil(6 * log2(n_pre / soft) * 0.8);
+        e->qp = qp + (dq > 1 ? dq : 1); if (e->qp > e->p.qp_max) e->qp = e->p.qp_max;
+        e->qp_raised = 1;
+    }
+    else if (rtok && (double)n > soft) { /* rt_rc accepted an oversize frame: raise qp for the next frame instead */
         int dq = (int)ceil(6 * log2(n / soft) * 0.8);
         e->qp = qp + (dq > 1 ? dq : 1); if (e->qp > e->p.qp_max) e->qp = e->p.qp_max;
         e->qp_raised = 1;
     }
+    { int nc = 0; for (b = 0; b < NB; b++) nc += e->changed[b]; nchanged = nc; }
+    if (e->p.converge && !e->key && e->p.sf_budget > 0) { /* spend what the link and the decoder have left on blocks not yet equal to the target, worst first.  RAW writes the target itself: the error of that block is 0 from here on.  Comes after the rate state: this frame's decisions and the next frame's qp do not see it, only the bucket does */
+        double L, Cc = e->p.sf_budget; int pass;
+        if (e->p.csc_fit && nchanged == 0) { int nf = 0, mx = 400; for (b = 0; b < NB && nf < mx; b++) if (!e->fitted[b] && !e->changed[b] && e->bd[b].mode == SKIP) { fit_block(e, b); block_exact(e, b); nf++; } }
+        if (e->dtf >= 1.5) { int k = (int)(e->dtf * 0.8); if (k < 1) k = 1; if (k > e->p.conv_sf) k = e->p.conv_sf; L = k * Cc; } /* the source has slowed: the next frame is ticks away */
+        else { L = (double)n > 0.5 * Cc ? 0 : alw < Cc ? alw : Cc; }                                                                                         /* frames every tick: only a light frame (a selector move, not a pan) gives room, and only what this superframe has anyway */
+        if (L > hard0) L = hard0;
+        if ((double)n < L) {
+            double room = L - (double)n, croom = cb - cyc; int nmax = (int)(room / 131);
+            for (pass = 0; pass < 2 && nmax > 0 && croom > 0; pass++) for (b = 0; b < NB && nmax > 0 && croom > 0; b++) {
+                blkdec *d = &e->bd[b]; double dc;
+                if (d->mode != SKIP || e->changed[b] || e->exact[b]) continue;
+                if (pass == 0 && e->berr[b] < 128) continue;   /* first the blocks with an error of 1 level RMS or more */
+                dc = CY_HDR + CY_RAW - d->cyc; if (dc > croom) { croom = 0; break; }
+                d->mode = RAW; d->cbp = 0; d->cbits = 0; d->cyc = CY_HDR + CY_RAW; croom -= dc; nmax--; nconv++;
+            }
+            if (nconv) { double f0 = (double)n; frame_size(e, &n, &cyc); e->fill += (double)n - f0; if ((double)n > Cc) spill = 1; }
+        }
+    }
     t5 = now_ms();
     run_w(e, job_commit, BH, e->ncoded, 64);
     run_w(e, job_scatter, BH, e->ncoded, 256);
+    if (e->p.converge) { for (b = 0; b < NB; b++) if (!e->forced[b] || e->bd[b].mode != SKIP) block_exact(e, b); }
     e->wqp = qp;
     run_w(e, job_post, 1 + 3 * BH, e->ncoded, 128); /* serial bitstream write overlapped with the half-pel planes of the new reference */
     t6 = now_ms();
     for (b = 0; b < NB; b++) {
         int m = e->bd[b].mode;
         e->prevmode[b] = (uint8_t)m;
-        if (m == SKIP && !e->forced[b]) { e->skq[b] = (uint8_t)qp; e->skmu[b] = mu; e->skl[b] = (uint8_t)e->alvl; }
+        if (m == SKIP && !e->forced[b]) { e->skq[b] = (uint8_t)qp; e->skmu[b] = mu; e->skl[b] = (uint8_t)(trims ? e->nlev : e->alvl); } /* a SKIP forced by the trim is judged again next frame */
         if (m == SKIP) e->prev_mv[b][0] = e->prev_mv[b][1] = 0; else { e->prev_mv[b][0] = e->mv0[b][0]; e->prev_mv[b][1] = e->mv0[b][1]; }
         if (info) info->modes[m]++;
     }
@@ -1002,7 +1197,7 @@ int rnv2enc_encode(rnv2enc *e, const uint8_t *pix, int stride, enum rnv2_fmt fmt
     if (*outlen != n) fprintf(stderr, "rnv2enc: internal size mismatch %zu vs %zu\n", *outlen, n);
     if (info) {
         info->bytes = (int)*outlen; info->qp = qp; info->level = e->alvl; info->link_cap = e->p.rate; info->lamk = e->lamk; info->tries = tries; info->cycles = cyc; info->mu = mu; info->fill = e->fill;
-        info->n_skip_forced = e->n_forced; info->n_searched = e->n_search;
+        info->n_skip_forced = e->n_forced; info->n_searched = e->n_search; info->trims = trims; info->nchanged = nchanged; info->nraw_conv = nconv; if (e->p.converge) { int ne = 0; for (b = 0; b < NB; b++) ne += e->exact[b]; info->nexact = ne; } info->spill = !e->p.sf_budget || (double)n <= C ? 0 : (spill || e->key) ? 1 : 2;
         info->sizes[0] = (int)e->w0.n; info->sizes[1] = (int)e->w1.n; info->sizes[2] = (int)e->w2.n; info->sizes[3] = (int)e->s3n;
         info->gmv_n = e->ng; for (i = 0; i < e->ng; i++) { info->gmv[i][0] = e->g[i][0]; info->gmv[i][1] = e->g[i][1]; }
         info->t_ms[0] = t1 - t0; info->t_ms[1] = t2 - t1; info->t_ms[2] = t3 - t2; info->t_ms[3] = ta; info->t_ms[4] = td;

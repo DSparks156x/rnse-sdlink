@@ -10,9 +10,23 @@
 // word at 25 MHz) or bottom half (prio 16). A full cpsid here lost CMD words: bad-CRC host command, 50 s host stall (bench 2026-11-05).
 #define AVS_LOCK()   __asm__ volatile("msr basepri, %0" :: "r"(64u) : "memory")
 #define AVS_UNLOCK() __asm__ volatile("msr basepri, %0" :: "r"(0u) : "memory")
+// Pin commit only: prevent the prio-16 command bottom half changing the command generation between its
+// check and the one-store pin update. No table scan, image copy or sector freeing runs inside this region.
+// CMD top half (prio 0) remains enabled; restore any incoming mask rather than lowering it.
+#define AVS_PIN_LOCK(v) __asm__ volatile("mrs %0, basepri\n\tmsr basepri_max, %1" : "=&r"(v) : "r"(16u) : "memory")
+#define AVS_PIN_UNLOCK(v) __asm__ volatile("msr basepri, %0" :: "r"(v) : "memory")
+#elif defined(AVS_TEST_INTERLEAVE)
+// Native regression hook: let a simulated read IRQ land after victim selection, before the lock.
+extern void avs_test_before_lock(void);
+#define AVS_LOCK()   avs_test_before_lock()
+#define AVS_UNLOCK() do {} while (0)
+#define AVS_PIN_LOCK(v) do { (v) = 0; } while (0)
+#define AVS_PIN_UNLOCK(v) do { (void)(v); } while (0)
 #else
 #define AVS_LOCK()   do {} while (0)
 #define AVS_UNLOCK() do {} while (0)
+#define AVS_PIN_LOCK(v) do { (v) = 0; } while (0)
+#define AVS_PIN_UNLOCK(v) do { (void)(v); } while (0)
 #endif
 
 AvStream AVS;
@@ -46,6 +60,7 @@ void avs_unwire(const uint32_t *w, int fmt4, uint8_t *out) {
 // ---------------------------------------------------------------- pool
 void AvStream::init(AvsSector *const *b, const uint16_t *bn, int nb, now_fn nowf, tx_fn txf) {
   memset(slots, 0, sizeof slots);
+  read_slot = -1;
   banks = b; bank_n = bn; nbanks = nb; now = nowf; tx = txf;
   pool_n = 0;
   for (int i = 0; i < nb; i++) pool_n += bn[i];
@@ -53,12 +68,13 @@ void AvStream::init(AvsSector *const *b, const uint16_t *bn, int nb, now_fn nowf
   free_list = (uint16_t *)malloc(sizeof(uint16_t) * (size_t)(pool_n ? pool_n : 1));
   free_n = 0;
   for (int i = pool_n - 1; i >= 0; i--) free_list[free_n++] = (uint16_t)i;
-  cfg.hold_cut_ms = 30; cfg.hold_future_ms = 20; cfg.silent_ms = 100; cfg.stale_ms = 200; cfg.status_hz = 20;
+  cfg.hold_cut_ms = 30; cfg.hold_future_ms = 20; cfg.silent_ms = 100; cfg.stale_ms = 200; cfg.status_hz = 20; cfg.whole_sf = 0;
   memset(&st, 0, sizeof st);
   st.ver = 1; st.size = sizeof(AvsStatus); st.pool_sectors = (uint32_t)pool_n;
   have_begun = have_complete = have_served = 0; newest_begun = newest_complete = 0;
   ps = 0; mpos = 0; link_active = 0; rx_msgs = 0; last_rx_us = 0;
-  read_gen = 0; my_gen = 0xFFFFFFFFu; holding = 0; sticky_win = -1; degraded = 0; syn_valid = 0;
+  wslot = -1; cur_sec = -1; cur_got = 0; cur_dst = nullptr;
+  read_gen = 0; read_win = -1; my_gen = 0xFFFFFFFFu; holding = 0; sticky_win = -1; degraded = 0; syn_valid = 0;
   srv_head = srv_tail = 0; last_status_us = 0; last_sent_free = 0xFFFFFFFFu; last_sent_slots = 0xFFFFFFFFu; tx_seq = 0;
   card_state = 0; bus_width = 1; mode = 0; crc7_rejects = 0;
   uint8_t z[512];
@@ -77,13 +93,16 @@ AvsSector *AvStream::sec_ptr(uint16_t i) const {
 
 int AvStream::alloc_sector(void) {
   if (free_n == 0) {
-    // the Pi overran its credits (or the Teensy restarted under it): drop the oldest slot that is not being filled
-    int victim = -1;
-    for (int s = 0; s < AVS_NSLOT; s++)
-      if (slots[s].used && s != wslot && (victim < 0 || seq_after(slots[victim].seq, slots[s].seq))) victim = s;
-    if (victim < 0) return -1;
-    if (!slots[victim].served) st.evicted++;
-    free_slot(victim);
+    // Credit overrun: only unpinned slots other than the writer can be sacrificed. Selection is advisory:
+    // a read IRQ may pin that victim before free_slot atomically checks and unpublishes it.
+    for (int tries = 0; tries < AVS_NSLOT && free_n == 0; tries++) {
+      int victim = -1;
+      for (int s = 0; s < AVS_NSLOT; s++)
+        if (slots[s].used && s != wslot && s != read_slot &&
+            (victim < 0 || seq_after(slots[victim].seq, slots[s].seq))) victim = s;
+      if (victim < 0) return -1;
+      free_slot(victim, 0, 1);
+    }
   }
   if (free_n == 0) return -1;
   int r;
@@ -93,7 +112,7 @@ int AvStream::alloc_sector(void) {
   return r;
 }
 
-void AvStream::free_sector(uint16_t i) { free_list[free_n++] = i; }   // caller holds the lock
+void AvStream::free_sector(uint16_t i) { free_list[free_n++] = i; }   // main loop owns pool allocation
 
 // ---------------------------------------------------------------- slots
 int AvStream::used_slots(void) const {
@@ -102,13 +121,18 @@ int AvStream::used_slots(void) const {
   return n;
 }
 
-void AvStream::free_slot(int s) {
+int AvStream::free_slot(int s, int force, int evict) {
   AVS_LOCK();
   AvsSlot &S = slots[s];
+  if (!S.used || (!force && s == read_slot)) { AVS_UNLOCK(); return 0; }
+  if (evict && !S.served) st.evicted++;
+  if (s == read_slot) read_slot = -1;              // only explicit FLUSH/reset can invalidate a retry pin
+  S.used = 0;                                    // get can no longer acquire this slot
+  AVS_UNLOCK();
+  // Main owns the detached slot. A read IRQ cannot see it, so walking up to 256 indices needs no mask.
   for (int i = 0; i < S.total; i++)
     if (S.idx[i] != 0xFFFF) { free_sector(S.idx[i]); S.idx[i] = 0xFFFF; }
-  S.used = 0;
-  AVS_UNLOCK();
+  return 1;
 }
 
 int AvStream::find_slot(uint32_t seq) const {
@@ -121,28 +145,43 @@ int AvStream::find_slot_idx(uint32_t win) const {
   return -1;
 }
 
+// More than 128 superframes behind the newest: outside the window's +-128 seq range, so its window number now means a newer
+// superframe. get() no longer answers from it and it cannot keep a pin: the reader must always make progress (review finding 1).
+int AvStream::slot_stale(uint32_t seq) const { return have_begun && (int32_t)(newest_begun - seq) > 128; }
+
 int AvStream::new_slot(uint32_t seq, uint16_t total) {
   int s;
-  while ((s = find_slot_idx(seq & 0xFF)) >= 0) free_slot(s);      // resend, or an old seq on the same window slot
+  if (slot_stale(seq)) {                                           // seq only ever rises in one session: the sender restarted and DTR was not seen
+    for (s = 0; s < AVS_NSLOT; s++) if (slots[s].used) free_slot(s, 1);
+    AVS_LOCK();
+    have_begun = have_complete = 0;
+    syn_valid = 0;
+    AVS_UNLOCK();
+  }
+  // An admitted resend/wrap must never replace the host's retry image. Fail admission instead. A stale alias is not a retry image.
+  while ((s = find_slot_idx(seq & 0xFF)) >= 0) if (!free_slot(s, slot_stale(slots[s].seq))) return -1;
   for (s = 0; s < AVS_NSLOT && slots[s].used; s++) {}
   if (s == AVS_NSLOT) {                                            // table full: oldest served first, else oldest
-    int v = -1;
-    for (int i = 0; i < AVS_NSLOT; i++)
-      if (slots[i].served && (v < 0 || seq_after(slots[v].seq, slots[i].seq))) v = i;
-    if (v < 0) {
-      for (int i = 0; i < AVS_NSLOT; i++) if (v < 0 || seq_after(slots[v].seq, slots[i].seq)) v = i;
-      st.evicted++;
+    for (int tries = 0; tries < AVS_NSLOT; tries++) {
+      int v = -1;
+      for (int i = 0; i < AVS_NSLOT; i++)
+        if (slots[i].used && i != read_slot && slots[i].served &&
+            (v < 0 || seq_after(slots[v].seq, slots[i].seq))) v = i;
+      if (v < 0)
+        for (int i = 0; i < AVS_NSLOT; i++)
+          if (slots[i].used && i != read_slot && (v < 0 || seq_after(slots[v].seq, slots[i].seq))) v = i;
+      if (v < 0) return -1;
+      if (free_slot(v, 0, 1)) { s = v; break; }
     }
-    free_slot(v);
-    s = v;
+    if (s == AVS_NSLOT) return -1;
   }
   uint32_t t = now();
-  AVS_LOCK();
   AvsSlot &S = slots[s];
   S.seq = seq; S.total = total; S.have = 0; S.ended = 0; S.served = 0;
   S.t_begin = t; S.t_end = t; S.t_read = t;
   memset(S.idx, 0xFF, sizeof S.idx);
   memset(S.fmt1, 0, sizeof S.fmt1);
+  AVS_LOCK();                                  // initialize privately; publish only after all indices are ready
   S.used = 1;
   if (!have_begun || seq_after(seq, newest_begun)) newest_begun = seq;
   have_begun = 1;
@@ -151,32 +190,38 @@ int AvStream::new_slot(uint32_t seq, uint16_t total) {
 }
 
 void AvStream::reset_link(void) {
-  for (int s = 0; s < AVS_NSLOT; s++) if (slots[s].used) free_slot(s);
+  for (int s = 0; s < AVS_NSLOT; s++) if (slots[s].used) free_slot(s, 1);
   AVS_LOCK();
   have_begun = have_complete = have_served = 0;
   syn_valid = 0;
   AVS_UNLOCK();
   link_active = 0;
+  // The sender may have died inside a message. A parser left mid-WIRE would swallow the next sender's CONFIGs as sector
+  // data, up to 100 s at the 200 ms resend. Hunt for the magic again and give back the sector being copied.
+  if (ps == 4 && cur_sec >= 0) free_sector((uint16_t)cur_sec);
+  ps = 0; mpos = 0; hpos = 0; mgot = 0; mlen = 0; ppos = 0; wpos = 0;
+  wslot = -1; cur_sec = -1; cur_got = 0; cur_dst = nullptr; cur_drop = 0;
 }
 
 void AvStream::reclaim(uint32_t t) {
   for (int s = 0; s < AVS_NSLOT; s++) {
     AvsSlot &X = slots[s];
     if (!X.used) continue;
-    if (X.served) {                                  // mode A: kept until 2 newer superframes were served
-      int newer = 0;
-      for (int i = 0; i < AVS_NSLOT; i++)
-        if (slots[i].used && slots[i].served && seq_after(slots[i].seq, X.seq)) newer++;
-      if (newer >= 2) free_slot(s);
+    if (slot_stale(X.seq)) { free_slot(s, 1, 1); continue; }   // includes an old pin: get() cannot answer from it any more
+    if (X.served) {                                  // mode A: free once a newer superframe was served. The reader's command for
+      int newer = 0;                                 // that newer window moved the pin first, and a retry only ever re-reads the pinned one
+      for (int i = 0; i < AVS_NSLOT && !newer; i++)
+        if (slots[i].used && slots[i].served && seq_after(slots[i].seq, X.seq)) newer = 1;
+      if (newer) free_slot(s);
       continue;
     }
     uint32_t quiet = t - X.t_read;
     int complete = X.ended && X.have == X.total;
     if (complete) {                                  // never read: stale after stale_ms unless it is the newest
       if (have_complete && X.seq == newest_complete) continue;
-      if (t - X.t_end > (uint32_t)cfg.stale_ms * 1000u && quiet > 50000u) { st.evicted++; free_slot(s); }
+      if (t - X.t_end > (uint32_t)cfg.stale_ms * 1000u && quiet > 50000u) free_slot(s, 0, 1);
     } else if (X.seq != newest_begun && t - X.t_begin > 1000000u && quiet > 50000u) {   // abandoned
-      st.evicted++; free_slot(s);
+      free_slot(s, 0, 1);
     }
   }
 }
@@ -231,7 +276,11 @@ void AvStream::feed(const uint8_t *p, int n, console_fn console) {
       case 4: {
         if (cur_sec < 0 && !cur_got) {                // start of a sector
           cur_drop = 1;
-          if (wslot >= 0) { int a = alloc_sector(); if (a >= 0) { cur_sec = a; cur_drop = 0; } }
+          if (wslot >= 0 && !(wslot == read_slot && slots[wslot].idx[widx + wdone] != 0xFFFF)) {
+            int a = alloc_sector();
+            if (a >= 0) { cur_sec = a; cur_drop = 0; }
+            else st.rx_errors++;                   // all storage is owned by the reader/writer: count and drop
+          }
           cur_dst = cur_drop ? nullptr : (uint8_t *)sec_ptr((uint16_t)cur_sec)->w;
         }
         uint32_t k = (uint32_t)wbytes - cur_got; if (k > (uint32_t)n) k = (uint32_t)n;
@@ -272,9 +321,14 @@ void AvStream::sector_done(void) {
     else {
       AvsSlot &S = slots[wslot];
       uint16_t i = (uint16_t)(widx + wdone);
-      if (S.idx[i] != 0xFFFF) free_sector(S.idx[i]); else S.have++;
-      S.idx[i] = (uint16_t)cur_sec;
-      if (wfmt1) S.fmt1[i >> 5] |= 1u << (i & 31); else S.fmt1[i >> 5] &= ~(1u << (i & 31));
+      // A read may have pinned this slot while USB copied the image. Existing retry sectors stay immutable;
+      // missing sectors may still be published for cut-through reads.
+      if (wslot == read_slot && S.idx[i] != 0xFFFF) free_sector((uint16_t)cur_sec);
+      else {
+        if (S.idx[i] != 0xFFFF) free_sector(S.idx[i]); else S.have++;
+        S.idx[i] = (uint16_t)cur_sec;
+        if (wfmt1) S.fmt1[i >> 5] |= 1u << (i & 31); else S.fmt1[i >> 5] &= ~(1u << (i & 31));
+      }
     }
     AVS_UNLOCK();
   }
@@ -288,7 +342,7 @@ void AvStream::on_small(void) {
     case TL_SF_BEGIN:
       if (mlen >= 8) {
         uint16_t total = le16(q + 4);
-        if (total >= 1 && total <= 256) { new_slot(le32(q), total); st.begun++; }
+        if (total >= 1 && total <= 256) { if (new_slot(le32(q), total) < 0) st.rx_errors++; st.begun++; }
         else { st.rx_errors++; st.begun++; }
       }
       break;
@@ -310,12 +364,13 @@ void AvStream::on_small(void) {
         if (le16(q + 4)) cfg.silent_ms = le16(q + 4);
         if (le16(q + 6)) cfg.stale_ms = le16(q + 6);
         if (q[8]) cfg.status_hz = q[8];
+        if (mlen >= 10 && q[9]) cfg.whole_sf = q[9] == 2;   // 0 = leave as it is (every older sender), 1 = off, 2 = on
       }
       break;
     case TL_FLUSH:
       if (mlen >= 4) {
         uint32_t f = le32(q);
-        for (int s = 0; s < AVS_NSLOT; s++) if (slots[s].used && !seq_after(f, slots[s].seq)) free_slot(s);
+        for (int s = 0; s < AVS_NSLOT; s++) if (slots[s].used && !seq_after(f, slots[s].seq)) free_slot(s, 1);
         AVS_LOCK();
         if (have_begun && !seq_after(f, newest_begun)) newest_begun = f - 1;
         if (have_complete && !seq_after(f, newest_complete)) newest_complete = f - 1;
@@ -329,7 +384,11 @@ void AvStream::on_small(void) {
 }
 
 // ---------------------------------------------------------------- read side (IRQ)
-void AvStream::read_begin(void) { read_gen++; }
+void AvStream::read_begin(uint32_t lba) {
+  uint32_t rel = lba - AVS_WIN_LBA;
+  read_win = rel < AVS_WIN_SECT ? (int)(rel >> 8) : -1;
+  read_gen++;
+}
 
 void AvStream::synth(uint8_t kind, uint32_t seq, uint32_t arg, int bus4, uint32_t *out, uint16_t *n) {
   if (!(syn_valid && syn_kind == kind && syn_seq == seq && syn_arg == arg && syn_bus4 == (uint8_t)bus4)) {
@@ -371,12 +430,36 @@ int AvStream::get(uint32_t lba, int bus4, uint32_t *out, uint16_t *nw) {
   uint32_t g = read_gen;
   if (g != my_gen) { my_gen = g; holding = 0; sticky_win = -1; degraded = 0; }
   int win = (int)(rel >> 8), off = (int)(rel & 0xFF);
+  if (win != read_win) {                          // speculative queue crossing a Mode-A command's window boundary
+    memcpy(out, bus4 ? zero_w4 : zero_w1, (size_t)(bus4 ? zero_n4 : zero_n1) * 4);
+    *nw = bus4 ? zero_n4 : zero_n1;
+    return AVS_READY;
+  }
   uint32_t t = now();
   if (sticky_win == win) { synth(sticky_kind, sticky_seq, sticky_arg, bus4, out, nw); return AVS_READY; }
   int s = find_slot_idx((uint32_t)win);
+  if (s >= 0 && slot_stale(slots[s].seq)) s = -1;   // a stale alias never answers for the window and is never pinned again
   if (s >= 0) {
     AvsSlot &S = slots[s];
+    uint32_t pin_mask;
+    AVS_PIN_LOCK(pin_mask);
+    int command_slot = read_gen == g && read_win == win;
+    if (command_slot) read_slot = s;
+    AVS_PIN_UNLOCK(pin_mask);
+    if (!command_slot) {                          // a newer CMD17/18 preempted this build; pump will discard it
+      memcpy(out, bus4 ? zero_w4 : zero_w1, (size_t)(bus4 ? zero_n4 : zero_n1) * 4);
+      *nw = bus4 ? zero_n4 : zero_n1;
+      return AVS_READY;
+    }
     S.t_read = t;
+    if (off == 0 && cfg.whole_sf && S.have != S.total && !degraded) {   // hold before the first block instead of inside the read
+      if (!holding || hold_lba != lba) { holding = 1; hold_lba = lba; hold_t0 = t; st.holds++; }
+      uint32_t lim = cfg.hold_cut_ms < AVS_MAX_HOLD_MS ? cfg.hold_cut_ms : AVS_MAX_HOLD_MS;
+      if (t - hold_t0 < lim * 1000u) return AVS_HOLD;
+      holding = 0; degraded = 1; st.hold_timeouts++; st.notready++;   // not marked served: nothing of it was delivered
+      synth(SFF_NOTREADY, S.seq, have_complete ? newest_complete : 0, bus4, out, nw);
+      return AVS_READY;
+    }
     if (off == 0 && !S.served) {
       S.served = 1; st.served_seq = S.seq; have_served = 1;
       uint8_t h = srv_head, nh = (uint8_t)((h + 1) & 15);
@@ -510,7 +593,8 @@ int avs_selftest(char *msg, int ml) {
   enum { NP = 24 };
   AvsSector *pool = (AvsSector *)malloc(sizeof(AvsSector) * NP);
   if (!pool) { snprintf(msg, (size_t)ml, "FAIL no heap"); return 1; }
-  static AvStream a;
+  AvStream a;                                         // 11 KB on the stack: console only, not during streaming; a static would cost pool
+  memset((void *)&a, 0, sizeof a);
   AvsSector *banks[2] = {pool, pool + 16};
   uint16_t bn[2] = {16, 8};
   t_now = 1000000; t_txn = 0; t_conn = 0;
@@ -522,20 +606,20 @@ int avs_selftest(char *msg, int ml) {
   t_send_sf(a, 5, 3, 3, 7);                          // seq 5, 3 sectors, fed 7 bytes at a time
   if (a.free_sectors() != NP - 3 || !a.link_active) T_FAIL("FAIL pool after sf5 free=%d", a.free_sectors());
   uint32_t L5 = AVS_WIN_LBA + 5 * 256;
-  a.read_begin();
+  a.read_begin(L5);
   for (int i = 0; i < 3; i++) {
     t_sector(e, 5, i);
     if (t_get(a, L5 + (uint32_t)i, 1, b) != AVS_READY || memcmp(b, e, 512)) T_FAIL("FAIL serve sf5 sector %d", i);
   }
   if (t_get(a, L5 + 3, 1, b) != AVS_READY) T_FAIL("FAIL beyond total");
   for (int k = 0; k < 512; k++) if (b[k]) T_FAIL("FAIL beyond total not zero");
-  a.read_begin();
+  a.read_begin(L5 + 1);
   t_sector(e, 5, 1);                                  // 1-bit bus: the Teensy re-encodes the 4-bit image
   if (t_get(a, L5 + 1, 0, b) != AVS_READY || memcmp(b, e, 512) || a.st.converted != 1) T_FAIL("FAIL 1-bit convert");
   if (t_get(a, 0x40100, 1, b) != AVS_NOTWIN) T_FAIL("FAIL notwin");
   // future slot (seq 6, nothing sent): hold, then NOT_READY, then the same answer at once for the rest
-  a.read_begin();
   uint32_t L6 = AVS_WIN_LBA + 6 * 256;
+  a.read_begin(L6);
   if (t_get(a, L6, 1, b) != AVS_HOLD) T_FAIL("FAIL future hold");
   t_now += 10000;
   if (t_get(a, L6, 1, b) != AVS_HOLD) T_FAIL("FAIL future hold 10ms");
@@ -545,12 +629,12 @@ int avs_selftest(char *msg, int ml) {
   if (crc32z(b + 64, 448, crc32z(b, 60)) != be32r(b + 60)) T_FAIL("FAIL NOT_READY hdr crc");
   if (t_get(a, L6 + 1, 1, b) != AVS_READY || be32r(b + 12) != (SFF_SYNTH | SFF_NOTREADY)) T_FAIL("FAIL sticky");
   // past slot (seq 2 < newest 5, not resident): EXPIRED naming the newest seq
-  a.read_begin();
+  a.read_begin(AVS_WIN_LBA + 2 * 256);
   if (t_get(a, AVS_WIN_LBA + 2 * 256, 1, b) != AVS_READY || be32r(b + 12) != (SFF_SYNTH | SFF_EXPIRED) ||
       be32r(b + 8) != 2 || be32r(b + 64) != 5) T_FAIL("FAIL EXPIRED");
   // cut-through: seq 6 begun with 1 of 3 sectors; sector 1 holds, arrives during the hold -> served
   t_send_sf(a, 6, 3, 1, 600);
-  a.read_begin();
+  a.read_begin(L6);
   t_sector(e, 6, 0);
   if (t_get(a, L6, 1, b) != AVS_READY || memcmp(b, e, 512)) T_FAIL("FAIL cut sector 0");
   if (t_get(a, L6 + 1, 1, b) != AVS_HOLD) T_FAIL("FAIL cut hold");
@@ -567,16 +651,17 @@ int avs_selftest(char *msg, int ml) {
   }
   // cut-through timeout: seq 7 with 1 of 2 sectors, never completed -> NOT_READY after 30 ms
   t_send_sf(a, 7, 2, 1, 64);
-  a.read_begin();
   uint32_t L7 = AVS_WIN_LBA + 7 * 256;
+  a.read_begin(L7);
   t_get(a, L7, 1, b);
   if (t_get(a, L7 + 1, 1, b) != AVS_HOLD) T_FAIL("FAIL cut2 hold");
   t_now += 31000;
   if (t_get(a, L7 + 1, 1, b) != AVS_READY || be32r(b + 12) != (SFF_SYNTH | SFF_NOTREADY)) T_FAIL("FAIL cut timeout");
-  // reclaim: 5, 6, 7 served -> 5 is freed (2 newer served); STATUS reports it
+  // reclaim: 5, 6, 7 served -> 5 and 6 are freed (a newer one served), 7 stays (newest, pinned); STATUS reports it
   t_txn = 0;
   a.poll();
   if (a.slot(0)->used && a.slot(0)->seq == 5) T_FAIL("FAIL reclaim sf5");
+  if (a.used_slots() != 1) T_FAIL("FAIL reclaim keep one, used=%d", a.used_slots());
   int fs = -1, srv = 0;
   for (int i = 0; i + 16 <= t_txn;) {
     uint32_t len = le32(t_tx + i + 8);
@@ -585,10 +670,10 @@ int avs_selftest(char *msg, int ml) {
     if (le16(t_tx + i + 4) == TL_SERVED) srv++;
     i += 16 + (int)len;
   }
-  if (fs != a.free_sectors() || fs != NP - 4 || srv != 3) T_FAIL("FAIL status free=%d srv=%d", fs, srv);
+  if (fs != a.free_sectors() || fs != NP - 1 || srv != 3) T_FAIL("FAIL status free=%d srv=%d", fs, srv);
   // silent Pi: future slot -> IDLE (seq = newest complete)
   t_now += 300000;
-  a.read_begin();
+  a.read_begin(AVS_WIN_LBA + 9 * 256);
   t_get(a, AVS_WIN_LBA + 9 * 256, 1, b);
   t_now += 21000;
   if (t_get(a, AVS_WIN_LBA + 9 * 256, 1, b) != AVS_READY || be32r(b + 12) != (SFF_SYNTH | SFF_IDLE) || be32r(b + 8) != 6)
@@ -599,7 +684,7 @@ int avs_selftest(char *msg, int ml) {
   // credit overrun: 30 sectors into a 24-sector pool -> oldest slot evicted, nothing corrupt
   t_send_sf(a, 10, 20, 20, 528);
   t_send_sf(a, 11, 10, 10, 528);
-  a.read_begin();
+  a.read_begin(AVS_WIN_LBA + 11 * 256 + 9);
   t_sector(e, 11, 9);
   if (t_get(a, AVS_WIN_LBA + 11 * 256 + 9, 1, b) != AVS_READY || memcmp(b, e, 512)) T_FAIL("FAIL overrun serve");
   free(pool);

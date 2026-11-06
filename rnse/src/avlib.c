@@ -144,3 +144,6 @@ void du_restore(void)
 }
 
 u32 du_dssr(void) { return R32(DU_DSSR); }
+
+/* array-0 mode word as the firmware last left it: anything but ours means it is taking the plane back */
+u32 du_mr(void) { return R32(SH_MR); }

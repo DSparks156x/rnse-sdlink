@@ -128,6 +128,7 @@ static KnobDef KNOBS[] = {
   {"fastpat", &K.fastpat, 1, 0, "pattern area = one pre-encoded sector (bench timing test)"},
   {"dlaunch", &K.dlaunch, 1, 1, "DAT TX launch edge 0=rising 1=falling"},
   {"mp3", &vol_mp3, 2, 0, "0 none, 1 SILENCE.MP3, 2 TONE.MP3 (RNS-E must remount)"},
+  {"wholesf", &AVS.cfg.whole_sf, 1, 0, "stream: 1 = hold only before sector 0 until the superframe is complete, 0 = cut-through"},
 };
 static void print_knobs(void) {
   Serial.print("CFG");
@@ -146,7 +147,7 @@ static void selftest(void) {
 }
 
 // ---------------------------------------------------------------- S0 USB throughput
-static uint8_t usbbuf[65536] __attribute__((aligned(32)));
+static uint8_t usbbuf[4096] __attribute__((aligned(32)));   // bench USB test only: smaller chunks, same stream. Was 64 KB
 static void usb_tx_test(uint32_t mb) {
   uint32_t total = mb * 1048576u, sent = 0, ctr = 0;
   Serial.print("USBTX BEGIN "); Serial.println((unsigned long)total);
@@ -347,13 +348,13 @@ static uint8_t rxbuf[4096];
 void setup() {
   fx_begin();                                // pads high-Z first thing
   Serial.begin(115200);
+  fx_set_mode(FX_CARD);                      // card from power-up, before anything that waits: drives only while slot VDD is sensed
   uint32_t t0 = millis();
-  while (!Serial && millis() - t0 < 2000) {}
+  while (!Serial && millis() - t0 < 2000) fx_poll();
   touch_begin();                             // ~75 ms GT911 reset + probe; SD pads already high-Z
   Serial.println("BOOT " FW_VERSION);
   help();
   touch_print();
-  fx_set_mode(FX_CARD);                      // card from power-up: drives only while slot VDD is sensed
 }
 
 void loop() {

@@ -34,7 +34,7 @@ static int read_some(audio_stage *a, size_t want)
     if (a->have + want > a->cap) want = a->cap - a->have;
     if (!want) return 0;
     ssize_t r = read(a->fd, a->buf + a->have, want);
-    if (r > 0) { a->have += (size_t)r; return (int)r; }
+    if (r > 0) { a->have += (size_t)r; a->raw_bytes += (uint64_t)r; a->last_arrival = 1; return (int)r; }
     if (r == 0 || (errno != EAGAIN && errno != EINTR)) a->eof = 1;
     return 0;
 }
@@ -59,15 +59,26 @@ int audio_take(audio_stage *a, int frames, uint8_t *out, int blocking)
         if (blocking || !a->nonblock) while (a->have < need && !a->eof) read_some(a, need - a->have);
         else {
             audio_read_avail(a);
-            /* live audio must not queue up: when we run under real time, ticks are skipped while the source keeps coming, so the
-             * delay only grows. Keep this tick's frames + 100 ms, drop the oldest (2026-11-05: 1.6 s and rising without this). */
-            size_t keep = need + 48 * 100 * 4;
-            if (a->have > keep) {
-                size_t drop = (a->have - keep) & ~(size_t)3;
+            /* PipeWire hands audio over in bursts (256-1440 frames), the tick takes a fixed 800. With no margin the tick found too little, padded the rest
+             * with silence, and later dropped the backlog: ~20 audible gaps per 30 s, in multiples of 16 frames (bench 2026-11-05, 1 kHz through the chain).
+             * So: hold a margin (PRIME). Only a real shortage re-primes. Over HIGH the excess goes, back to the margin: ticks are skipped while the
+             * reader is away, and the delay must not grow. */
+            size_t prime = 48 * AUDIO_PRIME_MS * 4, high = prime + 48 * 60 * 4;
+            if (!a->primed) {
+                if (a->have >= need + prime) a->primed = 1;
+                else {
+                    memset(out, 0, need);
+                    a->frames_silence += need / 4;
+                    return 0;
+                }
+            }
+            if (a->have > need + high) {
+                size_t drop = (a->have - need - prime) & ~(size_t)3;
                 memmove(a->buf, a->buf + drop, a->have - drop);
                 a->have -= drop;
                 a->frames_dropped += drop / 4;
             }
+            if (a->have < need) a->primed = 0;
         }
     }
     size_t got = a->have < need ? (a->have & ~(size_t)3) : need;

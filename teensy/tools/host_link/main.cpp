@@ -42,8 +42,9 @@ static void tx(const uint8_t *p, int n) {
 static unsigned long console_bytes;
 static void console(uint8_t c) { (void)c; console_bytes++; }
 
-#define POOL_A 880
-#define POOL_B 192
+#include "../../sdemu/config.h"
+#define POOL_A AVS_POOL_OCRAM                         // same pool as the firmware
+#define POOL_B AVS_POOL_DTCM
 static AvsSector poolA[POOL_A], poolB[POOL_B];
 
 static void service(int wait_ms) {
@@ -69,7 +70,7 @@ static uint8_t rbuf[256 * 512];
 
 // one CMD18: count sectors from lba into dst; services the pty while a sector is held
 static void read_cmd(uint32_t lba, int count, uint8_t *dst) {
-  AVS.read_begin();
+  AVS.read_begin(lba);
   reads++;
   for (int i = 0; i < count; i++) {
     uint32_t w[WIRE_MAX_WORDS], chk[WIRE_MAX_WORDS];
