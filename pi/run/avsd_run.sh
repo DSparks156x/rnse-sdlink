@@ -64,8 +64,9 @@ e=[i for i in json.load(sys.stdin) if i.get("properties",{}).get("node.name")=="
 m=[str(i["index"]) for i in e if i["sink"]!='"$ck"']
 print(" ".join(m) if m else ("-" if e else ""))')
   [ "$ec" = - ] && return 0
+  # No echo canceller (LIVI): nothing to move; avsd_clock alone keeps the graph on the Pi clock.
+  [ -z "$ec" ] && return 0
   for i in $ec; do pactl move-sink-input "$i" avsd_clock && say "avsd_clock: moved echo-cancel-playback $i back onto the Pi clock"; done
-  [ -n "$ec" ]
 }
 waitfor "Pi clock driving the audio graph (avsd_clock)" clock_sink
 waitfor "Teensy on USB" have_teensy
