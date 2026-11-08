@@ -40,9 +40,9 @@ reads in two 60 s runs (about one per 25 to 30 s without it); the flash run abov
 the Teensy evicts a superframe the unit has not started reading in time, which shows up as
 EXPIRED headers and a CRC mismatch, not as corruption.
 
-## Live Pi settings (differ from `pi/scripts/hud2.sh` in this repo)
+## Live Pi settings, 2026-11-06 (historical)
 
-`pi/scripts/hud2.sh` here is the source of truth for the script. The copy running on the Pi on 2026-11-06 differs in two places:
+`pi/run/hud2.sh` is now the source of truth (this section is the 2026-11-06 state). The copy running on the Pi on 2026-11-06 differs in two places:
 
 - `ENC_BIN` default is `$A/pienc_budget3/rnv2enc` instead of `$A/pienc_budget/rnv2enc`
 - the default `ENCFLAGS` has `--converge 1` appended: `--cyc 4.05e6 --refill wall --dwell 0 --converge 1`

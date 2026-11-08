@@ -1,6 +1,6 @@
 r"""Refresh this repo from the working tree (analysis/av_over_sd_v1) using tools/manifest.txt, then show git status.
 
-  C:\Users\raccoon\AppData\Local\Programs\Python\Python312\python.exe -I tools/sync_from_analysis.py [--src DIR] [--dry]
+  python -I tools/sync_from_worktree.py [--dry]
 
 Only files named in the manifest are copied (standard library only). Source files in the scanned directories that are
 neither listed nor marked 'skip' are reported so nothing silently goes missing. Text files get a few fixed
@@ -18,14 +18,16 @@ SRC_EXT = {'.c', '.h', '.cpp', '.py', '.sh', '.s', '.ld', '.ino', '.ini', '.md',
 IGNORE_DIRS = {'.venv', '.pio', '__pycache__', 'out', 'results', 'logs', 'sim', 'evidence', 'fw', 'build'}
 GIT = 'git'
 
+HOME = os.path.expanduser('~')   # the author's profile folder: scrubbed from copied files, never written into the repo
+PY312 = HOME + r'\AppData\Local\Programs\Python\Python312\python.exe'
 SCRUB = [   # (old, new) applied to every copied text file
-    (r'C:\Users\raccoon\AppData\Local\Programs\Python\Python312\python.exe', 'python'),
-    (r'C:\Users\raccoon\.cache\codex-runtimes\codex-primary-runtime\dependencies\python\python.exe', 'python'),
-    ('C:\\\\Users\\\\raccoon\\\\AppData\\\\Local\\\\Programs\\\\Python\\\\Python312\\\\python.exe', 'python'),
-    ('r"C:\\Users\\raccoon\\Documents\\carstuff\\RNSE hacking\\analysis\\av_over_sd_v1\\teensy\\tools"',
+    (PY312, 'python'),
+    (HOME + r'\.cache\codex-runtimes\codex-primary-runtime\dependencies\python\python.exe', 'python'),
+    (PY312.replace('\\', '\\\\'), 'python'),
+    ('r"' + HOME + r'\Documents\carstuff\RNSE hacking\analysis\av_over_sd_v1\teensy\tools"',
      'os.path.join(os.path.dirname(os.path.abspath(__file__)), "..")'),
     ('192.168.12.1', '<pi-address>'),
-    (r'C:\Users\raccoon\.pio-teensy\packages\tool-teensy', r'<PLATFORMIO_CORE_DIR>\packages\tool-teensy'),
+    (HOME + r'\.pio-teensy\packages\tool-teensy', r'<PLATFORMIO_CORE_DIR>\packages\tool-teensy'),
 ]
 NOTE_SPEC = ("> Written as a design document, since implemented and run on the bench (see the root README for the real state).\n"
              "> References to other folders (datasheets, analysis notes, FACTS.md, sdgen.py, video/) point into the author's private\n"
@@ -80,9 +82,7 @@ def read_manifest():
 
 def transform(dest, data):
     try:
-        s = data.decode("utf-8").replace("
-", "
-")   # the repo is LF only (.gitattributes)
+        s = data.decode("utf-8").replace(chr(13) + chr(10), chr(10))   # the repo is LF only (.gitattributes)
     except UnicodeDecodeError:
         return data
     for a, b in SCRUB:

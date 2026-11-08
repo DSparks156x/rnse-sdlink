@@ -46,3 +46,5 @@ fw/
 pienc/rnv2enc_count
 pienc/rnv2enc_emu
 pi/wlcap/wlcap
+bin/
+pienc/rnv3dec_ref

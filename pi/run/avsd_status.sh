@@ -3,7 +3,7 @@
 export XDG_RUNTIME_DIR=/run/user/$(id -u)
 L=$XDG_RUNTIME_DIR/avsd
 echo "== service";   systemctl --user --no-pager -n 0 status avsd-chain.service | sed -n 1,4p
-echo "== chain log"; journalctl --user -u avsd-chain -n 8 --no-pager -o cat
+echo "== chain log"; journalctl -b _SYSTEMD_USER_UNIT=avsd-chain.service -n 8 --no-pager -o cat
 echo "== avlink";    tail -n 2 "$L/live.log" 2>/dev/null | cut -c1-220
 echo "== capture";   tail -n 1 "$L/cap.log" 2>/dev/null | cut -c1-160
 echo "== priority";  cat "$L/rt.log" 2>/dev/null | tail -n 3

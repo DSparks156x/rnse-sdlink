@@ -1,11 +1,11 @@
-# rnse-av-sd
+# sdlink
 
 Experimental: audio and video for an Audi RNS-E (SH7773 "193PU" head unit) delivered through its SD card slot.
 A Teensy 4.1 pretends to be an SD card; a program on the RNS-E reads A/V "superframes" from it, decodes them and drives the screen
 and the audio sink on the TV source. The source is typically Android Auto (Hudiy) running on a Raspberry Pi 5.
 
-**State (2026-11-06): experimental, tested on one unit (the author's), on a bench. Not a product.** Nothing here is safe to run on
-a car you care about, and nothing has run in a car. The RNS-E side pokes firmware internals at fixed addresses that only match
+**State (2026-11-07): experimental, running in the author's car on one unit. Not a product.** Nothing here is safe to run on
+a car you care about. The RNS-E side pokes firmware internals at fixed addresses that only match
 specific firmware builds (checked at runtime in `rnse/layout.py`, `FW_CHECKS`). Misuse of flash tools (none are in this repo)
 can brick the unit.
 
@@ -13,6 +13,9 @@ Measured on the bench, with the reader in the unit's flash and the stream starte
 SD, 60 superframes/s, 59.6 fps shown, 0 CRC errors in a 41 s window. Video alone reached about 4.2 to 4.3 MB/s. Open: recovery
 after the slot loses power is fixed in the Teensy code but not proven, the Teensy dropped off USB about every 15 minutes on one
 bench day, cold power-up and live Android Auto by ear are untested. Details and what is flashed versus RAM: `docs/BENCH_NOTES.md`.
+
+Used as a submodule by the Pi-side front ends (Hudiy integration in RNS-E-Hudiy, later LIVI): they supply the screen and the
+music, this repo carries them to the head unit.
 
 ## Hardware
 - Raspberry Pi 5 (aarch64, Pi OS Bookworm) running a Wayland compositor (labwc) with Hudiy / Android Auto
@@ -23,19 +26,21 @@ bench day, cold power-up and live Android Auto by ear are untested. Details and 
 
 ## How the chain fits
 ```
-Hudiy/AA --(wlr screencopy)--> pi/wlcap --raw--> pienc/rnv2enc --RNV3--> pi/avlink --USB CDC--> teensy/sdemu
+Hudiy/AA --(wlr export-dmabuf)--> pi/wlcap --raw--> pienc/rnv3enc --RNV3--> pi/avlink --USB CDC--> teensy/sdemu
   pw-record of the Hudiy sink (48 kHz s16) ---------------------------------^                    | emulated SD card
                                                                                                   v
         rnse/src/sdstream.c on the RNS-E: SD read, RNV2 decode, display flip, audio sink
         (started on TV entry by rnse/hook, or loaded into RAM by rnse/benchd.py)
 ```
 - `pi/wlcap`: screen capture with damage tracking, newest-frame-wins.
-- `pienc`: RNV3 video encoder, the working tree's `enc3` and what the Pi runs. The built binary is named `rnv2enc` (`docs/DEPLOYMENT.md` has the deployment and settings) (NEON on the Pi, scalar and emulated NEON on x86), rate-limited to the SD bus budget (`--linkcap`),
+- `pienc`: RNV3 video encoder, the working tree's `enc3` and what the Pi runs. Installed as `rnv3enc` (`docs/DEPLOYMENT.md` has the deployment and settings) (NEON on the Pi, scalar and emulated NEON on x86), rate-limited to the SD bus budget (`--linkcap`),
   with the superframe budget and still-screen convergence options. `ref/` is the older RNV2 reference decoder, `dec/` the RNV3 one.
 - `pi/avlink`: packs video, audio and control into superframes and sends them to the Teensy with credit-based flow control
   (`--whole-sf 1` hands over whole superframes). Tests in `pi/avlink/test`.
-- `pi/scripts`: `hud2.sh` starts capture, encoder and link with the flags in use; `car/` has the systemd units and install
-  scripts for starting the chain with the Pi.
+- `pi/run`: what the Pi runs. `avsd_run.sh` (systemd `avsd-chain.service`) waits for the audio graph, puts it on the Pi clock
+  (`avsd_clock`) and the Teensy, then `hud2.sh` starts capture, encoder and link; settings in `avsd.env`. Expects the binaries in
+  `~/avsd/current/bin` (the Hudiy integration installs them there). These scripts are edited here, not synced.
+- `pi/scripts`: diagnostics that need no head unit: `bench_audio.sh` (whole chain into /dev/null), `audio_diag.sh`, `tap_rate.py`, `xrun_delta.sh`.
 - `teensy/sdemu`: SD card emulation firmware (SD protocol, FAT16 volume, live superframe store, optional touch HID).
 - `rnse`: the RNS-E program (`src/`, built with an `sh-elf` cross toolchain), the PC-side bench host (`benchd.py`, `rnse_bench.py`,
   `sdstream.py`, `sdfast.py`) and `rnse/hook` (source of the flash-resident TV-entry starter, see `docs/HOOK.md`).
@@ -46,9 +51,8 @@ Hudiy/AA --(wlr screencopy)--> pi/wlcap --raw--> pienc/rnv2enc --RNV3--> pi/avli
 |---|---|---|
 | Teensy firmware | `cd teensy && pio run` | PlatformIO with the Teensy platform. `usb_serial_touch.py` patches the Teensy core's `usb_desc.h` to add a CDC+touch USB type. Not run in the last cleanup (it edits the shared core) |
 | RNS-E programs | `cd rnse && mkdir -p out && bash build.sh` | `sh-elf-gcc` (SH-4, big-endian, `-m4-single`) at `~/sh-elf/bin/sh-elf-*`; output in `rnse/out/` (`sdstream.bin`, `sdboot.bin`, ...) |
-| Pi link | `cd pi/avlink && make` | gcc |
-| Pi capture | `cd pi/wlcap && cc -O2 -pthread -o wlcap wlcap.c` | Wayland headers; `WAYLAND_DISPLAY` and `XDG_RUNTIME_DIR` at run time |
-| Encoder | `cd pienc && make` (`make test` for the self-checks) | gcc; NEON is used on aarch64, emulated NEON checks run on x86 |
+| Pi binaries | `make` at the top: `bin/rnv3enc`, `bin/avlink`, `bin/wlcap` (`make test` runs the encoder self-checks) | gcc on the Pi 5; `WAYLAND_DISPLAY` and `XDG_RUNTIME_DIR` at run time for wlcap |
+| Encoder only | `cd pienc && make` (`make test` for the self-checks) | gcc; NEON is used on aarch64, emulated NEON checks run on x86 |
 | Hook (`rnse/hook`) | not buildable here | linked into a firmware image by private tools |
 
 ### Checks that run offline (Windows Python plus WSL gcc, no hardware)
@@ -62,10 +66,8 @@ Hudiy/AA --(wlr screencopy)--> pi/wlcap --raw--> pienc/rnv2enc --RNV3--> pi/avli
 
 ## Install / run (bench procedure, in short)
 1. Flash the Teensy (`teensy/tools/bench/flash.py` for the Windows HalfKay path, or any Teensy loader with `firmware.hex`).
-2. On the Pi build wlcap, the encoder and avlink under `~/avsd`. `pi/scripts/hud2.sh` expects `~/avsd/pi/{wlcap,avlink}` and the
-   encoder at `~/avsd/pienc_rnv3/rnv3enc` (copy `pienc/` there, or set `ENC_BIN`). `hud2.sh SECONDS` starts capture, encoder
-   and link. For starting the chain with the Pi, see `pi/scripts/car/CAR_INSTALL.md`. The flags in use on the author's Pi
-   differ slightly from this script: see `docs/BENCH_NOTES.md`.
+2. On the Pi: `make`, copy `bin/*` to `~/avsd/current/bin` and `pi/run/*` to `~/avsd/current/chain`, install the two systemd
+   user units. `hud2.sh SECONDS` alone starts capture, encoder and link (`WLCAP_BIN`, `ENC_BIN`, `AVLINK_BIN` override the paths).
 3. RAM start from the PC: `python -I rnse/benchd.py serve` (owns the CowCAN, keeps the RNS-E awake), then
    `python -I rnse/benchd.py sdstream run --slot 0 --gate none --wrap 0 --mode av --secs N --target 3000 --iis`
    (the hook uses target 3000; older notes used 4800). The program uploads over SD or CAN and runs as a firmware task.
@@ -84,6 +86,6 @@ the RNS-E firmware; they are tied to specific builds.
 No license has been chosen yet. See `docs/THIRD_PARTY.md` for files whose provenance needs a decision.
 
 ## Refreshing from the working tree
-`tools/sync_from_analysis.py` re-copies the files listed in `tools/manifest.txt` from the author's private working tree
+`tools/sync_from_worktree.py` (working tree next to this repo, or `SDLINK_WORKTREE`) re-copies the files listed in `tools/manifest.txt` from the author's private working tree
 and reports any new unlisted source files. It needs no third-party packages. It also applies the path and address scrubbing
 and a few patches (test paths, notes). Re-run it, then `git status`.

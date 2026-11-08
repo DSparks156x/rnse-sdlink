@@ -5,10 +5,13 @@
 # CAPMODE: dmabuf (default: labwc hands over its buffer, no readback on the labwc thread) or shm (labwc reads back).
 # RTPRIO: SCHED_FIFO priority of the encoder, 0 = off. wlcap gets one less, avlink one more. Needs passwordless sudo; without it the chain just runs at normal priority.
 # Test without the Teensy: LINKDEV="--dump-sf /dev/null" CHAINDIR=/some/dir NORANDR=1 WLCAP_BIN=... AVLINK_BIN=... hud2.sh SECS
-export XDG_RUNTIME_DIR=/run/user/1000 WAYLAND_DISPLAY=wayland-0
+export XDG_RUNTIME_DIR=/run/user/$(id -u) WAYLAND_DISPLAY=wayland-0
 A=$HOME/avsd
+B=$A/current/bin
 # Settings file, plain NAME=value lines: see avsd.env
 [ -f "$A/avsd.env" ] && . "$A/avsd.env"
+# Apply in the app: temporary values on top. tmpfs, so a reboot drops them.
+[ -f "$XDG_RUNTIME_DIR/avsd-trial.env" ] && . "$XDG_RUNTIME_DIR/avsd-trial.env"
 cd "${CHAINDIR:-$A/clips}" || exit 1
 [ -n "$NORANDR" ] || wlr-randr --output NOOP-1 --custom-mode 800x480@60Hz 2>/dev/null
 rm -f pcm.fifo key.fifo cap.pid enc.pid link.pid; mkfifo pcm.fifo key.fifo
@@ -43,4 +46,4 @@ if [ "${AUDIOCAP:-pw}" = parec ]; then
 else
   timeout $1 pw-record --target "$CAPSINK" -P '{stream.capture.sink=true}' --rate 48000 --channels 2 --format s16 --latency 20ms --raw - > pcm.fifo 2>parec.log &
 fi
-timeout $1 bash -c 'echo $$ > cap.pid; exec "$0" "$@"' "${WLCAP_BIN:-$A/pi/wlcap/wlcap}" $CAPARG 2>cap.log | withpid enc.pid "${ENC_BIN:-$A/pienc_rnv3/rnv3enc}" -i - --fmt $FMT -o - --keyint ${KEYINT:-0} --linkcap ${LINKCAP:-4.5e6} --linkctl key.fifo --stats st.txt --threads ${ENCTHREADS:-2} --maxvid ${MAXVID:-161} ${ENCFLAGS:---cyc ${CYC:-4.05e6} --refill wall --dither ${DITHER:-0} --srcdead ${SRCDEAD:-3} --srcmean ${SRCMEAN:-48} --fillpen ${FILLPEN:-2}} $ENCEXTRA 2>enc.log | withpid link.pid "${AVLINK_BIN:-$A/pi/avlink/avlink}" --video - --audio pcm.fifo ${LINKDEV:---dev /dev/ttyACM0} --keyctl key.fifo --linkcap ${LINKCAP:-4.5e6} --maxvid ${MAXVID:-161} --whole-sf ${WHOLESF:-1} --gain-db ${GAIN:--3} --stats ${STATS:-5} --console > live.log 2>&1
+timeout $1 bash -c 'echo $$ > cap.pid; exec "$0" "$@"' "${WLCAP_BIN:-$B/wlcap}" $CAPARG 2>cap.log | withpid enc.pid "${ENC_BIN:-$B/rnv3enc}" -i - --fmt $FMT -o - --keyint ${KEYINT:-0} --linkcap ${LINKCAP:-4.5e6} --linkctl key.fifo --stats st.txt --threads ${ENCTHREADS:-2} --maxvid ${MAXVID:-161} ${ENCFLAGS:---cyc ${CYC:-4.05e6} --refill wall --dither ${DITHER:-0} --srcdead ${SRCDEAD:-3} --srcmean ${SRCMEAN:-48} --fillpen ${FILLPEN:-2}} $ENCEXTRA 2>enc.log | withpid link.pid "${AVLINK_BIN:-$B/avlink}" --video - --audio pcm.fifo ${LINKDEV:---dev /dev/ttyACM0} --keyctl key.fifo --linkcap ${LINKCAP:-4.5e6} --maxvid ${MAXVID:-161} --whole-sf ${WHOLESF:-1} --gain-db ${GAIN:--3} --stats ${STATS:-5} --console > live.log 2>&1

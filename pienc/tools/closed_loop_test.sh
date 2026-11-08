@@ -1,7 +1,7 @@
 #!/bin/sh
 # make test, part 2: whole-encoder checks on a synthetic clip.
 #  - SIMD (NEON) and scalar encoders, 1 and 3 threads, RGB24 and XRGB8888 input: identical bitstreams
-#  - reference decoder (ref/rnv2dec.c, unchanged) output == encoder reconstruction on every frame (CRC32)
+#  - RNV3 reference decoder (dec/rnv3dec.c) output == encoder reconstruction on every frame (CRC32)
 #  - damage-hint path (--auto-damage) stays closed-loop
 #  - headroom-driven quality (default): link caps 2.5 / 8 MB/s and a --linkctl file give identical streams for 1 and 3 threads,
 #    --linkctl "cap 2.5e6" == --linkcap 2.5e6, and every one of them decodes bit-exactly (closed loop)
@@ -34,7 +34,7 @@ cmp -s $T/a.rnv $T/d.rnv && echo "OK   RGB24 == XRGB8888 input" || { echo "FAIL 
 cmp -s $T/h1.rnv $T/h3.rnv && echo "OK   linkcap 2.5e6: 1 thread == 3 threads bitstream" || { echo "FAIL linkcap: thread count changes the bitstream"; fail=1; }
 cmp -s $T/h1.rnv $T/hc.rnv && echo "OK   --linkctl file (last line cap 2.5e6) == --linkcap 2.5e6" || { echo "FAIL linkctl != linkcap"; fail=1; }
 for x in a e h1 h8; do
-  ./rnv2dec_ref $T/$x.rnv $T/$x.dec 2>/dev/null
+  ./rnv3dec_ref $T/$x.rnv $T/$x.dec 2>/dev/null
   bad=$(cut -d' ' -f1,2 $T/$x.dec | paste $T/$x.crc - | awk '{n++; if ($2 != $4) b++} END {print (n == 0) ? -1 : b + 0}')
   [ "$bad" = "0" ] && echo "OK   closed loop ($x): decoder == encoder recon on all $N frames" || { echo "FAIL closed loop ($x): $bad mismatching frames"; fail=1; }
 done

@@ -19,7 +19,7 @@ LDLIBS  += -lpthread -lm
 SRC = src/enc.c src/kern_scalar.c src/kern_neon.c
 OBJ = $(SRC:.c=.o)
 
-all: rnv2enc rnv2dec_ref test_kernels bench_kernels
+all: rnv2enc rnv2dec_ref rnv3dec_ref test_kernels bench_kernels
 
 librnv2enc.a: $(OBJ)
 	ar rcs $@ $^
@@ -47,13 +47,17 @@ synth: tools/synth.c
 rnv2dec_ref: ref/rnv2dec.c ref/rnv2_tables.h
 	$(CC) -O2 -DRNV_MAIN ref/rnv2dec.c -o $@
 
+# RNV3 reference decoder (dec/): what the closed-loop test checks against
+rnv3dec_ref: dec/rnv3dec.c dec/rnv2_tables.h
+	$(CC) -O2 -DRNV_MAIN dec/rnv3dec.c -o $@ -lm
+
 ifeq ($(ARCH),aarch64)
-test: rnv2enc rnv2dec_ref test_kernels synth
+test: rnv2enc rnv3dec_ref test_kernels synth
 	./test_kernels
 	sh tools/closed_loop_test.sh
 else
 # x86: no real NEON; check the NEON logic through src/neon_emu.h (kernels + whole encoder), then the closed loop
-test: rnv2enc rnv2dec_ref synth emutest rnv2enc_emu
+test: rnv2enc rnv3dec_ref synth emutest rnv2enc_emu
 	sh tools/closed_loop_test.sh
 endif
 
@@ -70,7 +74,7 @@ neoncheck:
 	@echo "aarch64 NEON object OK: /tmp/kern_neon_a64.o"
 
 clean:
-	rm -f src/*.o librnv2enc.a rnv2enc rnv2dec_ref test_kernels test_kernels_emu rnv2enc_emu rnv2enc_count bench_kernels synth headroom_eval
+	rm -f src/*.o librnv2enc.a rnv2enc rnv2dec_ref rnv3dec_ref test_kernels test_kernels_emu rnv2enc_emu rnv2enc_count bench_kernels synth headroom_eval
 
 .PHONY: headroom_eval all test emutest neoncheck clean
 

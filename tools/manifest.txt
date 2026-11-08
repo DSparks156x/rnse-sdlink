@@ -1,4 +1,4 @@
-# Curated copy list for tools/sync_from_analysis.py.
+# Curated copy list for tools/sync_from_worktree.py.
 # Format:  <dest in repo> <src relative to the 'RNSE hacking' folder>     (dest ending in / = glob copy into that dir)
 # 'skip <glob>' marks a source file as deliberately NOT copied (glob relative to analysis/av_over_sd_v1, matched with fnmatch).
 # 'scan <dir>' = directory under analysis/av_over_sd_v1 that is checked for unlisted files.
@@ -48,8 +48,10 @@ pi/avlink/Makefile analysis/av_over_sd_v1/pi/avlink/Makefile
 pi/avlink/README.txt analysis/av_over_sd_v1/pi/avlink/README.txt
 pi/capdec/capdec.py analysis/av_over_sd_v1/pi/capdec/capdec.py
 pi/vtouch/vtouch.py analysis/av_over_sd_v1/pi/vtouch/vtouch.py
-pi/scripts/ analysis/av_over_sd_v1/pi/scripts/*.sh
-pi/scripts/car/ analysis/av_over_sd_v1/pi/scripts/car/*
+# run scripts (hud2.sh, avsd_run.sh, units, avsd.env) live in pi/run/ here, edited in this repo; only the diagnostics are synced
+pi/scripts/audio_diag.sh analysis/av_over_sd_v1/pi/scripts/audio_diag.sh
+pi/scripts/bench_audio.sh analysis/av_over_sd_v1/pi/scripts/bench_audio.sh
+pi/scripts/xrun_delta.sh analysis/av_over_sd_v1/pi/scripts/xrun_delta.sh
 skip pi/avlink/avlink
 pi/avlink/test/ analysis/av_over_sd_v1/pi/avlink/test/*.c
 pi/avlink/test/ analysis/av_over_sd_v1/pi/avlink/test/*.py
@@ -60,19 +62,18 @@ skip pi/avlink/test/credit_review/*
 # ---- pienc (encoder)
 # The repo folder pienc/ is the 'enc3' RNV3 encoder of the working tree, what the Pi runs; ref/, README and test tools still come from pienc_budget. Older note: the 'pienc_budget' encoder of the working tree (superframe budget + settled-quality options).
 # With no new flag it produces the same stream as the older plain 'pienc' encoder, so only this one is kept.
-pienc/Makefile analysis/av_over_sd_v1/enc3/Makefile
+# edited here (RNV3 closed loop): pienc/Makefile analysis/av_over_sd_v1/enc3/Makefile
 pienc/README.txt analysis/av_over_sd_v1/pienc_budget/README.txt
 pienc/RNV3_REPORT.md analysis/av_over_sd_v1/enc3/RNV3_REPORT.md
 pienc/dec/rnv3dec.c analysis/av_over_sd_v1/enc3/dec/rnv3dec.c
 pienc/dec/rnv2_tables.h analysis/av_over_sd_v1/enc3/dec/rnv2_tables.h
 docs/DEPLOYMENT.md analysis/av_over_sd_v1/DEPLOYMENT.md
-pi/scripts/avsd.env analysis/av_over_sd_v1/pi/scripts/avsd.env
 pienc/include/ analysis/av_over_sd_v1/enc3/include/*.h
 pienc/src/ analysis/av_over_sd_v1/enc3/src/*.c
 pienc/src/ analysis/av_over_sd_v1/enc3/src/*.h
 pienc/src/ analysis/av_over_sd_v1/enc3/src/*.inc
 pienc/ref/ analysis/av_over_sd_v1/pienc_budget/ref/*
-pienc/tools/closed_loop_test.sh analysis/av_over_sd_v1/pienc_budget/tools/closed_loop_test.sh
+# edited here (RNV3 closed loop): pienc/tools/closed_loop_test.sh analysis/av_over_sd_v1/pienc_budget/tools/closed_loop_test.sh
 pienc/tools/synth.c analysis/av_over_sd_v1/pienc_budget/tools/synth.c
 pienc/tools/bench_kernels.c analysis/av_over_sd_v1/pienc_budget/tools/bench_kernels.c
 skip pienc_budget/REPORT.txt
@@ -148,3 +149,5 @@ skip rnse_proto/verify_sdwrite.py
 pi/scripts/ analysis/av_over_sd_v1/pi/scripts/*.py
 skip pienc_budget/include/*
 skip pienc_budget/src/*
+skip pi/scripts/hud2.sh
+skip pi/scripts/car/*

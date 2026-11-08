@@ -8,7 +8,7 @@ StartLimitIntervalSec=0
 
 [Service]
 Type=simple
-ExecStart=%h/avsd/car/avsd_run.sh
+ExecStart=%h/avsd/current/chain/avsd_run.sh
 Restart=always
 RestartSec=2
 KillMode=control-group
