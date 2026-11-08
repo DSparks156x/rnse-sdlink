@@ -1,6 +1,8 @@
 # Third-party and unclear-provenance files
 
-No license has been chosen for this repository. Items below need a decision before anything goes public.
+The repository is under PolyForm Noncommercial 1.0.0 (`LICENSE.md`). That license can only cover the author's own work: a file
+that turns out to be derived from GPL code (the HalfKay flasher below is the candidate) stays under the GPL, and is to be
+rewritten or removed rather than relicensed. Items below are still open.
 
 | file | issue |
 |---|---|

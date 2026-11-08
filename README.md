@@ -83,7 +83,11 @@ image-build tools, Doom, research scripts (encoder evaluation, firmware RE helpe
 end-to-end tests. Several constants in `rnse/layout.py` and `rnse/src/` are addresses and offsets recovered by reverse-engineering
 the RNS-E firmware; they are tied to specific builds.
 
-No license has been chosen yet. See `docs/THIRD_PARTY.md` for files whose provenance needs a decision.
+## License
+PolyForm Noncommercial 1.0.0 (`LICENSE.md`): free to use, change and share for any noncommercial purpose; commercial use is
+not allowed. Exceptions and files of unclear provenance are listed in `docs/THIRD_PARTY.md`.
+
+Required Notice: Copyright (c) 2026 Drew Sparks (https://github.com/DSparks156x)
 
 ## Refreshing from the working tree
 `tools/sync_from_worktree.py` (working tree next to this repo, or `SDLINK_WORKTREE`) re-copies the files listed in `tools/manifest.txt` from the author's private working tree
