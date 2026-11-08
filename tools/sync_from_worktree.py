@@ -11,7 +11,8 @@ import fnmatch, glob, os, subprocess, sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.normpath(os.path.join(HERE, '..'))
-ROOT = os.path.normpath(os.path.join(REPO, '..'))          # the 'RNSE hacking' folder
+# the author's working tree ('RNSE hacking'): next to this repo, or set SDLINK_WORKTREE
+ROOT = os.environ.get('SDLINK_WORKTREE') or os.path.normpath(os.path.join(REPO, '..', 'RNSE hacking'))
 SRC_TREE = 'analysis/av_over_sd_v1'
 SRC_EXT = {'.c', '.h', '.cpp', '.py', '.sh', '.s', '.ld', '.ino', '.ini', '.md', '.mk'}
 IGNORE_DIRS = {'.venv', '.pio', '__pycache__', 'out', 'results', 'logs', 'sim', 'evidence', 'fw', 'build'}
@@ -79,7 +80,9 @@ def read_manifest():
 
 def transform(dest, data):
     try:
-        s = data.decode('utf-8')
+        s = data.decode("utf-8").replace("
+", "
+")   # the repo is LF only (.gitattributes)
     except UnicodeDecodeError:
         return data
     for a, b in SCRUB:
