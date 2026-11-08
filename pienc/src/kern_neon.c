@@ -7,6 +7,47 @@
 #include <arm_neon.h>
 #else
 #include "neon_emu.h"
+/* the intrinsics only csc8 uses (real ones on ARM) */
+#define E_ static inline
+#define LP_(N) for (int i = 0; i < (N); i++)
+E_ uint8x16_t vqtbl1q_u8(uint8x16_t t, uint8x16_t x) { uint8x16_t r; LP_(16) r.v[i] = x.v[i] < 16 ? t.v[x.v[i]] : 0; return r; }
+E_ uint8x16_t vsriq_n_u8(uint8x16_t a, uint8x16_t b, int n) { uint8x16_t r; LP_(16) r.v[i] = (uint8_t)((a.v[i] & ~(0xFF >> n)) | (b.v[i] >> n)); return r; }
+E_ uint16x8_t vaddl_u8(uint8x8_t a, uint8x8_t b) { uint16x8_t r; LP_(8) r.v[i] = (uint16_t)(a.v[i] + b.v[i]); return r; }
+E_ uint16x8_t vaddw_u8(uint16x8_t a, uint8x8_t b) { LP_(8) a.v[i] = (uint16_t)(a.v[i] + b.v[i]); return a; }
+E_ uint16x8_t vld1q_u16(const uint16_t *p) { uint16x8_t r; memcpy(r.v, p, 16); return r; }
+E_ uint32x4_t vshll_n_u16(uint16x4_t a, int n) { uint32x4_t r; LP_(4) r.v[i] = (uint32_t)a.v[i] << n; return r; }
+E_ uint32x4_t vsubq_u32(uint32x4_t a, uint32x4_t b) { LP_(4) a.v[i] -= b.v[i]; return a; }
+E_ uint32x4_t vsubl_u16(uint16x4_t a, uint16x4_t b) { uint32x4_t r; LP_(4) r.v[i] = (uint32_t)a.v[i] - b.v[i]; return r; }
+E_ uint16x4_t vdup4u_(uint16_t x) { uint16x4_t r; LP_(4) r.v[i] = x; return r; }
+#define vmull_laneq_u16(a, c, l) vmull_u16((a), vdup4u_((c).v[l]))
+#define vmlal_laneq_u16(d, a, c, l) vmlal_u16((d), (a), vdup4u_((c).v[l]))
+E_ uint16x8_t vpaddlq_u8(uint8x16_t a) { uint16x8_t r; LP_(8) r.v[i] = (uint16_t)(a.v[2 * i] + a.v[2 * i + 1]); return r; }
+E_ uint16x8_t vaddl_high_u8(uint8x16_t a, uint8x16_t b) { uint16x8_t r; LP_(8) r.v[i] = (uint16_t)(a.v[i + 8] + b.v[i + 8]); return r; }
+E_ uint16x8_t vaddw_high_u8(uint16x8_t a, uint8x16_t b) { LP_(8) a.v[i] = (uint16_t)(a.v[i] + b.v[i + 8]); return a; }
+E_ uint32x4_t vshll_high_n_u16(uint16x8_t a, int n) { uint32x4_t r; LP_(4) r.v[i] = (uint32_t)a.v[i + 4] << n; return r; }
+E_ uint32x4_t vsubl_high_u16(uint16x8_t a, uint16x8_t b) { uint32x4_t r; LP_(4) r.v[i] = (uint32_t)a.v[i + 4] - b.v[i + 4]; return r; }
+#define vmull_high_laneq_u16(a, c, l) vmull_u16(vget_high_u16(a), vdup4u_((c).v[l]))
+#define vmlal_high_laneq_u16(d, a, c, l) vmlal_u16((d), vget_high_u16(a), vdup4u_((c).v[l]))
+E_ int32x4_t emu_mull_s16(int16x4_t a, int16_t b) { int32x4_t r; LP_(4) r.v[i] = (int32_t)a.v[i] * b; return r; }
+E_ int32x4_t emu_mlal_s16(int32x4_t d, int16x4_t a, int16_t b) { LP_(4) d.v[i] = (int32_t)((uint32_t)d.v[i] + (uint32_t)((int32_t)a.v[i] * b)); return d; }
+#define vmull_laneq_s16(a, c, l) emu_mull_s16((a), (c).v[l])
+#define vmlal_laneq_s16(d, a, c, l) emu_mlal_s16((d), (a), (c).v[l])
+E_ int16x4_t vrshrn_n_s32(int32x4_t a, int n) { int16x4_t r; LP_(4) r.v[i] = (int16_t)(((int64_t)a.v[i] + (1LL << (n - 1))) >> n); return r; }
+E_ uint16x4_t vqrshrun_n_s32(int32x4_t a, int n) { uint16x4_t r; LP_(4) { int64_t x = ((int64_t)a.v[i] + (1LL << (n - 1))) >> n; r.v[i] = (uint16_t)(x < 0 ? 0 : x > 65535 ? 65535 : x); } return r; }
+E_ int16_t emu_sat16_(int64_t x) { return (int16_t)(x > 32767 ? 32767 : x < -32768 ? -32768 : x); }
+E_ int16x8_t emu_qrdmulh_(int16x8_t a, int16_t b) { LP_(8) a.v[i] = emu_sat16_((2 * (int64_t)a.v[i] * b + 32768) >> 16); return a; }
+E_ int16x8_t emu_qdmulh_(int16x8_t a, int16_t b) { LP_(8) a.v[i] = emu_sat16_((2 * (int64_t)a.v[i] * b) >> 16); return a; }
+#define vqrdmulhq_laneq_s16(a, c, l) emu_qrdmulh_((a), (c).v[l])
+#define vqdmulhq_laneq_s16(a, c, l) emu_qdmulh_((a), (c).v[l])
+E_ uint16x8_t vqaddq_u16(uint16x8_t a, uint16x8_t b) { LP_(8) { uint32_t s = (uint32_t)a.v[i] + b.v[i]; a.v[i] = (uint16_t)(s > 65535 ? 65535 : s); } return a; }
+E_ uint16x8_t vcltq_u16(uint16x8_t a, uint16x8_t b) { uint16x8_t r; LP_(8) r.v[i] = a.v[i] < b.v[i] ? 0xFFFF : 0; return r; }
+E_ uint16x8_t veorq_u16(uint16x8_t a, uint16x8_t b) { LP_(8) a.v[i] ^= b.v[i]; return a; }
+E_ uint8x16_t vqaddq_u8(uint8x16_t a, uint8x16_t b) { LP_(16) { int s = a.v[i] + b.v[i]; a.v[i] = (uint8_t)(s > 255 ? 255 : s); } return a; }
+E_ uint8x16_t vbslq_u8(uint8x16_t m, uint8x16_t a, uint8x16_t b) { LP_(16) a.v[i] = (uint8_t)((m.v[i] & a.v[i]) | (~m.v[i] & b.v[i])); return a; }
+E_ uint8x16_t vreinterpretq_u8_u16(uint16x8_t a) { uint8x16_t r; memcpy(&r, &a, sizeof r); return r; }
+E_ uint8x16_t vuzp1q_u8(uint8x16_t a, uint8x16_t b) { uint8x16_t r; LP_(8) { r.v[i] = a.v[2 * i]; r.v[i + 8] = b.v[2 * i]; } return r; }
+#undef E_
+#undef LP_
 #endif
 #include <string.h>
 
@@ -19,20 +60,17 @@ static uint32_t sad8x8_n(const uint8_t *a, int as, const uint8_t *b, int bs) {
 }
 
 static void pd8_n(const uint8_t *s, const uint8_t *r, int kappa16, int thr, uint32_t out[8]) {
-    const uint16x8_t T = vdupq_n_u16((uint16_t)thr);
+    const uint8x16_t T = vdupq_n_u8((uint8_t)thr);
     int sb;
     for (sb = 0; sb < 8; sb++) {
-        uint8x16_t d = vabdq_u8(vld1q_u8(s + 16 * sb), vld1q_u8(r + 16 * sb));
-        uint16x8_t a0 = vmovl_u8(vget_low_u8(d)), a1 = vmovl_u8(vget_high_u8(d));
-        uint16x8_t m0 = vqsubq_u16(a0, T), m1 = vqsubq_u16(a1, T);
-        uint16x8_t a16_0 = vshlq_n_u16(a0, 4), a16_1 = vshlq_n_u16(a1, 4);
-        uint16x8_t mk0 = vmulq_n_u16(m0, (uint16_t)kappa16), mk1 = vmulq_n_u16(m1, (uint16_t)kappa16);
-        /* two independent accumulator chains (A76 multiply-accumulate latency) */
-        uint32x4_t acc = vmull_u16(vget_low_u16(a16_0), vget_low_u16(a0)), acc2 = vmull_u16(vget_low_u16(mk0), vget_low_u16(m0));
-        acc = vmlal_u16(acc, vget_high_u16(a16_0), vget_high_u16(a0)); acc2 = vmlal_u16(acc2, vget_high_u16(mk0), vget_high_u16(m0));
-        acc = vmlal_u16(acc, vget_low_u16(a16_1), vget_low_u16(a1)); acc2 = vmlal_u16(acc2, vget_low_u16(mk1), vget_low_u16(m1));
-        acc = vmlal_u16(acc, vget_high_u16(a16_1), vget_high_u16(a1)); acc2 = vmlal_u16(acc2, vget_high_u16(mk1), vget_high_u16(m1));
-        out[sb] = vaddvq_u32(vaddq_u32(acc, acc2));
+        uint8x16_t a = vabdq_u8(vld1q_u8(s + 16 * sb), vld1q_u8(r + 16 * sb)), m = vqsubq_u8(a, T);
+#ifdef __ARM_FEATURE_DOTPROD
+        uint32x4_t aa = vdotq_u32(vdupq_n_u32(0), a, a), mm = vdotq_u32(vdupq_n_u32(0), m, m);
+#else
+        uint32x4_t aa = vaddq_u32(vpaddlq_u16(vmull_u8(vget_low_u8(a), vget_low_u8(a))), vpaddlq_u16(vmull_high_u8(a, a)));
+        uint32x4_t mm = vaddq_u32(vpaddlq_u16(vmull_u8(vget_low_u8(m), vget_low_u8(m))), vpaddlq_u16(vmull_high_u8(m, m)));
+#endif
+        out[sb] = vaddvq_u32(vaddq_u32(vshlq_n_u32(aa, 4), vmulq_n_u32(mm, (uint32_t)kappa16)));
     }
 }
 
@@ -180,136 +218,141 @@ static void proj_rows_n(const uint8_t *p, int stride, int w, int h, int sw, uint
     }
 }
 
-/* ------------------------------------------------------------------ glass CSC, 8 pixel pairs per step */
-static inline int32x4_t cl255_32(int32x4_t x) { return vminq_s32(vmaxq_s32(x, vdupq_n_s32(0)), vdupq_n_s32(255)); }
-static inline int32x4_t sh16r(int32x4_t x) { return vshrq_n_s32(vaddq_s32(x, vdupq_n_s32(32768)), 16); }
-/* 8 lanes as two int32x4 halves */
-typedef struct { int32x4_t l, h; } i32x8;
-static inline i32x8 w8(uint8x8_t v) { uint16x8_t u = vmovl_u8(v); i32x8 r; r.l = vreinterpretq_s32_u32(vmovl_u16(vget_low_u16(u))); r.h = vreinterpretq_s32_u32(vmovl_u16(vget_high_u16(u))); return r; }
-static inline int16x8_t n8(i32x8 a) { return vcombine_s16(vmovn_s32(a.l), vmovn_s32(a.h)); }
-static inline uint8x8_t q6_8(uint8x8_t x) { return vorr_u8(vand_u8(x, vdup_n_u8(0xFC)), vshr_n_u8(x, 6)); }
-/* per-pixel glass error (3 channels) for y (int16x8, 0..255) with offsets oR/oG/oB (int16x8) vs targets t* (u8x8) */
-static inline uint32x4x2_t perr8(int16x8_t y, int16x8_t oR, int16x8_t oG, int16x8_t oB, uint8x8_t tR, uint8x8_t tG, uint8x8_t tB) {
-    uint8x8_t gR = q6_8(vqmovun_s16(vaddq_s16(y, oR))), gG = q6_8(vqmovun_s16(vaddq_s16(y, oG))), gB = q6_8(vqmovun_s16(vaddq_s16(y, oB)));
-    uint8x8_t dR = vabd_u8(gR, tR), dG = vabd_u8(gG, tG), dB = vabd_u8(gB, tB);
-    uint16x8_t sR = vmull_u8(dR, dR), sG = vmull_u8(dG, dG), sB = vmull_u8(dB, dB);
-    uint32x4x2_t r;
-    r.val[0] = vaddw_u16(vaddl_u16(vget_low_u16(sR), vget_low_u16(sG)), vget_low_u16(sB));
-    r.val[1] = vaddw_u16(vaddl_u16(vget_high_u16(sR), vget_high_u16(sG)), vget_high_u16(sB));
-    return r;
+/* ------------------------------------------------------------------ glass CSC, 8 pixel pairs per step
+ * Same result as csc_glass_c, computed differently:
+ *  - 16-bit lanes wherever the value allows it.  Errors saturate at 65535.  The comparisons stay exact as long as the winning pair error
+ *    is below 65535; if a lane's is not, the whole group goes through the scalar kernel (a pair needs a colour error of about 100 levels
+ *    per channel for that).
+ *  - cu[0] is always cu[1]: RNV2_LSU is exactly CBF / 2.  cv[0] is (crs + bs - gs) / 2 against cv[1] = crs / 2, because RNV2_LSV is CRF / 2
+ *    rounded the other way on g and b, so the two chromas differ only when that small term crosses a rounding boundary.  Candidate 1 runs
+ *    only then.  A candidate equal to an earlier one can never win (strict <).  test_kernels pins all of this against the scalar.
+ *  - The offsets come from exhaustively checked 16-bit forms: (91881 v + 32768) >> 16 = v + sqrdmulh(v, 13172) for all v in -128..127,
+ *    (116130 u + 32768) >> 16 = u + sqrdmulh(u, 25297), and YFROM's multiply by 21846 is sqdmulh by 10923. */
+static inline uint8x16_t q6q(uint8x16_t x) { return vsriq_n_u8(x, x, 6); }
+typedef struct { int16x8_t y0, y1, oR, oG, oB; uint16x8_t e0, e1, u, v; } csc_cand;
+#define CSC_INL static inline __attribute__((always_inline))
+/* |glass - target| of one channel for both pixels: pixel 0 in the low half, pixel 1 in the high half */
+CSC_INL uint8x16_t ch_d(int16x8_t y0, int16x8_t y1, int16x8_t o, uint8x16_t t) {
+    return vabdq_u8(q6q(vcombine_u8(vqmovun_s16(vaddq_s16(y0, o)), vqmovun_s16(vaddq_s16(y1, o)))), t);
 }
-static inline uint16x8_t sel16(uint32x4_t ml, uint32x4_t mh, uint16x8_t a, uint16x8_t b) { /* mask ? a : b */
-    uint16x8_t m = vcombine_u16(vmovn_u32(ml), vmovn_u32(mh));
-    return vbslq_u16(m, a, b);
+CSC_INL uint16x8_t sq3_lo(uint8x16_t a, uint8x16_t b, uint8x16_t c) {
+    uint8x8_t x = vget_low_u8(a), y = vget_low_u8(b), z = vget_low_u8(c);
+    return vqaddq_u16(vqaddq_u16(vmull_u8(x, x), vmull_u8(y, y)), vmull_u8(z, z));
 }
+CSC_INL uint16x8_t sq3_hi(uint8x16_t a, uint8x16_t b, uint8x16_t c) {
+    uint8x8_t x = vget_high_u8(a), y = vget_high_u8(b), z = vget_high_u8(c);
+    return vqaddq_u16(vqaddq_u16(vmull_u8(x, x), vmull_u8(y, y)), vmull_u8(z, z));
+}
+CSC_INL csc_cand cand8(uint16x8_t u, uint16x8_t v, int16x8_t S0, int16x8_t S1, uint8x16_t tR, uint8x16_t tG, uint8x16_t tB, int16x8_t C) {
+    csc_cand c;
+    const int16x8_t K128 = vdupq_n_s16(128);
+    int16x8_t uu = vsubq_s16(vreinterpretq_s16_u16(u), K128), vv = vsubq_s16(vreinterpretq_s16_u16(v), K128), sr;
+    int16x4_t ul = vget_low_s16(uu), uh = vget_high_s16(uu), vl = vget_low_s16(vv), vh = vget_high_s16(vv);
+    uint8x16_t dR, dG, dB;
+    c.u = u; c.v = v;
+    c.oR = vaddq_s16(vv, vqrdmulhq_laneq_s16(vv, C, 4));
+    c.oB = vaddq_s16(uu, vqrdmulhq_laneq_s16(uu, C, 5));
+    /* -22554 u - 46802 v, with the whole -v taken out so that the coefficient fits 16 bits */
+    c.oG = vsubq_s16(vcombine_s16(vrshrn_n_s32(vmlal_laneq_s16(vmull_laneq_s16(ul, C, 0), vl, C, 1), 16), vrshrn_n_s32(vmlal_laneq_s16(vmull_laneq_s16(uh, C, 0), vh, C, 1), 16)), vv);
+    /* (32768 - SOFF) >> 16, same trick */
+    sr = vsubq_s16(vcombine_s16(vrshrn_n_s32(vmlal_laneq_s16(vmull_laneq_s16(ul, C, 2), vl, C, 3), 16), vrshrn_n_s32(vmlal_laneq_s16(vmull_laneq_s16(uh, C, 2), vh, C, 3), 16)), vaddq_s16(uu, vv));
+    sr = vaddq_s16(sr, vdupq_n_s16(385));
+    /* the quotient is at least 38 and at most 473 */
+    c.y0 = vreinterpretq_s16_u16(vminq_u16(vqsubq_u16(vreinterpretq_u16_s16(vqdmulhq_laneq_s16(vaddq_s16(S0, sr), C, 6)), vreinterpretq_u16_s16(K128)), vdupq_n_u16(255)));
+    c.y1 = vreinterpretq_s16_u16(vminq_u16(vqsubq_u16(vreinterpretq_u16_s16(vqdmulhq_laneq_s16(vaddq_s16(S1, sr), C, 6)), vreinterpretq_u16_s16(K128)), vdupq_n_u16(255)));
+    dR = ch_d(c.y0, c.y1, c.oR, tR); dG = ch_d(c.y0, c.y1, c.oG, tG); dB = ch_d(c.y0, c.y1, c.oB, tB);
+    c.e0 = sq3_lo(dR, dG, dB); c.e1 = sq3_hi(dR, dG, dB);
+    return c;
+}
+#define CAND_TAKE(U, V) do { csc_cand n_ = cand8(U, V, S0, S1, tR, tG, tB, C); uint16x8_t e_ = vqaddq_u16(n_.e0, n_.e1), m_ = vcltq_u16(e_, be); be = vbslq_u16(m_, e_, be); \
+    b.y0 = vbslq_s16(m_, n_.y0, b.y0); b.y1 = vbslq_s16(m_, n_.y1, b.y1); b.oR = vbslq_s16(m_, n_.oR, b.oR); b.oG = vbslq_s16(m_, n_.oG, b.oG); b.oB = vbslq_s16(m_, n_.oB, b.oB); \
+    b.e0 = vbslq_u16(m_, n_.e0, b.e0); b.e1 = vbslq_u16(m_, n_.e1, b.e1); b.u = vbslq_u16(m_, n_.u, b.u); b.v = vbslq_u16(m_, n_.v, b.v); } while (0)
+/* clip255(y + p - n) where one of p and n is 0 */
+CSC_INL uint8x16_t ch_dn(uint8x16_t y, uint8x16_t p, uint8x16_t n, uint8x16_t t) { return vabdq_u8(q6q(vqsubq_u8(vqaddq_u8(y, p), n)), t); }
 
-static void csc8(const uint8_t *rgb, uint8_t *Y, uint8_t *U, uint8_t *V) {
-    uint8x16x3_t px = vld3q_u8(rgb); /* 16 pixels */
-    uint8x16x2_t ur = vuzpq_u8(px.val[0], px.val[0]), ug = vuzpq_u8(px.val[1], px.val[1]), ub = vuzpq_u8(px.val[2], px.val[2]);
-    uint8x8_t r0 = vget_low_u8(ur.val[0]), r1 = vget_low_u8(ur.val[1]), g0 = vget_low_u8(ug.val[0]), g1 = vget_low_u8(ug.val[1]);
-    uint8x8_t b0 = vget_low_u8(ub.val[0]), b1 = vget_low_u8(ub.val[1]);
-    uint8x8_t t0r = q6_8(r0), t0g = q6_8(g0), t0b = q6_8(b0), t1r = q6_8(r1), t1g = q6_8(g1), t1b = q6_8(b1);
-    i32x8 R0 = w8(r0), G0 = w8(g0), B0 = w8(b0), R1 = w8(r1), G1 = w8(g1), B1 = w8(b1);
-    i32x8 S0, S1, cb0, cb1, cr0, cr1, lu, lv, cu[4], cv[4];
-    uint32x4_t bel = vdupq_n_u32(0xFFFFFFFFu), beh = bel;
-    uint16x8_t bu = vdupq_n_u16(0), bv = bu, by0 = bu, by1 = bu;
-    int c, d;
-#define H2(EXPR) do { int32x4_t L_, H_; { int32x4_t r0_ = R0.l, g0_ = G0.l, b0_ = B0.l, r1_ = R1.l, g1_ = G1.l, b1_ = B1.l; (void)r0_; (void)g0_; (void)b0_; (void)r1_; (void)g1_; (void)b1_; L_ = EXPR; } \
-                                                   { int32x4_t r0_ = R0.h, g0_ = G0.h, b0_ = B0.h, r1_ = R1.h, g1_ = G1.h, b1_ = B1.h; (void)r0_; (void)g0_; (void)b0_; (void)r1_; (void)g1_; (void)b1_; H_ = EXPR; } OUT.l = L_; OUT.h = H_; } while (0)
-#define OUT S0
-    H2(vaddq_s32(vaddq_s32(r0_, g0_), b0_));
-#undef OUT
-#define OUT S1
-    H2(vaddq_s32(vaddq_s32(r1_, g1_), b1_));
-#undef OUT
-#define CBX(r, g, b) vmlaq_n_s32(vmlaq_n_s32(vmulq_n_s32(r, -11058), g, -21710), b, 32768)
-#define CRX(r, g, b) vmlaq_n_s32(vmlaq_n_s32(vmulq_n_s32(r, 32768), g, -27439), b, -5329)
-#define OUT cb0
-    H2(CBX(r0_, g0_, b0_));
-#undef OUT
-#define OUT cb1
-    H2(CBX(r1_, g1_, b1_));
-#undef OUT
-#define OUT cr0
-    H2(CRX(r0_, g0_, b0_));
-#undef OUT
-#define OUT cr1
-    H2(CRX(r1_, g1_, b1_));
-#undef OUT
-#define LSX(M) vmlaq_n_s32(vmlaq_n_s32(vmlaq_n_s32(vmlaq_n_s32(vmlaq_n_s32(vmulq_n_s32(r0_, M[0]), g0_, M[1]), b0_, M[2]), r1_, M[3]), g1_, M[4]), b1_, M[5])
-#define OUT lu
-    H2(LSX(RNV2_LSU));
-#undef OUT
-#define OUT lv
-    H2(LSX(RNV2_LSV));
-#undef OUT
+CSC_INL void csc8(const uint8_t *rgb, uint8_t *Y, uint8_t *U, uint8_t *V) {
+    static const uint8_t EO[16] = {0, 2, 4, 6, 8, 10, 12, 14, 1, 3, 5, 7, 9, 11, 13, 15};
+    static const uint16_t CC_[8] = {11058, 21710, 27439, 5329, 0, 0, 0, 0};
+    static const int16_t CO_[8] = {-22554, 18734, -28040, 20456, 13172, 25297, 10923, 0};
+    const uint8x16x3_t px = vld3q_u8(rgb); /* 16 pixels */
+    const uint8x16_t eo = vld1q_u8(EO);
+    const uint16x8_t CC = vld1q_u16(CC_);
+    const int16x8_t C = vld1q_s16(CO_);
+    /* planar, pixel 0 of each pair in the low half and pixel 1 in the high half */
+    const uint8x16_t R = vqtbl1q_u8(px.val[0], eo), G = vqtbl1q_u8(px.val[1], eo), B = vqtbl1q_u8(px.val[2], eo);
+    const uint8x16_t tR = q6q(R), tG = q6q(G), tB = q6q(B);
+    const uint8x8_t r0 = vget_low_u8(R), g0 = vget_low_u8(G), b0 = vget_low_u8(B);
+    const int16x8_t S0 = vreinterpretq_s16_u16(vaddw_u8(vaddl_u8(r0, g0), b0)), S1 = vreinterpretq_s16_u16(vaddw_high_u8(vaddl_high_u8(R, G), B));
+    uint16x8_t u0, v0, v1, u2, v2, u3, v3;
     {
-        const int32x4_t K128 = vdupq_n_s32(128 << 16), K256 = vdupq_n_s32((256 << 16) + 65536);
-#define C1(dst, x) do { dst.l = cl255_32(sh16r(vaddq_s32(x.l, K128))); dst.h = cl255_32(sh16r(vaddq_s32(x.h, K128))); } while (0)
-        C1(cu[0], lu); C1(cv[0], lv);
-        cu[1].l = cl255_32(vshrq_n_s32(vaddq_s32(vaddq_s32(cb0.l, cb1.l), K256), 17)); cu[1].h = cl255_32(vshrq_n_s32(vaddq_s32(vaddq_s32(cb0.h, cb1.h), K256), 17));
-        cv[1].l = cl255_32(vshrq_n_s32(vaddq_s32(vaddq_s32(cr0.l, cr1.l), K256), 17)); cv[1].h = cl255_32(vshrq_n_s32(vaddq_s32(vaddq_s32(cr0.h, cr1.h), K256), 17));
-        C1(cu[2], cb0); C1(cv[2], cr0); C1(cu[3], cb1); C1(cv[3], cr1);
-#undef C1
+        const uint16x8_t R0 = vmovl_u8(r0), G0 = vmovl_u8(g0), B0 = vmovl_u8(b0), RS = vpaddlq_u8(px.val[0]), GS = vpaddlq_u8(px.val[1]), BS = vpaddlq_u8(px.val[2]);
+        const int32x4_t K128 = vdupq_n_s32(128 << 16);
+        const uint16x8_t K255 = vdupq_n_u16(255);
+        int32x4_t cb0l, cb0h, cr0l, cr0h, cbsl, cbsh, crsl, crsh;
+#define CBC_L(rr, gg, bb, cbo, cro) do { \
+            cbo = vreinterpretq_s32_u32(vsubq_u32(vshll_n_u16(vget_low_u16(bb), 15), vmlal_laneq_u16(vmull_laneq_u16(vget_low_u16(rr), CC, 0), vget_low_u16(gg), CC, 1))); \
+            cro = vreinterpretq_s32_u32(vsubq_u32(vshll_n_u16(vget_low_u16(rr), 15), vmlal_laneq_u16(vmull_laneq_u16(vget_low_u16(gg), CC, 2), vget_low_u16(bb), CC, 3))); } while (0)
+#define CBC_H(rr, gg, bb, cbo, cro) do { \
+            cbo = vreinterpretq_s32_u32(vsubq_u32(vshll_high_n_u16(bb, 15), vmlal_high_laneq_u16(vmull_high_laneq_u16(rr, CC, 0), gg, CC, 1))); \
+            cro = vreinterpretq_s32_u32(vsubq_u32(vshll_high_n_u16(rr, 15), vmlal_high_laneq_u16(vmull_high_laneq_u16(gg, CC, 2), bb, CC, 3))); } while (0)
+        CBC_L(R0, G0, B0, cb0l, cr0l);
+        CBC_H(R0, G0, B0, cb0h, cr0h);
+        CBC_L(RS, GS, BS, cbsl, crsl);
+        CBC_H(RS, GS, BS, cbsh, crsh);
+#undef CBC_L
+#undef CBC_H
+#define CH(l, h) vminq_u16(vcombine_u16(vqrshrun_n_s32(vaddq_s32(l, K128), 16), vqrshrun_n_s32(vaddq_s32(h, K128), 16)), K255)
+#define H1(x) vshrq_n_s32(x, 1) /* floor(floor(x / 2) + n) / m) = floor((x / 2 + n) / m), so halving first keeps the >> 17 of the scalar exact */
+        u0 = CH(H1(cbsl), H1(cbsh)); v1 = CH(H1(crsl), H1(crsh));
+        v0 = CH(H1(vaddq_s32(crsl, vreinterpretq_s32_u32(vsubl_u16(vget_low_u16(BS), vget_low_u16(GS))))), H1(vaddq_s32(crsh, vreinterpretq_s32_u32(vsubl_high_u16(BS, GS)))));
+        u2 = CH(cb0l, cb0h); v2 = CH(cr0l, cr0h);
+        u3 = CH(vsubq_s32(cbsl, cb0l), vsubq_s32(cbsh, cb0h)); v3 = CH(vsubq_s32(crsl, cr0l), vsubq_s32(crsh, cr0h));
+#undef H1
+#undef CH
     }
-    for (c = 0; c < 4; c++) {
-        const int32x4_t K128 = vdupq_n_s32(128), K384 = vdupq_n_s32(384), K98 = vdupq_n_s32(98304);
-        i32x8 uu, vv, oR, oG, oB, so, y0, y1;
-        int16x8_t oR16, oG16, oB16, y016, y116;
-        uint32x4x2_t e0, e1; uint32x4_t el, eh, ml, mh;
-        uu.l = vsubq_s32(cu[c].l, K128); uu.h = vsubq_s32(cu[c].h, K128);
-        vv.l = vsubq_s32(cv[c].l, K128); vv.h = vsubq_s32(cv[c].h, K128);
-        oR.l = sh16r(vmulq_n_s32(vv.l, 91881)); oR.h = sh16r(vmulq_n_s32(vv.h, 91881));
-        oG.l = sh16r(vmlaq_n_s32(vmulq_n_s32(uu.l, -22554), vv.l, -46802)); oG.h = sh16r(vmlaq_n_s32(vmulq_n_s32(uu.h, -22554), vv.h, -46802));
-        oB.l = sh16r(vmulq_n_s32(uu.l, 116130)); oB.h = sh16r(vmulq_n_s32(uu.h, 116130));
-        so.l = vmlaq_n_s32(vmulq_n_s32(vv.l, 45080), uu.l, 93576); so.h = vmlaq_n_s32(vmulq_n_s32(vv.h, 45080), uu.h, 93576);
-#define YF(S, so_) cl255_32(vsubq_s32(vshrq_n_s32(vmulq_n_s32(vaddq_s32(vshrq_n_s32(vaddq_s32(vsubq_s32(vshlq_n_s32(S, 16), so_), K98), 16), K384), 21846), 16), K128))
-        y0.l = YF(S0.l, so.l); y0.h = YF(S0.h, so.h); y1.l = YF(S1.l, so.l); y1.h = YF(S1.h, so.h);
-#undef YF
-        oR16 = n8(oR); oG16 = n8(oG); oB16 = n8(oB); y016 = n8(y0); y116 = n8(y1);
-        e0 = perr8(y016, oR16, oG16, oB16, t0r, t0g, t0b);
-        e1 = perr8(y116, oR16, oG16, oB16, t1r, t1g, t1b);
-        el = vaddq_u32(e0.val[0], e1.val[0]); eh = vaddq_u32(e0.val[1], e1.val[1]);
-        ml = vcltq_u32(el, bel); mh = vcltq_u32(eh, beh);
-        bel = vbslq_u32(ml, el, bel); beh = vbslq_u32(mh, eh, beh);
-        bu = sel16(ml, mh, vreinterpretq_u16_s16(n8(cu[c])), bu); bv = sel16(ml, mh, vreinterpretq_u16_s16(n8(cv[c])), bv);
-        by0 = sel16(ml, mh, vreinterpretq_u16_s16(y016), by0); by1 = sel16(ml, mh, vreinterpretq_u16_s16(y116), by1);
-    }
-    { /* Y nudge onto a better 6-bit level */
-        int16x8_t uu16 = vsubq_s16(vreinterpretq_s16_u16(bu), vdupq_n_s16(128)), vv16 = vsubq_s16(vreinterpretq_s16_u16(bv), vdupq_n_s16(128));
-        i32x8 uu, vv; int16x8_t oR, oG, oB, n0, n1, y0 = vreinterpretq_s16_u16(by0), y1 = vreinterpretq_s16_u16(by1);
-        uint32x4x2_t e0, e1;
-        uu.l = vmovl_s16(vget_low_s16(uu16)); uu.h = vmovl_s16(vget_high_s16(uu16));
-        vv.l = vmovl_s16(vget_low_s16(vv16)); vv.h = vmovl_s16(vget_high_s16(vv16));
-        { i32x8 t; t.l = sh16r(vmulq_n_s32(vv.l, 91881)); t.h = sh16r(vmulq_n_s32(vv.h, 91881)); oR = n8(t); }
-        { i32x8 t; t.l = sh16r(vmlaq_n_s32(vmulq_n_s32(uu.l, -22554), vv.l, -46802)); t.h = sh16r(vmlaq_n_s32(vmulq_n_s32(uu.h, -22554), vv.h, -46802)); oG = n8(t); }
-        { i32x8 t; t.l = sh16r(vmulq_n_s32(uu.l, 116130)); t.h = sh16r(vmulq_n_s32(uu.h, 116130)); oB = n8(t); }
-        e0 = perr8(y0, oR, oG, oB, t0r, t0g, t0b); e1 = perr8(y1, oR, oG, oB, t1r, t1g, t1b);
-        n0 = y0; n1 = y1;
-        for (d = -4; d <= 4; d += 2) {
-            int16x8_t yc; uint32x4x2_t e; uint32x4_t ml, mh;
-            if (!d) continue;
-            yc = vreinterpretq_s16_u16(vmovl_u8(vqmovun_s16(vaddq_s16(y0, vdupq_n_s16((int16_t)d)))));
-            e = perr8(yc, oR, oG, oB, t0r, t0g, t0b);
-            ml = vcltq_u32(e.val[0], e0.val[0]); mh = vcltq_u32(e.val[1], e0.val[1]);
-            e0.val[0] = vbslq_u32(ml, e.val[0], e0.val[0]); e0.val[1] = vbslq_u32(mh, e.val[1], e0.val[1]);
-            n0 = vreinterpretq_s16_u16(sel16(ml, mh, vreinterpretq_u16_s16(yc), vreinterpretq_u16_s16(n0)));
-            yc = vreinterpretq_s16_u16(vmovl_u8(vqmovun_s16(vaddq_s16(y1, vdupq_n_s16((int16_t)d)))));
-            e = perr8(yc, oR, oG, oB, t1r, t1g, t1b);
-            ml = vcltq_u32(e.val[0], e1.val[0]); mh = vcltq_u32(e.val[1], e1.val[1]);
-            e1.val[0] = vbslq_u32(ml, e.val[0], e1.val[0]); e1.val[1] = vbslq_u32(mh, e.val[1], e1.val[1]);
-            n1 = vreinterpretq_s16_u16(sel16(ml, mh, vreinterpretq_u16_s16(yc), vreinterpretq_u16_s16(n1)));
+    {
+        csc_cand b = cand8(u0, v0, S0, S1, tR, tG, tB, C);
+        uint16x8_t be = vqaddq_u16(b.e0, b.e1);
+        const uint16x8_t d20 = vorrq_u16(veorq_u16(u2, u0), veorq_u16(v2, v0)), d30 = vorrq_u16(veorq_u16(u3, u0), veorq_u16(v3, v0)), d10 = veorq_u16(v0, v1);
+        int bm;
+        /* video from a 4:2:0 source: both pixels of a pair round to the same chroma, and in nearly every group all lanes do */
+        if (vmaxvq_u16(vorrq_u16(vorrq_u16(d10, d20), d30))) {
+            if (vmaxvq_u16(d10)) CAND_TAKE(u0, v1);
+            if (vmaxvq_u16(d20)) CAND_TAKE(u2, v2);
+            if (vmaxvq_u16(vminq_u16(d30, vorrq_u16(veorq_u16(u3, u2), veorq_u16(v3, v2))))) CAND_TAKE(u3, v3); /* min: nonzero only where both differ */
         }
-        {
-            uint8x8x2_t yy; yy.val[0] = vmovn_u16(vreinterpretq_u16_s16(n0)); yy.val[1] = vmovn_u16(vreinterpretq_u16_s16(n1));
-            vst2_u8(Y, yy); vst1_u8(U, vmovn_u16(bu)); vst1_u8(V, vmovn_u16(bv));
+        bm = vmaxvq_u16(be);
+        if (bm == 0xFFFF) { rnv2_kern_scalar.csc_glass(rgb, 8, Y, U, V); return; }
+        if (!bm) { /* every pair is already exact: no nudge can win */
+            uint8x8x2_t yy; yy.val[0] = vmovn_u16(vreinterpretq_u16_s16(b.y0)); yy.val[1] = vmovn_u16(vreinterpretq_u16_s16(b.y1));
+            vst2_u8(Y, yy); vst1_u8(U, vmovn_u16(b.u)); vst1_u8(V, vmovn_u16(b.v));
+            return;
+        }
+        { /* Y nudge onto a better 6-bit level.  The offsets as saturating add + subtract on 8-bit lanes: |o| is at most 227 */
+            const uint8x8_t pr = vqmovun_s16(b.oR), pg = vqmovun_s16(b.oG), pb = vqmovun_s16(b.oB), nr = vqmovun_s16(vnegq_s16(b.oR)), ng = vqmovun_s16(vnegq_s16(b.oG)), nb = vqmovun_s16(vnegq_s16(b.oB));
+            const uint8x16_t PR = vcombine_u8(pr, pr), PG = vcombine_u8(pg, pg), PB = vcombine_u8(pb, pb), NR = vcombine_u8(nr, nr), NG = vcombine_u8(ng, ng), NB = vcombine_u8(nb, nb);
+            const uint8x16_t Y0 = vcombine_u8(vmovn_u16(vreinterpretq_u16_s16(b.y0)), vmovn_u16(vreinterpretq_u16_s16(b.y1)));
+            const uint8x16_t K2 = vdupq_n_u8(2), K4 = vdupq_n_u8(4);
+            uint8x16_t N = Y0;
+            uint16x8_t e0 = b.e0, e1 = b.e1;
+#define TRY(EXPR) do { uint8x16_t yc = EXPR, dR = ch_dn(yc, PR, NR, tR), dG = ch_dn(yc, PG, NG, tG), dB = ch_dn(yc, PB, NB, tB); \
+                uint16x8_t a0 = sq3_lo(dR, dG, dB), a1 = sq3_hi(dR, dG, dB), m0 = vcltq_u16(a0, e0), m1 = vcltq_u16(a1, e1); \
+                e0 = vminq_u16(a0, e0); e1 = vminq_u16(a1, e1); \
+                N = vbslq_u8(vuzp1q_u8(vreinterpretq_u8_u16(m0), vreinterpretq_u8_u16(m1)), yc, N); } while (0)
+            TRY(vqsubq_u8(Y0, K4));
+            TRY(vqsubq_u8(Y0, K2));
+            TRY(vqaddq_u8(Y0, K2));
+            TRY(vqaddq_u8(Y0, K4));
+#undef TRY
+            {
+                uint8x8x2_t yy; yy.val[0] = vget_low_u8(N); yy.val[1] = vget_high_u8(N);
+                vst2_u8(Y, yy); vst1_u8(U, vmovn_u16(b.u)); vst1_u8(V, vmovn_u16(b.v));
+            }
         }
     }
-#undef H2
-#undef CBX
-#undef CRX
-#undef LSX
 }
+#undef CAND_TAKE
+#undef CSC_INL
 
 static void csc_glass_n(const uint8_t *rgb, int npairs, uint8_t *Y, uint8_t *U, uint8_t *V) {
     int p = 0;

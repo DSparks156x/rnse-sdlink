@@ -93,16 +93,16 @@ SCEN = [
     ('twice_3k',   3000,  ['--absent-at', '3', '--absent-for', '2', '--absent-at', '8', '--absent-for', '0.5', '--total', '13'], 140, 'settle'),
     ('late_start', 20000, ['--absent-at', '0', '--absent-for', '4', '--total', '9'], 140, 'settle'),      # chain up first, then the reader
     ('steady_75k', 75000, ['--total', '10'], 150, 'steady'),
-    ('over_60k',   60000, ['--total', '15', '--us-per-sector', '160', '--settle', '5'], 140, 'overload'),  # reader about 50 superframes/s
+    ('over_60k',   60000, ['--total', '15', '--us-per-sector', '160', '--settle', '5'], 140, 'overload', {'avl_args': ['--linkcap', '4.5e6']}),  # reader about 50 superframes/s
     ('over_3k',    3000,  ['--total', '15', '--sleep-us', '20000', '--settle', '5'], 140, 'overload'),     # reader limited, small frames
-    ('peak_170',   81000, ['--total', '12', '--settle', '5'], 162, 'overload'),                            # 167-170 sectors: 17.1 ms per read, over the tick
+    ('peak_170',   81000, ['--total', '12', '--settle', '5'], 162, 'overload', {'avl_args': ['--linkcap', '4.5e6']}),                            # 167-170 sectors: 17.1 ms per read, over the tick
 ]
 # extra scenarios: name, frame bytes, reader args, maxvid, checks, options. Whole-superframe hold on (--whole-sf 1), and what a real source looks like: below 60 fps, periodic keys.
 WSF = ['--whole-sf', '1']
 SCEN2 = [
     ('wsf_steady', 75000, ['--total', '10'], 150, 'steady', {'avl_args': WSF}),
     ('wsf_away10', 20000, LONG, 140, 'settle', {'avl_args': WSF}),
-    ('wsf_over',   60000, ['--total', '15', '--us-per-sector', '160', '--settle', '5'], 140, 'overload', {'avl_args': WSF}),
+    ('wsf_over',   60000, ['--total', '15', '--us-per-sector', '160', '--settle', '5'], 140, 'overload', {'avl_args': WSF + ['--linkcap', '4.5e6']}),
     ('steady_55',  75000, ['--total', '10', '--settle', '3'], 150, 'steady', {'fps': 55}),                 # the standing queue behind the start key drains
     ('away03_55',  3000,  ['--absent-at', '3', '--absent-for', '0.3', '--total', '9'], 140, 'settle', {'fps': 55}),
     ('keys4s_60',  60000, ['--total', '14', '--settle', '3'], 140, 'none', {'keyevery': 4}),               # periodic key, exactly 60 fps: compare the older tree

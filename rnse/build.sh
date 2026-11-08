@@ -33,7 +33,8 @@ ${X}gcc $CF -c src/rnv2tab.c -o out/rnvtab.o
 ${X}gcc ${CF/-fno-builtin/} -Wno-sign-compare -c src/rnv2ref.c -o out/rnvref.o
 ${X}gcc $CF -c src/avlib.c -o out/avlib.o
 ${X}gcc $CF -c src/decbench.c -o out/decbench.o
-link decbench 0x20000 out/decbench.o out/avlib.o out/rnvtab.o out/rnvo.o out/rnvp.o out/rnvf.o out/rnvref.o
+# RNV3: decbench no longer fits its window with the larger decoder; not needed for sdstream
+# link decbench 0x20000 out/decbench.o out/avlib.o out/rnvtab.o out/rnvo.o out/rnvp.o out/rnvf.o out/rnvref.o
 if [ -f src/sdstream.c ]; then
   ${X}gcc $CF ${XCF} -c src/sdstream.c -o out/sdstream.o
   ${X}gcc $CF -c src/sdmem.c -o out/sdmem.o

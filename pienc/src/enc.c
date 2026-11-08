@@ -13,8 +13,9 @@
 #define _GNU_SOURCE
 #include "rnv2enc.h"
 #include "kern.h"
-#include "csc_common.h"
 #include "rnv2_tables.h"
+#include "rnv3_modes.h"
+#include "csc_common.h"
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
@@ -33,6 +34,7 @@
 #define BH (H / 8)
 #define NB (BW * BH)
 enum { SKIP = 0, MC, MCR, ZRES, INTRA, RAW };
+#define RNV3_QC2 2
 #define RUNMAX 16
 #define LVMAX 13
 static const uint8_t ZZ[16] = {0, 1, 4, 8, 5, 2, 3, 6, 9, 12, 13, 10, 7, 11, 14, 15};
@@ -40,22 +42,33 @@ static const uint8_t ZZ[16] = {0, 1, 4, 8, 5, 2, 3, 6, 9, 12, 13, 10, 7, 11, 14,
 enum { CY_FRAME = 20000, CY_SKIP = 6, CY_MEM = 306, CY_SKIPCOPY = 100 + 306, CY_HDR = 150, CY_MC_INT = 100, CY_MC_ODD = 398,
        CY_MC_H = 646, CY_MC_V = 318, CY_MC_HV = 924, CY_HALF_MEM = 38, CY_ZRES = 100 + 306, CY_FILL = 54 + 306,
        CY_RAW = 150 + 306 + 77, CY_COEF = 55, CY_IWHT_FULL = 218, CY_IWHT_BASE = 20, CY_IWHT_PER = 16, CY_DC = 30,
-       CY_ADD_Y = 184, CY_ADD_YDC = 152, CY_ADD_C4 = 207, CY_ADD_C4DC = 177 };
+       CY_ADD_Y = 184, CY_ADD_YDC = 152, CY_ADD_C4 = 207, CY_ADD_C4DC = 177,
+       CY_LAT8 = 784, CY_LAT4 = 1016, CY_LAT2 = 2047, CY_BTC4 = 991, CY_BTC2 = 792, CY_DITH = 70 }; /* LAT / BTC: qemu instruction counts per block (enc3/sh/sim/table_final2.txt) + CY_MEM - CY_HDR */ /* LAT / BTC: estimates, include CY_MEM */
 static const int WSB[8] = {20, 20, 20, 20, 44, 44, 33, 33}; /* 1, 2.2, 1.65 (rnv2.WCB/WCR) x20 */
 #define DSCALE 320.0                                         /* pd8 is x16, weights x20 */
 #define MAXG 8
 #define BURST_QP_OCT 5.0 /* qp per halving of the frame size around qp 15-30, measured on fades: 4.8 */
 
+typedef struct { int c[6]; } btcinfo; /* y0 y1 u0 u1 v0 v1 */
+typedef struct { uint8_t F2[401 * 241], F4[201 * 121], F8[101 * 61], FU4[201 * 121], FV4[201 * 121], FU8[101 * 61], FV8[101 * 61], QY8[101 * 61], QY4[201 * 121], QY2[401 * 241], QU4[201 * 121], QV4[201 * 121];
+                 int16_t DY4[201 * 121], DY2[401 * 241], DU4[201 * 121], DV4[201 * 121]; } latgrid;
 typedef struct {
-    uint32_t ds[8], dm[8], di[8];
-    uint32_t don[3][8];
-    uint16_t bits[3][8], cyc[3][8];
-    uint8_t nz[3], fill[3], has_mc, valid;
-    uint16_t mvbits, mcc;
-    double Don[3][8], Doff[3][8], Jds, Jdm; /* WSB * distortion / DSCALE, cached by the analysis: decide runs several times per frame */
+    btcinfo btc[2]; uint8_t m4[16], m2[8];  /* btc[0] = BTC4, btc[1] = BTC2 */
+    uint8_t fill[3];
     int16_t L3[3][128];                     /* quantised levels of each residual candidate (commit and the stream writer use these) */
 } blkstat;
-typedef struct { uint8_t mode, cbp, cand; int32_t cbits, cyc; } blkdec;
+/* What the mode decision reads, kept apart from blkstat: decide runs several times per frame over every active block, and these two arrays stay near the size of L2.
+ * Distortions are WSB * pd8 / DSCALE; infinity = candidate not evaluated. */
+#define DCNONE 0xFFFF
+typedef struct { float g[8]; uint16_t bits[8], cyc[8]; } dcand; /* one residual candidate: per subblock Doff - Don (< 0: never coded), bits, cycles */
+typedef struct {
+    float Jds, Jdm, Jdi, ipw, Dlat[3], Dbtc[2];
+    uint16_t blat[3], mvbits, mcc, cskip, cand[3];
+    uint8_t valid, ry, rc;
+} blkdc;
+_Static_assert(sizeof(dcand) == 64, "dcand is one cache line");
+_Static_assert(sizeof(blkdc) <= 64, "blkdc is one cache line");
+typedef struct { uint8_t mode, cbp, cand; int32_t cbits, cyc, ebits; float dist; } blkdec;
 typedef struct { uint8_t *buf; size_t cap, n; uint64_t acc; int nb; } bw_t;
 typedef void (*job_fn)(rnv2enc *e, int idx);
 enum { GNSX = 4, GSW = W / GNSX, GNBAND = 3, GBHT = H / GNBAND, GRNG = 120 };
@@ -69,6 +82,8 @@ long long rnv_cnt[8]; /* csc pairs, sad calls, pd8 calls, fwd8 calls, iwht calls
 #define KC(i, n) ((void)0)
 #endif
 
+#define PAL_MAX 8
+typedef struct { uint8_t r, g, b, y, u, v; int age; } tone_pal;
 struct rnv2enc {
     rnv2enc_params p;
     const rnv2_kern *k;
@@ -83,9 +98,8 @@ struct rnv2enc {
     uint8_t skq[NB]; double skmu[NB]; int qp0; double mu0; /* static-skip validity: (qp, mu, level) of the last evaluated SKIP */
     int16_t prev_mv[NB][2], mv0[NB][2], mv1[NB][2];
     uint32_t mc0[NB], mc1[NB];
-    blkstat *bs; blkdec *bd;
+    blkstat *bs; blkdec *bd; blkdc *dc; dcand *dcp; uint8_t smp[NB]; uint16_t sact[NB]; int nsact; double lam_est, nu_est, lam_gate, nu_gate, rslope; int burst; /* blocks of the lambda sample; this frame's lambda from it */
     double fill, rate_pf, buf, mu; int qp, fn;
-    uint8_t fitted[NB]; uint8_t exact[NB]; uint32_t berr[NB]; /* converge: block equals the target; its squared error */
     double pend_dt, dtf; int since_spill; /* rnv2enc_set_elapsed; frames since the last deliberate spill */
     /* headroom-driven quality: operating point ladder lvl 0 (near-exact) .. nlev-1 (= --lamk/--kappa/--thr) */
     int nlev, lvl, alvl, l0cool, since; double lamk; uint8_t skl[NB];
@@ -103,14 +117,16 @@ struct rnv2enc {
     pthread_mutex_t m; pthread_cond_t cv, cvdone;
     int gen, quit; job_fn jfn; int njobs; _Atomic uint64_t next; atomic_int done; /* next = gen << 32 | next job index */
     /* per-frame work lists / flags */
-    uint8_t key, tvalid, cscneed[NB]; /* key = coded from black; tvalid: tY/U/V = csc(refrgb) everywhere (not before the first frame) */
+    uint8_t nxtd[NB], lat_valid, key, tvalid, cscneed[NB]; /* key = coded from black; tvalid: tY/U/V = csc(refrgb) everywhere (not before the first frame) */
     uint16_t act[NB]; int nact, ncoded, nprev_act;
     uint16_t hx0[BH], hx1[BH];        /* x range of the blocks written to each band (half-pel update range) */
     double lastn, bmu;
+    tone_pal pal[PAL_MAX]; int npal;
     uint8_t *drgb, rng[NB], dith[NB]; /* --dither: source with the static pattern, per-block channel range, blocks dithered now */
     int kl0;                          /* last key at level 0: 0 unknown, 1 fitted, 2 did not fit */
     double pbpa, pkey; int pq, pkq;    /* bytes per active block / of the last key at the classic point, at qp pq / pkq: first-qp prediction */
     blkstat *bs2; int bs2_cls, bs2_qp; /* the other analysis class, kept so a failed level-0 probe does not re-run the level-1 analysis */
+    latgrid *L; int q4, q2a, q2b, q4c; uint8_t clean[NB]; double lamp, mup, szrat, lamb; int lat_ok; blkdec *bd2, *bd3; void *fillc;
 };
 
 /* ------------------------------------------------------------------ utils */
@@ -189,8 +205,16 @@ static inline void run_w(rnv2enc *e, job_fn fn, int n, int work, int minwork) {
 
 /* ------------------------------------------------------------------ block gather / scatter (SB layout) */
 static inline void gather_y(const uint8_t *p, int stride, uint8_t *o) {
+#ifdef __ARM_NEON
+    int g;
+    for (g = 0; g < 2; g++, p += 4 * stride, o += 32) {
+        uint32x4_t a = vreinterpretq_u32_u8(vcombine_u8(vld1_u8(p), vld1_u8(p + stride))), c = vreinterpretq_u32_u8(vcombine_u8(vld1_u8(p + 2 * stride), vld1_u8(p + 3 * stride)));
+        vst1q_u32((uint32_t *)o, vuzp1q_u32(a, c)); vst1q_u32((uint32_t *)(o + 16), vuzp2q_u32(a, c));
+    }
+#else
     int r;
     for (r = 0; r < 8; r++, p += stride) { uint8_t *d = o + ((r >> 2) * 2) * 16 + (r & 3) * 4; memcpy(d, p, 4); memcpy(d + 16, p + 4, 4); }
+#endif
 }
 static inline void gather_c(const uint8_t *p, int stride, uint8_t *o) { /* o = start of the component's 2 subblocks */
     int r;
@@ -296,12 +320,18 @@ static void recon_res(rnv2enc *e, const int16_t *L, int mask, int step, const ui
     KC(5, 1); e->k->addclamp(P, R, mask, rec);
 }
 
+#include "rnv3_enc.inc"
+
 /* ------------------------------------------------------------------ phase 1: change detection + CSC */
 /* 8 pixels of the input format -> RGB24 */
 static inline void line8_rgb(const uint8_t *s, enum rnv2_fmt f, uint8_t *d) {
 #ifdef __ARM_NEON
     if (f == RNV2_BGR24) { uint8x8x3_t v = vld3_u8(s), o; o.val[0] = v.val[2]; o.val[1] = v.val[1]; o.val[2] = v.val[0]; vst3_u8(d, o); }
-    else { uint8x8x4_t v = vld4_u8(s); uint8x8x3_t o; if (f == RNV2_BGR0) { o.val[0] = v.val[2]; o.val[1] = v.val[1]; o.val[2] = v.val[0]; } else { o.val[0] = v.val[0]; o.val[1] = v.val[1]; o.val[2] = v.val[2]; } vst3_u8(d, o); }
+    else { /* 32 bytes in, 24 out: a shuffle over two registers instead of de-interleaving and re-interleaving every row */
+        static const uint8_t T[2][24] = {{2, 1, 0, 6, 5, 4, 10, 9, 8, 14, 13, 12, 18, 17, 16, 22, 21, 20, 26, 25, 24, 30, 29, 28}, {0, 1, 2, 4, 5, 6, 8, 9, 10, 12, 13, 14, 16, 17, 18, 20, 21, 22, 24, 25, 26, 28, 29, 30}};
+        const uint8_t *t = T[f != RNV2_BGR0]; uint8x16x2_t v; v.val[0] = vld1q_u8(s); v.val[1] = vld1q_u8(s + 16);
+        vst1q_u8(d, vqtbl2q_u8(v, vld1q_u8(t))); vst1_u8(d + 16, vqtbl2_u8(v, vld1_u8(t + 16)));
+    }
 #else
     int x;
     switch (f) {
@@ -311,20 +341,30 @@ static inline void line8_rgb(const uint8_t *s, enum rnv2_fmt f, uint8_t *d) {
     }
 #endif
 }
+/* n >= 4 pairs; almost all unequal groups already differ in the first 8 bytes */
+static inline int group_eq(const uint8_t *a, const uint8_t *b, size_t n) {
+    uint64_t x, y;
+    memcpy(&x, a, 8); memcpy(&y, b, 8);
+    return x == y && !memcmp(a + 8, b + 8, n - 8);
+}
 /* CSC of one row segment of refrgb (npairs from pixel x).  The kernel is a pure per-pair function, so a 16-pixel group equal to the same
  * group one row up (already converted: same band, or an unchanged block) or to the group on its left reuses that output.  UI and map
- * content is mostly flat or vertically uniform, and this kernel is the most expensive per-pixel step in the encoder. */
+ * content is mostly flat or vertically uniform, and this kernel is the most expensive per-pixel step in the encoder.
+ * Groups without a match collect into one kernel call: the kernel is faster per group over a long run than called group by group. */
 static void csc_seg(rnv2enc *e, int y, int x, int npairs, int r) {
-    const uint8_t *rgb = (e->p.dither ? e->drgb : e->refrgb) + ((size_t)y * W + x) * 3;
+    const uint8_t *rgb = e->refrgb + ((size_t)y * W + x) * 3;
     uint8_t *Y = e->tY + y * W + x, *U = e->tU + y * CW + x / 2, *V = e->tV + y * CW + x / 2;
-    int p = 0;
+    int p = 0, run = 0; /* the pending run ends at p */
+#define FLUSH() do { if (run) { KC(0, run); e->k->csc_glass(rgb + 6 * (p - run), run, Y + 2 * (p - run), U + p - run, V + p - run); run = 0; } } while (0)
     while (p < npairs) {
         int n = npairs - p >= 8 ? 8 : npairs - p;
-        if (r > 0 && !memcmp(rgb + 6 * p, rgb + 6 * p - W * 3, (size_t)6 * n)) { memcpy(Y + 2 * p, Y + 2 * p - W, (size_t)2 * n); memcpy(U + p, U + p - CW, (size_t)n); memcpy(V + p, V + p - CW, (size_t)n); }
-        else if (p >= n && !memcmp(rgb + 6 * p, rgb + 6 * (p - n), (size_t)6 * n)) { memcpy(Y + 2 * p, Y + 2 * (p - n), (size_t)2 * n); memcpy(U + p, U + p - n, (size_t)n); memcpy(V + p, V + p - n, (size_t)n); }
-        else { KC(0, n); e->k->csc_glass(rgb + 6 * p, n, Y + 2 * p, U + p, V + p); }
+        if (r > 0 && group_eq(rgb + 6 * p, rgb + 6 * p - W * 3, (size_t)6 * n)) { FLUSH(); memcpy(Y + 2 * p, Y + 2 * p - W, (size_t)2 * n); memcpy(U + p, U + p - CW, (size_t)n); memcpy(V + p, V + p - CW, (size_t)n); }
+        else if (p >= n && group_eq(rgb + 6 * p, rgb + 6 * (p - n), (size_t)6 * n)) { FLUSH(); memcpy(Y + 2 * p, Y + 2 * (p - n), (size_t)2 * n); memcpy(U + p, U + p - n, (size_t)n); memcpy(V + p, V + p - n, (size_t)n); }
+        else run += n;
         p += n;
     }
+    FLUSH();
+#undef FLUSH
 }
 /* static-skip rule: unchanged source, SKIP last frame, and last evaluated at a qp / mu / level no finer than now: the decision cannot change */
 static void csc_row(rnv2enc *e, int by, int bx0, int bx1) { /* CSC on runs of blocks that need it */
@@ -339,7 +379,50 @@ static void csc_row(rnv2enc *e, int by, int bx0, int bx1) { /* CSC on runs of bl
         }
     }
 }
-static inline int can_force(const rnv2enc *e, int b) { return (e->p.converge && e->exact[b]) || (e->p.static_skip && e->prevmode[b] == SKIP && e->qp0 >= e->skq[b] && e->mu0 >= e->skmu[b] && e->lvl >= e->skl[b]); } /* a block equal to the target with an unchanged source has nothing left to gain */
+static inline int can_force(const rnv2enc *e, int b) { return e->clean[b]; }
+static inline int it_lt(int a, int b) { return a < b; }
+static int fill_cmp(const void *a, const void *b) { float x = *(const float *)a, y = *(const float *)b; return x < y ? 1 : x > y ? -1 : (((const int *)a)[1] - ((const int *)b)[1]); }
+/* Block compares of job_csc: a = 8 rows of 24 bytes at stride as, r = the same block of refrgb.  Identical results on both paths. */
+#ifdef __ARM_NEON
+static inline int blk_maxdiff(const uint8_t *a, size_t as, const uint8_t *r) { /* largest byte difference */
+    uint8x16_t m = vdupq_n_u8(0); uint8x8_t m8 = vdup_n_u8(0); int i, x, y;
+    for (i = 0; i < 8; i++, a += as, r += W * 3) { m = vmaxq_u8(m, vabdq_u8(vld1q_u8(a), vld1q_u8(r))); m8 = vmax_u8(m8, vabd_u8(vld1_u8(a + 16), vld1_u8(r + 16))); }
+    x = vmaxvq_u8(m); y = vmaxv_u8(m8);
+    return x > y ? x : y;
+}
+static inline void blk_sumdiff(const uint8_t *a, size_t as, const uint8_t *r, int sm[3]) { /* sum of a - r per channel */
+    int16x8_t s0 = vdupq_n_s16(0), s1 = s0, s2 = s0; int i;
+    for (i = 0; i < 8; i++, a += as, r += W * 3) {
+        uint8x8x3_t x = vld3_u8(a), y = vld3_u8(r);
+        s0 = vaddq_s16(s0, vreinterpretq_s16_u16(vsubl_u8(x.val[0], y.val[0]))); s1 = vaddq_s16(s1, vreinterpretq_s16_u16(vsubl_u8(x.val[1], y.val[1]))); s2 = vaddq_s16(s2, vreinterpretq_s16_u16(vsubl_u8(x.val[2], y.val[2])));
+    }
+    sm[0] = vaddlvq_s16(s0); sm[1] = vaddlvq_s16(s1); sm[2] = vaddlvq_s16(s2);
+}
+static inline int blk_range(const uint8_t *r) { /* largest max - min of the three channels */
+    uint8x8x3_t v = vld3_u8(r); uint8x8_t n0 = v.val[0], x0 = n0, n1 = v.val[1], x1 = n1, n2 = v.val[2], x2 = n2; int i, a, b, c;
+    for (i = 1; i < 8; i++) { r += W * 3; v = vld3_u8(r); n0 = vmin_u8(n0, v.val[0]); x0 = vmax_u8(x0, v.val[0]); n1 = vmin_u8(n1, v.val[1]); x1 = vmax_u8(x1, v.val[1]); n2 = vmin_u8(n2, v.val[2]); x2 = vmax_u8(x2, v.val[2]); }
+    a = vmaxv_u8(x0) - vminv_u8(n0); b = vmaxv_u8(x1) - vminv_u8(n1); c = vmaxv_u8(x2) - vminv_u8(n2);
+    if (b > a) a = b;
+    return c > a ? c : a;
+}
+#else
+static inline int blk_maxdiff(const uint8_t *a, size_t as, const uint8_t *r) {
+    int i, x, m = 0;
+    for (i = 0; i < 8; i++, a += as, r += W * 3) for (x = 0; x < 24; x++) { int d = abs(a[x] - r[x]); if (d > m) m = d; }
+    return m;
+}
+static inline void blk_sumdiff(const uint8_t *a, size_t as, const uint8_t *r, int sm[3]) {
+    int i, x;
+    sm[0] = sm[1] = sm[2] = 0;
+    for (i = 0; i < 8; i++, a += as, r += W * 3) for (x = 0; x < 24; x += 3) { sm[0] += a[x] - r[x]; sm[1] += a[x + 1] - r[x + 1]; sm[2] += a[x + 2] - r[x + 2]; }
+}
+static inline int blk_range(const uint8_t *r) {
+    int mn[3] = {255, 255, 255}, mx[3] = {0, 0, 0}, i, x, c, m = 0;
+    for (i = 0; i < 8; i++, r += W * 3) for (x = 0; x < 8; x++) for (c = 0; c < 3; c++) { int v = r[3 * x + c]; if (v < mn[c]) mn[c] = v; if (v > mx[c]) mx[c] = v; }
+    for (c = 0; c < 3; c++) if (mx[c] - mn[c] > m) m = mx[c] - mn[c];
+    return m;
+}
+#endif
 static void job_csc(rnv2enc *e, int by) {
     int bx, r, y0 = by * 8, bx0 = 0, bx1 = BW, first = e->first;
     const uint8_t *dmg = e->damaged + by * BW; int bpp = e->fmt == RNV2_RGB24 || e->fmt == RNV2_BGR24 ? 3 : 4;
@@ -349,20 +432,21 @@ static void job_csc(rnv2enc *e, int by) {
         if (bx0 >= bx1) { memset(e->changed + by * BW, 0, BW); memset(e->cscneed + by * BW, 0, BW); if (e->p.refine_static) { for (bx = 0; bx < BW; bx++) e->forced[by * BW + bx] = (uint8_t)can_force(e, by * BW + bx); } else memset(e->forced + by * BW, 1, BW); return; }
     }
     for (bx = 0; bx < BW; bx++) {
-        int b = by * BW + bx, diff = 0, need; uint8_t line[24];
+        int b = by * BW + bx, diff = 0, need;
         if (!dmg[bx] && !first) { e->changed[b] = 0; e->forced[b] = e->p.refine_static ? (uint8_t)can_force(e, b) : 1; e->cscneed[b] = 0; continue; }
-        for (r = 0; r < 8; r++) { /* compare against, and update, the RGB24 copy of the previous source in one pass */
-            const uint8_t *sp = e->cur + (size_t)(y0 + r) * e->curstride + (size_t)bx * 8 * bpp, *lp = sp; uint8_t *rp = e->refrgb + (size_t)(y0 + r) * W * 3 + bx * 24;
-            if (e->fmt != RNV2_RGB24) { line8_rgb(sp, e->fmt, line); lp = line; }
-            if (!e->tvalid || memcmp(lp, rp, 24)) { memcpy(rp, lp, 24); diff = 1; }
+        { /* compare with the source last taken for this block.  Changes within --srcdead levels do not count: the phone stream wobbles by a level or two in flat areas, and the panel cannot show that anyway */
+            uint8_t nb[192]; const uint8_t *np, *rb = e->refrgb + (size_t)y0 * W * 3 + bx * 24; size_t ns; int dead = e->p.src_dead, any = 1;
+            if (e->fmt == RNV2_RGB24) { np = e->cur + (size_t)y0 * e->curstride + (size_t)bx * 8 * bpp; ns = e->curstride; } /* the source rows themselves */
+            else { for (r = 0; r < 8; r++) line8_rgb(e->cur + (size_t)(y0 + r) * e->curstride + (size_t)bx * 8 * bpp, e->fmt, nb + 24 * r); np = nb; ns = 24; }
+            if (e->tvalid) {
+                int md = blk_maxdiff(np, ns, rb);
+                any = md > 0;
+                if (any && dead > 0 && md <= dead) { int sm[3]; blk_sumdiff(np, ns, rb, sm); any = abs(sm[0]) >= e->p.src_mean || abs(sm[1]) >= e->p.src_mean || abs(sm[2]) >= e->p.src_mean; } /* a block whose mean moves is a real change on its way (a fade, a slow gradient), not noise */
+            }
+            if (any) { for (r = 0; r < 8; r++) memcpy(e->refrgb + (size_t)(y0 + r) * W * 3 + bx * 24, np + ns * r, 24); diff = 1; }
         }
         need = diff;
-        if (need && e->p.dither) { /* max-min per channel of this block */
-            int mn[3] = {255, 255, 255}, mx[3] = {0, 0, 0}, x, c, m = 0;
-            for (r = 0; r < 8; r++) { const uint8_t *rp = e->refrgb + (size_t)(y0 + r) * W * 3 + bx * 24; for (x = 0; x < 8; x++) for (c = 0; c < 3; c++) { int v = rp[3 * x + c]; if (v < mn[c]) mn[c] = v; if (v > mx[c]) mx[c] = v; } }
-            for (c = 0; c < 3; c++) if (mx[c] - mn[c] > m) m = mx[c] - mn[c];
-            e->rng[b] = (uint8_t)m;
-        }
+        if (need && (e->p.dither || e->p.smooth)) e->rng[b] = (uint8_t)blk_range(e->refrgb + (size_t)y0 * W * 3 + bx * 24); /* max-min per channel of this block */
         e->cscneed[b] = (uint8_t)need; /* a key frame recodes every block, but the target of an unchanged source block is still valid */
         if (first) diff = 1;
         e->changed[b] = (uint8_t)diff;
@@ -370,46 +454,146 @@ static void job_csc(rnv2enc *e, int by) {
            qp or mu could make rnv2.py refine it): the decision cannot change -> SKIP without evaluation */
         e->forced[b] = (uint8_t)(!diff && can_force(e, b));
     }
-    if (!e->p.dither) csc_row(e, by, bx0, bx1);
+    csc_row(e, by, bx0, bx1);
 }
-/* --dither (prototype): 6-bit panel without its own dither.  In smooth gradient blocks the source gets a screen-locked 2x2 ordered pattern before the CSC:
- * truncation to 6 bits then averages to the true 8-bit value.  The pattern never moves, so a still picture still costs nothing.  A block is dithered when it and its
- * 4 neighbours are all smooth (range <= dither_range: no text or edges) and at least one of them is not perfectly flat (flat UI stays exact). */
-static void dither_pass(rnv2enc *e) {
-    static const uint8_t B[2][2] = {{0, 2}, {3, 1}};
+/* Smooth blocks: the plain conversion instead of the glass fit.  The fit nudges luma pixel by pixel towards 6-bit levels, which on a gradient is noise: expensive to code, and it does not survive any loss anyway.
+ * With --dither the screen-locked pattern goes on top, the same one the decoder adds to soft blocks.  Near black stays undithered: pure black must stay exactly black. */
+static void plain_block(rnv2enc *e, int b, int dith) {
+    int bx = b % BW, by = b / BW, r, x;
+    for (r = 0; r < 8; r++) {
+        const uint8_t *p = e->refrgb + (size_t)(by * 8 + r) * W * 3 + bx * 24; uint8_t *Y = e->tY + (by * 8 + r) * W + bx * 8, *U = e->tU + (by * 8 + r) * CW + bx * 4, *V = e->tV + (by * 8 + r) * CW + bx * 4;
+        for (x = 0; x < 4; x++, p += 6) {
+            int r0 = p[0], g0 = p[1], b0 = p[2], r1 = p[3], g1 = p[4], b1 = p[5];
+            int y0 = (19595 * r0 + 38470 * g0 + 7471 * b0 + 32768) >> 16, y1 = (19595 * r1 + 38470 * g1 + 7471 * b1 + 32768) >> 16;
+            int u = ((CBF(r0, g0, b0) + CBF(r1, g1, b1) + 65536) >> 17) + 128, v = ((CRF(r0, g0, b0) + CRF(r1, g1, b1) + 65536) >> 17) + 128;
+            if (dith) { y0 += LAT_DITH[r & 1][0] - LAT_DITH_BASE; y1 += LAT_DITH[r & 1][1] - LAT_DITH_BASE; }
+            Y[2 * x] = (uint8_t)CL255(y0); Y[2 * x + 1] = (uint8_t)CL255(y1); U[x] = (uint8_t)CL255(u); V[x] = (uint8_t)CL255(v);
+        }
+    }
+}
+static void smooth_classify(rnv2enc *e) {
     int b, R = e->p.dither_range;
     for (b = 0; b < NB; b++) {
-        int bx = b % BW, by = b / BW, m = e->rng[b], a = m, d, r, x, c;
+        int bx = b % BW, by = b / BW, m = e->rng[b], a = m, d;
         if (bx > 0) { int v = e->rng[b - 1]; if (v > m) m = v; a |= v; }
         if (bx < BW - 1) { int v = e->rng[b + 1]; if (v > m) m = v; a |= v; }
         if (by > 0) { int v = e->rng[b - BW]; if (v > m) m = v; a |= v; }
         if (by < BH - 1) { int v = e->rng[b + BW]; if (v > m) m = v; a |= v; }
         d = m <= R && a > 0;
-        if (d != e->dith[b]) { e->cscneed[b] = 1; if (!e->first) { e->changed[b] = 1; e->forced[b] = 0; } } /* the target of this block changes though its source did not */
-        if (!e->cscneed[b]) continue;
+        if (d && e->p.dither) { const uint8_t *p = e->refrgb + (size_t)(by * 8 + 4) * W * 3 + bx * 24 + 12; if (p[0] + p[1] + p[2] < 48) d = 2; } /* dark: smooth, no pattern */
+        else if (d && !e->p.dither) d = 2;
+        if (d != e->dith[b]) { e->cscneed[b] = e->first ? e->cscneed[b] : 2; if (!e->first) { e->changed[b] = 1; e->forced[b] = 0; e->clean[b] = 0; } } /* the target of this block changes though its source did not */
+        e->nxtd[b] = (uint8_t)d;
+    }
+}
+static void job_smooth(rnv2enc *e, int by) {
+    int b;
+    for (b = by * BW; b < (by + 1) * BW; b++) {
+        int d = e->nxtd[b];
+        if (e->cscneed[b]) {
+            if (d) plain_block(e, b, d == 1);
+            else if (e->cscneed[b] == 2) { int r; for (r = 0; r < 8; r++) csc_seg(e, by * 8 + r, (b % BW) * 8, 4, 0); }
+        }
         e->dith[b] = (uint8_t)d;
+    }
+}
+
+/* Tone palette: maps and Material UI are flat vector art, a few colours with the phone stream's speckle around each.  Where a pale colour covers enough of the screen, every pixel close to it gets one
+ * target: the panel levels of that colour, placed mid-level in each channel so coding errors cannot cross a level.  Keeps the tint, unlike --tonelock.  Gradients make no histogram peak and are left alone. */
+#define PAL_BINS 28                      /* channel (v - 200) >> 1 */
+static void tone_entry_target(tone_pal *t) {
+    int qr = t->r >> 2, qg = t->g >> 2, qb = t->b >> 2, best = -1, y, u, v;
+    double cr = 4 * qr + 1.5, cg = 4 * qg + 1.5, cb = 4 * qb + 1.5, yc = .299 * cr + .587 * cg + .114 * cb, uc = (cb - yc) / 1.772, vc = (cr - yc) / 1.402;
+    int y0 = (int)lrint(yc), u0 = (int)lrint(uc), v0 = (int)lrint(vc);
+    t->y = (uint8_t)CL255(y0); t->u = (uint8_t)CL255(u0 + 128); t->v = (uint8_t)CL255(v0 + 128);
+    for (y = y0 - 2; y <= y0 + 2; y++) for (u = u0 - 2; u <= u0 + 2; u++) for (v = v0 - 2; v <= v0 + 2; v++) {
+        int R = y + OR_(v), G = y + OG_(u, v), B = y + OB_(u), m, a;
+        if (y < 0 || y > 255 || R > 255 || G > 255 || B > 255 || (R >> 2) != qr || (G >> 2) != qg || (B >> 2) != qb) continue;
+        m = R & 3; if (3 - (R & 3) < m) m = 3 - (R & 3);                /* distance to the nearer level edge, worst channel; 63 has no upper edge */
+        a = G & 3; if (3 - (G & 3) < a) a = 3 - (G & 3); if (a < m) m = a;
+        a = B & 3; if (3 - (B & 3) < a) a = 3 - (B & 3); if (a < m) m = a;
+        m = m * 16 - abs(u) - abs(v);                                   /* of equal margins, the least chroma */
+        if (m > best) { best = m; t->y = (uint8_t)y; t->u = (uint8_t)(u + 128); t->v = (uint8_t)(v + 128); }
+    }
+}
+static void tone_palette(rnv2enc *e) {
+    static int h[PAL_BINS][PAL_BINS][PAL_BINS];
+    int x, y, n = 0, i, j, k, a, b, c, changed = 0, b_;
+    if (!e->first && e->fn % 8) return;
+    memset(h, 0, sizeof h);
+    for (y = 2; y < H; y += 4) { const uint8_t *p = e->refrgb + (size_t)y * W * 3 + 6; for (x = 2; x < W; x += 4, p += 12) { n++; if (p[0] >= 200 && p[1] >= 200 && p[2] >= 200) h[(p[0] - 200) >> 1][(p[1] - 200) >> 1][(p[2] - 200) >> 1]++; } }
+    for (i = 0; i < e->npal; i++) e->pal[i].age++;
+    for (i = 0; i < PAL_BINS; i++) for (j = 0; j < PAL_BINS; j++) for (k = 0; k < PAL_BINS; k++) {
+        int v = h[i][j][k], S = 0, peak = 1; double sr = 0, sg = 0, sb = 0;
+        if (v * 200 < n) continue;                                     /* quick reject: the bin itself is under 0.5% */
+        for (a = -1; a <= 1; a++) for (b = -1; b <= 1; b++) for (c = -1; c <= 1; c++) {
+            int I = i + a, J = j + b, K = k + c, w;
+            if (I < 0 || J < 0 || K < 0 || I >= PAL_BINS || J >= PAL_BINS || K >= PAL_BINS) continue;
+            w = h[I][J][K]; if (w > v || (w == v && (a < 0 || (a == 0 && (b < 0 || (b == 0 && c < 0)))))) peak = 0;
+            S += w; sr += w * (200.5 + 2 * I); sg += w * (200.5 + 2 * J); sb += w * (200.5 + 2 * K);
+        }
+        if (!peak || S * 50 < n) continue;                             /* a colour must cover 2% of the screen */
+        { int r = (int)lrint(sr / S), g = (int)lrint(sg / S), bl = (int)lrint(sb / S), m = -1;
+          for (a = 0; a < e->npal; a++) if (abs(e->pal[a].r - r) <= 2 && abs(e->pal[a].g - g) <= 2 && abs(e->pal[a].b - bl) <= 2) { m = a; break; }
+          if (m >= 0) { e->pal[m].age = 0; continue; }                 /* known colour: the target must not move with the noise */
+          if (e->npal < PAL_MAX) m = e->npal++;
+          else { m = 0; for (a = 1; a < PAL_MAX; a++) if (e->pal[a].age > e->pal[m].age) m = a; }
+          e->pal[m].r = (uint8_t)r; e->pal[m].g = (uint8_t)g; e->pal[m].b = (uint8_t)bl; e->pal[m].age = 0; tone_entry_target(&e->pal[m]); changed = 1; }
+    }
+    if (changed && !e->first) for (b_ = 0; b_ < NB; b_++) if (!e->cscneed[b_]) { e->cscneed[b_] = 1; e->changed[b_] = 1; e->forced[b_] = 0; e->clean[b_] = 0; } /* blocks with this colour held by the deadband */
+}
+static inline int pal_find(const rnv2enc *e, const uint8_t *p, int T) {
+    int i;
+    if (p[0] < 197 || p[1] < 197 || p[2] < 197) return -1;
+    for (i = 0; i < e->npal; i++) { const tone_pal *t = &e->pal[i]; if (abs(p[0] - t->r) <= T && abs(p[1] - t->g) <= T && abs(p[2] - t->b) <= T) return i; }
+    return -1;
+}
+static void job_tonepal(rnv2enc *e, int by) {
+    int bx, r, x, T = e->p.tone_pal;
+    for (bx = 0; bx < BW; bx++) {
+        if (!e->cscneed[by * BW + bx]) continue;
         for (r = 0; r < 8; r++) {
-            const uint8_t *sp = e->refrgb + (size_t)(by * 8 + r) * W * 3 + bx * 24; uint8_t *dp = e->drgb + (size_t)(by * 8 + r) * W * 3 + bx * 24;
-            if (!d) { memcpy(dp, sp, 24); continue; }
-            for (x = 0; x < 8; x++) for (c = 0; c < 3; c++) { int v = sp[3 * x + c] + B[(by * 8 + r) & 1][x & 1]; dp[3 * x + c] = (uint8_t)(v > 255 ? 255 : v); }
+            const uint8_t *p = e->refrgb + (size_t)(by * 8 + r) * W * 3 + bx * 24; uint8_t *Y = e->tY + (by * 8 + r) * W + bx * 8, *U = e->tU + (by * 8 + r) * CW + bx * 4, *V = e->tV + (by * 8 + r) * CW + bx * 4;
+            for (x = 0; x < 4; x++, p += 6) {
+                int a = pal_find(e, p, T), b;
+                if (a < 0) continue;
+                b = pal_find(e, p + 3, T);
+                if (b != a) continue;                                  /* chroma is shared by the pair: an edge pair keeps the fit */
+                U[x] = e->pal[a].u; V[x] = e->pal[a].v; Y[2 * x] = Y[2 * x + 1] = e->pal[a].y;
+            }
         }
     }
 }
-static void job_csc2(rnv2enc *e, int by) { csc_row(e, by, 0, BW); }
 
 /* ------------------------------------------------------------------ phase 2: global motion from projections */
 /* Row profiles per vertical strip (4 x 200 px) and column profiles per horizontal band (3 x 160 rows) of the current
  * target and the reference.  A 1-D SAD search over shifts finds scroll (dy) and pan (dx) per strip / band and for the
  * whole frame; static chrome cancels out of the profile difference, so a list scrolling inside a static frame is found.
  * Candidates (full-pel, converted to half-pel units) are handed to every block's motion search. */
-static void search1d(const int32_t *c, const int32_t *r, int n, int R, int *best, int *second, int64_t *bcost, int64_t *zcost) {
+#define GCOARSE_TOP 3 /* shifts of the coarse 1-D search that get the full search around them */
+static int64_t cost1d(const int32_t *c, const int32_t *r, int n, int d) { /* mean absolute difference of the profiles at shift d, Q12 */
+    int i0 = d < 0 ? -d : 0, i1 = d > 0 ? n - d : n, i; int32_t s = 0; const int32_t *rr = r + d;
+    for (i = i0; i < i1; i++) { int32_t x = c[i] - rr[i]; s += x < 0 ? -x : x; }
+    return ((int64_t)s << 12) / (i1 - i0);
+}
+/* Coarse: profiles at half resolution, even shifts only.  Fine: search1d then costs only d = 0 and the best coarse shifts +-1. */
+static void coarse1d(const int32_t *c, const int32_t *r, int n, int R, uint8_t *want) {
+    int32_t c2[W / 2], r2[W / 2]; int m = n / 2, i, q, top[GCOARSE_TOP] = {0}; int64_t tc[GCOARSE_TOP];
+    for (i = 0; i < GCOARSE_TOP; i++) tc[i] = INT64_MAX;
+    for (i = 0; i < m; i++) { c2[i] = c[2 * i] + c[2 * i + 1]; r2[i] = r[2 * i] + r[2 * i + 1]; }
+    for (q = -R / 2; q <= R / 2; q++) {
+        int64_t sc = cost1d(c2, r2, m, q);
+        if (sc < tc[GCOARSE_TOP - 1]) { for (i = GCOARSE_TOP - 1; i > 0 && sc < tc[i - 1]; i--) { tc[i] = tc[i - 1]; top[i] = top[i - 1]; } tc[i] = sc; top[i] = q; }
+    }
+    memset(want, 0, 2 * R + 3); want[R + 1] = 1;
+    for (i = 0; i < GCOARSE_TOP; i++) if (tc[i] != INT64_MAX) { int d = 2 * top[i]; want[d + R] = want[d + R + 1] = want[d + R + 2] = 1; }
+}
+static void search1d(const int32_t *c, const int32_t *r, int n, int R, const uint8_t *want, int *best, int *second, int64_t *bcost, int64_t *zcost) {
     int d, d1 = 0, d2 = 0; int64_t b1 = INT64_MAX, b2 = INT64_MAX;
     for (d = -R; d <= R; d++) {
-        int i0 = d < 0 ? -d : 0, i1 = d > 0 ? n - d : n, i; int32_t s = 0; int64_t sc;
-        const int32_t *rr = r + d;
-        if (i1 - i0 < n / 2) continue;
-        for (i = i0; i < i1; i++) { int32_t x = c[i] - rr[i]; s += x < 0 ? -x : x; }
-        sc = ((int64_t)s << 12) / (i1 - i0);
+        int i0 = d < 0 ? -d : 0, i1 = d > 0 ? n - d : n; int64_t sc;
+        if (i1 - i0 < n / 2 || (want && !want[d + R + 1])) continue;
+        sc = cost1d(c, r, n, d);
         if (d == 0) *zcost = sc;
         if (sc < b1) { if (abs(d - d1) > 2) { b2 = b1; d2 = d1; } b1 = sc; d1 = d; }
         else if (sc < b2 && abs(d - d1) > 2) { b2 = sc; d2 = d; }
@@ -429,8 +613,9 @@ static void job_proj(rnv2enc *e, int idx) { /* idx: image (0 cur, 1 ref) x band 
     KC(7, W * GBHT); e->k->proj_rows((img ? e->R[e->rb][0] : e->tY) + k * GBHT * W, W, W, GBHT, GSW, e->G->rows[img] + k * GBHT * GNSX, e->G->cols[img][k]);
 }
 static void job_gsearch(rnv2enc *e, int j) { /* 0 full rows, 1 full cols, 2-5 strips (rows), 6-8 bands (cols) */
-    int n = (j == 0 || (j >= 2 && j <= 5)) ? H : W, t; int64_t bc, zc = 0;
-    search1d(e->G->prof[j][0], e->G->prof[j][1], n, GRNG, &e->G->res[j][0], &e->G->res[j][1], &bc, &zc);
+    int n = (j == 0 || (j >= 2 && j <= 5)) ? H : W, t, fast = e->p.me_level == 2; int64_t bc, zc = 0; uint8_t want[2 * GRNG + 3];
+    if (fast) coarse1d(e->G->prof[j][0], e->G->prof[j][1], n, GRNG, want);
+    search1d(e->G->prof[j][0], e->G->prof[j][1], n, GRNG, fast ? want : NULL, &e->G->res[j][0], &e->G->res[j][1], &bc, &zc);
     if (bc >= zc) e->G->res[j][0] = 0;
     (void)t;
 }
@@ -466,17 +651,37 @@ static void global_motion(rnv2enc *e, int nchanged) {
 
 /* ------------------------------------------------------------------ phase 3: block motion search (luma SAD) */
 #define LAM_MV 4
+/* --me 2 (the default) has no wide window, no 12-point refinement and one neighbour pass: on the test clips those moved the picture
+ * by under 0.01 dB.  The half-pel step of the last pass is what still earns its cost.  --me 3 keeps the exhaustive search. */
+#define ME_G_GOOD 128 /* cost at which the zero / previous mv is good enough to skip the global candidates (2 per pixel) */
+#define ME_HP_GOOD 32 /* cost below which half-pel has nothing visible left to gain */
 #define PRUNE_NACT 2500 /* active blocks from which the analysis prunes candidates (--prune); lighter frames always analyse everything */
 /* cost of (mx, my), or any value >= lim once it is certain the candidate cannot beat lim (rows 4-7 are not read then) */
 static inline uint32_t me_cost(const rnv2enc *e, int x0, int y0, const uint8_t *src, int mx, int my, uint32_t lim) {
     int ix = mx >> 1, fx = mx & 1, iy = my >> 1, fy = my & 1; const uint8_t *ref; uint32_t mc;
     if (!(x0 + ix >= 0 && x0 + ix + 7 + fx <= W - 1 && y0 + iy >= 0 && y0 + iy + 7 + fy <= H - 1)) return 0xFFFFFFFFu;
     KC(1, 1);
-    ref = yplane(e, fy * 2 + fx) + (y0 + iy) * W + x0 + ix;
     mc = LAM_MV * ((mx != 0) + (my != 0));
 #ifdef __ARM_NEON
     if (e->p.simd) {
-        uint16x8_t acc = vabdl_u8(vld1_u8(src), vld1_u8(ref)); uint32_t h; int r;
+        uint16x8_t acc; uint32_t h; int r;
+        ref = e->R[e->rb][0] + (y0 + iy) * W + x0 + ix;
+        if (fx | fy) { /* half-pel from the integer plane, equal to the half-pel planes: those would be three more planes to pull through the cache */
+            uint8x8_t a = fx ? vrhadd_u8(vld1_u8(ref), vld1_u8(ref + 1)) : vld1_u8(ref), n;
+            if (!fy) {
+                acc = vabdl_u8(vld1_u8(src), a);
+                for (r = 1; r < 8; r++) { if (r == 4 && (h = vaddlvq_u16(acc) + mc) >= lim) return h; acc = vabal_u8(acc, vld1_u8(src + r * W), vrhadd_u8(vld1_u8(ref + r * W), vld1_u8(ref + r * W + 1))); }
+                return vaddlvq_u16(acc) + mc;
+            }
+            acc = vdupq_n_u16(0);
+            for (r = 0; r < 8; r++, a = n) {
+                n = fx ? vrhadd_u8(vld1_u8(ref + (r + 1) * W), vld1_u8(ref + (r + 1) * W + 1)) : vld1_u8(ref + (r + 1) * W);
+                if (r == 4 && (h = vaddlvq_u16(acc) + mc) >= lim) return h;
+                acc = vabal_u8(acc, vld1_u8(src + r * W), vrhadd_u8(a, n));
+            }
+            return vaddlvq_u16(acc) + mc;
+        }
+        acc = vabdl_u8(vld1_u8(src), vld1_u8(ref));
         acc = vabal_u8(acc, vld1_u8(src + W), vld1_u8(ref + W)); acc = vabal_u8(acc, vld1_u8(src + 2 * W), vld1_u8(ref + 2 * W)); acc = vabal_u8(acc, vld1_u8(src + 3 * W), vld1_u8(ref + 3 * W));
         h = vaddlvq_u16(acc) + mc;
         if (h >= lim) return h;
@@ -484,42 +689,47 @@ static inline uint32_t me_cost(const rnv2enc *e, int x0, int y0, const uint8_t *
         return vaddlvq_u16(acc) + mc;
     }
 #endif
+    ref = yplane(e, fy * 2 + fx) + (y0 + iy) * W + x0 + ix;
     return e->k->sad8x8(src, W, ref, W) + mc;
 }
-#define TRY(MX, MY) do { int mx_ = (MX), my_ = (MY); if (mx_ != bx_ || my_ != by_) { uint32_t c_ = me_cost(e, x0_, y0_, src, mx_, my_, bc); if (c_ < bc) { bc = c_; bx_ = mx_; by_ = my_; } } } while (0)
+/* Full-pel candidates already costed for this block in this stage, as an 8x8 grid (-4..+3 px) around an anchor.  bc never rises,
+ * so costing one again cannot change the result: dropping repeats is exact.  Other candidates are simply not tracked. */
+static inline int vis_new(uint64_t *v, int dx, int dy) {
+    unsigned ux = (unsigned)(dx + 8), uy = (unsigned)(dy + 8); uint64_t m;
+    if ((ux | uy) & ~14u) return 1;
+    m = 1ull << (uy * 4 + (ux >> 1));
+    if (*v & m) return 0;
+    *v |= m; return 1;
+}
+#define TRY(MX, MY) do { int mx_ = (MX), my_ = (MY); if ((mx_ != bx_ || my_ != by_) && vis_new(&vis_, mx_ - ox_, my_ - oy_)) { uint32_t c_ = me_cost(e, x0_, y0_, src, mx_, my_, bc); if (c_ < bc) { bc = c_; bx_ = mx_; by_ = my_; } } } while (0)
 
 static void job_me_init(rnv2enc *e, int row) {
-    int i, b;
+    int i, b, fast = e->p.me_level == 2;
     for (b = row * BW; b < (row + 1) * BW; b++) {
         int x0_ = (b - row * BW) * 8, y0_ = row * 8;
         const uint8_t *src = e->tY + y0_ * W + x0_;
-        int bx_ = 0, by_ = 0; uint32_t bc;
+        int bx_ = 0, by_ = 0, ox_ = 1 << 14, oy_ = 0; uint32_t bc; uint64_t vis_ = 0;
         e->medone[b] = 1;
+        if (!(x0_ & 31)) { /* the next lines of the target and of the reference at mv 0: much of the time here is waiting on them */
+            int r; const uint8_t *q = e->R[e->rb][0] + y0_ * W + x0_ + 64;
+            for (r = 0; r < 8; r++) { __builtin_prefetch(src + 64 + r * W); __builtin_prefetch(q + r * W); }
+        }
         if (e->forced[b] || (e->p.refine_static && !e->changed[b])) { e->mv0[b][0] = e->mv0[b][1] = 0; e->mc0[b] = 0; continue; } /* unchanged source: refinement in place, nothing to search */
         bc = me_cost(e, x0_, y0_, src, 0, 0, 0xFFFFFFFFu);
         if (bc) {
             int it;
             e->medone[b] = 0;
             TRY(e->prev_mv[b][0], e->prev_mv[b][1]);
-            for (i = 0; i < e->ng; i++) TRY(e->g[i][0], e->g[i][1]);
+            if (!fast || bc >= ME_G_GOOD) for (i = 0; i < e->ng; i++) TRY(e->g[i][0], e->g[i][1]);
+            ox_ = bx_; oy_ = by_; (void)vis_new(&vis_, 0, 0); (void)vis_new(&vis_, -ox_, -oy_); (void)vis_new(&vis_, e->prev_mv[b][0] - ox_, e->prev_mv[b][1] - oy_);
             for (it = 0; it < (e->p.me_level >= 2 ? 8 : 4) && bc; it++) { /* small full-pel descent */
                 int cx = bx_, cy = by_; uint32_t c0 = bc;
                 TRY(cx + 2, cy); TRY(cx - 2, cy); TRY(cx, cy + 2); TRY(cx, cy - 2);
                 if (bc == c0) break;
             }
-            if (e->p.me_level >= 2 && bc > (uint32_t)e->p.me_win_thr && bc < (uint32_t)e->p.me_win_max) { /* +-3 full-pel window around the best start (rnv2.py searches +-3 around its global peaks) */
+            if (e->p.me_level >= 3 && bc > (uint32_t)e->p.me_win_thr && bc < (uint32_t)e->p.me_win_max) { /* +-3 full-pel window around the best start (rnv2.py searches +-3 around its global peaks) */
                 int cx = bx_, cy = by_, dx, dy;
-                if (e->p.me_level >= 3) { for (dy = -6; dy <= 6; dy += 2) for (dx = -6; dx <= 6; dx += 2) TRY(cx + dx, cy + dy); }
-                else { /* sparse: rings at 2 and 3 px in 8 directions, then a short descent */
-                    static const int8_t R16[16][2] = {{4, 0}, {-4, 0}, {0, 4}, {0, -4}, {4, 4}, {-4, -4}, {4, -4}, {-4, 4},
-                                                      {6, 0}, {-6, 0}, {0, 6}, {0, -6}, {6, 6}, {-6, -6}, {6, -6}, {-6, 6}};
-                    for (i = 0; i < 16; i++) TRY(cx + R16[i][0], cy + R16[i][1]);
-                    for (it = 0; it < 4 && bc && (bx_ != cx || by_ != cy); it++) {
-                        int qx = bx_, qy = by_; uint32_t c0 = bc;
-                        TRY(qx + 2, qy); TRY(qx - 2, qy); TRY(qx, qy + 2); TRY(qx, qy - 2);
-                        if (bc == c0) break;
-                    }
-                }
+                for (dy = -6; dy <= 6; dy += 2) for (dx = -6; dx <= 6; dx += 2) TRY(cx + dx, cy + dy);
             }
         }
         e->mv0[b][0] = (int16_t)bx_; e->mv0[b][1] = (int16_t)by_; e->mc0[b] = bc;
@@ -531,12 +741,14 @@ static void job_me_pass(rnv2enc *e, int row) { /* Jacobi: reads pass input (mv0/
     int16_t (*mi)[2] = (e->pass & 1) ? e->mv1 : e->mv0, (*mo)[2] = (e->pass & 1) ? e->mv0 : e->mv1;
     uint32_t *ci = (e->pass & 1) ? e->mc1 : e->mc0, *co = (e->pass & 1) ? e->mc0 : e->mc1;
     int last = e->pass == (e->p.me_level >= 1 ? 1 : 0), b, i;
-    const uint8_t *pc = e->mchg[e->pass & 1]; uint8_t *oc = e->mchg[(e->pass & 1) ^ 1];
+    const uint8_t *pc = e->mchg[e->pass & 1]; uint8_t *oc = e->mchg[(e->pass & 1) ^ 1]; int fast = e->p.me_level == 2;
+    if (fast && e->pass == 0) { b = row * BW; memcpy(mo[b], mi[b], BW * sizeof mo[0]); memcpy(co + b, ci + b, BW * sizeof co[0]); memset(oc + b, 1, BW); return; } /* one neighbour pass, the last */
     for (b = row * BW; b < (row + 1) * BW; b++) {
         int x0_ = (b - row * BW) * 8, y0_ = row * 8;
         const uint8_t *src = e->tY + y0_ * W + x0_;
         int bx_ = mi[b][0], by_ = mi[b][1], bxr = b - row * BW, byr = row; uint32_t bc = ci[b];
         if (!e->medone[b] && bc) {
+            int ox_ = bx_, oy_ = by_; uint64_t vis_ = 1ull << 36; /* the block mv itself is already costed */
             /* Jacobi fixed point: if neither this block nor a neighbour changed in the previous pass, the
                neighbour + 12-point step would reproduce the previous result exactly -> skip it */
             int same = e->pass > 0 && !pc[b] && (bxr == 0 || !pc[b - 1]) && (bxr == BW - 1 || !pc[b + 1]) &&
@@ -547,9 +759,20 @@ static void job_me_pass(rnv2enc *e, int row) { /* Jacobi: reads pass input (mv0/
                 if (byr > 0) TRY(mi[b - BW][0], mi[b - BW][1]);
                 if (byr < BH - 1) TRY(mi[b + BW][0], mi[b + BW][1]);
                 /* no usable match nearby (cut / new content): skip the local refinements */
-                if (bc < (uint32_t)e->p.me_win_max) { int cx = bx_, cy = by_; for (i = 0; i < 12 && bc; i++) TRY(cx + P12[i][0], cy + P12[i][1]); }
+                if (!fast && bc < (uint32_t)e->p.me_win_max) { int cx = bx_, cy = by_; for (i = 0; i < 12 && bc; i++) TRY(cx + P12[i][0], cy + P12[i][1]); }
             }
-            if (last && bc && bc < (uint32_t)e->p.me_win_max) { int cx = bx_, cy = by_; for (i = 0; i < 8; i++) TRY(cx + P8[i][0], cy + P8[i][1]); }
+            if (last && bc && bc < (uint32_t)e->p.me_win_max && (!fast || bc >= ME_HP_GOOD)) {
+                int cx = bx_, cy = by_;
+                if (fast) { /* the sides, then the two diagonals next to the side that won, if one did */
+                    int hx = 0, hy = 0; uint32_t c1 = bc;
+                    TRY(cx + 1, cy); if (bc < c1) { hx = 1; c1 = bc; }
+                    TRY(cx - 1, cy); if (bc < c1) { hx = -1; c1 = bc; }
+                    TRY(cx, cy + 1); if (bc < c1) { hy = 1; hx = 0; c1 = bc; }
+                    TRY(cx, cy - 1); if (bc < c1) { hy = -1; hx = 0; c1 = bc; }
+                    if (hx) { TRY(cx + hx, cy + 1); TRY(cx + hx, cy - 1); }
+                    else if (hy) { TRY(cx + 1, cy + hy); TRY(cx - 1, cy + hy); }
+                } else for (i = 0; i < 8; i++) TRY(cx + P8[i][0], cy + P8[i][1]);
+            }
         }
         oc[b] = (uint8_t)(bx_ != mi[b][0] || by_ != mi[b][1]);
         mo[b][0] = (int16_t)bx_; mo[b][1] = (int16_t)by_; co[b] = bc;
@@ -557,115 +780,330 @@ static void job_me_pass(rnv2enc *e, int row) { /* Jacobi: reads pass input (mv0/
 }
 
 /* ------------------------------------------------------------------ phase 4: per-block RD analysis at qp */
-static void analyse_block(rnv2enc *e, int b) {
-    blkstat *s = &e->bs[b];
-    uint8_t S[128], Z[128], P[128], I[128], rec[128]; int16_t T[128];
+static inline int64_t wsum(const uint32_t d[8]) { return 20 * ((int64_t)d[0] + d[1] + d[2] + d[3]) + 44 * ((int64_t)d[4] + d[5]) + 33 * ((int64_t)d[6] + d[7]); } /* WSB */
+/* Which subblocks of a residual candidate pay at (lp, np), and their sums.  The sum order is the same in both paths: the float result must not depend on the build */
+static inline unsigned dcand_eval(const dcand *c, float lp, float np, int *B, int *cy, float *gain) {
+#ifdef __ARM_NEON
+    static const uint32_t M0[4] = {1, 2, 4, 8}, M1[4] = {16, 32, 64, 128};
+    uint16x8_t bb = vld1q_u16(c->bits), cc = vld1q_u16(c->cyc);
+    float32x4_t g0 = vld1q_f32(c->g), g1 = vld1q_f32(c->g + 4);
+    float32x4_t t0 = vaddq_f32(vmulq_n_f32(vcvtq_f32_u32(vmovl_u16(vget_low_u16(bb))), lp), vmulq_n_f32(vcvtq_f32_u32(vmovl_u16(vget_low_u16(cc))), np));
+    float32x4_t t1 = vaddq_f32(vmulq_n_f32(vcvtq_f32_u32(vmovl_high_u16(bb)), lp), vmulq_n_f32(vcvtq_f32_u32(vmovl_high_u16(cc)), np));
+    uint32x4_t m0 = vcgtq_f32(g0, t0), m1 = vcgtq_f32(g1, t1);
+    uint16x8_t m16 = vcombine_u16(vmovn_u32(m0), vmovn_u32(m1));
+    float32x4_t v = vaddq_f32(vreinterpretq_f32_u32(vandq_u32(vreinterpretq_u32_f32(g0), m0)), vreinterpretq_f32_u32(vandq_u32(vreinterpretq_u32_f32(g1), m1)));
+    *B = vaddvq_u16(vandq_u16(bb, m16)); *cy = vaddvq_u16(vandq_u16(cc, m16));
+    *gain = (vgetq_lane_f32(v, 0) + vgetq_lane_f32(v, 1)) + (vgetq_lane_f32(v, 2) + vgetq_lane_f32(v, 3));
+    return vaddvq_u32(vandq_u32(m0, vld1q_u32(M0))) | vaddvq_u32(vandq_u32(m1, vld1q_u32(M1)));
+#else
+    unsigned cbp = 0; int k, b_ = 0, c_ = 0; float v[4] = {0, 0, 0, 0};
+    for (k = 0; k < 8; k++) if (c->g[k] > (float)c->bits[k] * lp + (float)c->cyc[k] * np) { cbp |= 1u << k; b_ += c->bits[k]; c_ += c->cyc[k]; v[k & 3] += c->g[k]; }
+    *B = b_; *cy = c_; *gain = (v[0] + v[1]) + (v[2] + v[3]);
+    return cbp;
+#endif
+}
+#define CBPB(x) (CBPL_LEN[(x) & 15] + CBPC_LEN[(x) >> 4])
+static inline void blk_stats(const uint8_t *S, int *sy, int *su, int *sv, int *ry, int *rc) {
+#ifdef __ARM_NEON
+    uint8x16_t q0 = vld1q_u8(S), q1 = vld1q_u8(S + 16), q2 = vld1q_u8(S + 32), q3 = vld1q_u8(S + 48), q4 = vld1q_u8(S + 64), q5 = vld1q_u8(S + 80), q6 = vld1q_u8(S + 96), q7 = vld1q_u8(S + 112);
+    int ru, rv;
+    *sy = vaddlvq_u8(q0) + vaddlvq_u8(q1) + vaddlvq_u8(q2) + vaddlvq_u8(q3); *su = vaddlvq_u8(q4) + vaddlvq_u8(q5); *sv = vaddlvq_u8(q6) + vaddlvq_u8(q7);
+    *ry = vmaxvq_u8(vmaxq_u8(vmaxq_u8(q0, q1), vmaxq_u8(q2, q3))) - vminvq_u8(vminq_u8(vminq_u8(q0, q1), vminq_u8(q2, q3)));
+    ru = vmaxvq_u8(vmaxq_u8(q4, q5)) - vminvq_u8(vminq_u8(q4, q5)); rv = vmaxvq_u8(vmaxq_u8(q6, q7)) - vminvq_u8(vminq_u8(q6, q7));
+    *rc = ru > rv ? ru : rv;
+#else
+    int k, a = 0, n = 255, x = 0, ru, rv;
+    for (k = 0; k < 64; k++) { int v = S[k]; a += v; if (v < n) n = v; if (v > x) x = v; }
+    *sy = a; *ry = x - n; a = 0; n = 255; x = 0;
+    for (k = 64; k < 96; k++) { int v = S[k]; a += v; if (v < n) n = v; if (v > x) x = v; }
+    *su = a; ru = x - n; a = 0; n = 255; x = 0;
+    for (k = 96; k < 128; k++) { int v = S[k]; a += v; if (v < n) n = v; if (v > x) x = v; }
+    *sv = a; rv = x - n; *rc = ru > rv ? ru : rv;
+#endif
+}
+#define RES_GATE_LAM 0.5
+#define RES_SB_BITS 3     /* the cheapest coded subblock: one coefficient */
+#define RES_SB_CYC 237    /* CY_DC + CY_ADD_YDC + CY_COEF */
+#define RES_MINBITS 10
+/* phase 4a: what any block needs: the predictions and the residual candidates */
+static void analyse_block(rnv2enc *e, int b, int *ncand) {
+    blkstat *s = &e->bs[b]; blkdc *h = &e->dc[b]; dcand *dcn = e->dcp + (b / BW) * BW * 3 + *ncand;
+    uint8_t S[128], Z[128], P[128], I[128], rec[128]; int16_t T[128]; uint32_t ds[8], dm[8], di[8], don[8]; uint16_t cbits[8], ccyc[8];
     const qtab_t *qi, *qa;
     const int16_t (*mv)[2] = e->mv0; /* final mv field */
-    int c, k, mx = mv[b][0], my = mv[b][1], sy = 0, su = 0, sv = 0; int64_t Sds = 0, Sdm = 0, Sdi = 0; unsigned skipc = 0;
-    s->valid = 0;
+    int c, mx = mv[b][0], my = mv[b][1], sy, su, sv, ry, rc, has_mc; int64_t Sds = 0, Sdm = 0, Sdi = 0; unsigned skipc = 0;
+    h->valid = 0;
     if (e->forced[b]) return;
-    s->valid = 1;
-    qi = qtab(e, e->cqp, 0); qa = qtab(e, e->cqp, 1);
+    h->valid = 1; h->cskip = e->prevmode[b] != SKIP ? CY_SKIPCOPY : CY_SKIP;
+    qi = e->qt[e->cqp][0]; qa = e->qt[e->cqp][1]; /* built at create */
     gather_blk(e->tY, e->tU, e->tV, b, S);
     gather_blk(e->R[e->rb][0], e->R[e->rb][1], e->R[e->rb][2], b, Z);
-    KC(2, 1), e->k->pd8(S, Z, e->kappa16, e->thr, s->ds);
-    if (!(s->ds[0] | s->ds[1] | s->ds[2] | s->ds[3] | s->ds[4] | s->ds[5] | s->ds[6] | s->ds[7])) {
-        /* reference == target: SKIP has zero distortion and the lowest rate and cycles of every mode, at any (lambda > 0, mu) */
-        s->valid = 2; return;
+    KC(2, 1), e->k->pd8(S, Z, e->kappa16, e->thr, ds);
+    if (!e->key && (!(ds[0] | ds[1] | ds[2] | ds[3] | ds[4] | ds[5] | ds[6] | ds[7]) || (e->p.glass_dead && (uint64_t)ds[0] + ds[1] + ds[2] + ds[3] + ds[4] + ds[5] + ds[6] + ds[7] < 32768 && glass_equal(S, Z)))) {
+        /* reference == target at the panel: SKIP has nothing to fix */
+        h->valid = 2; return;
     }
-    for (k = 0; k < 64; k++) sy += S[k];
-    for (k = 64; k < 96; k++) su += S[k];
-    for (k = 96; k < 128; k++) sv += S[k];
+    blk_stats(S, &sy, &su, &sv, &ry, &rc);
+    h->ry = (uint8_t)ry; h->rc = (uint8_t)rc;
     s->fill[0] = (uint8_t)((sy + 32) >> 6); s->fill[1] = (uint8_t)((su + 16) >> 5); s->fill[2] = (uint8_t)((sv + 16) >> 5);
     memset(I, s->fill[0], 64); memset(I + 64, s->fill[1], 32); memset(I + 96, s->fill[2], 32);
-    KC(2, 1), e->k->pd8(S, I, e->kappa16, e->thr, s->di);
-    s->has_mc = (mx || my);
-    if (s->has_mc) { mc_pred(e, b, mx, my, P); KC(2, 1), e->k->pd8(S, P, e->kappa16, e->thr, s->dm); }
+    KC(2, 1), e->k->pd8(S, I, e->kappa16, e->thr, di);
+    has_mc = (mx || my);
+    if (has_mc) { mc_pred(e, b, mx, my, P); KC(2, 1), e->k->pd8(S, P, e->kappa16, e->thr, dm); }
     {
         int lx = b > 0 ? mv[b - 1][0] : 0, ly = b > 0 ? mv[b - 1][1] : 0;
-        s->mvbits = (uint16_t)(ue_len(se_map(mx - lx)) + ue_len(se_map(my - ly)));
-        s->mcc = (uint16_t)mc_cycles(mx, my);
+        h->mvbits = (uint16_t)(ue_len(se_map(mx - lx)) + ue_len(se_map(my - ly)));
+        h->mcc = (uint16_t)mc_cycles(mx, my);
     }
-    for (k = 0; k < 8; k++) { Sds += (int64_t)WSB[k] * s->ds[k]; if (s->has_mc) Sdm += (int64_t)WSB[k] * s->dm[k]; }
-    s->Jds = Sds / DSCALE; s->Jdm = Sdm / DSCALE;
-    if (e->p.prune && e->nact >= PRUNE_NACT) { /* heavy frame: residual candidates whose prediction is far worse than another candidate's rarely win, don't transform them */
-        int64_t Smin = s->has_mc && Sdm < Sds ? Sdm : Sds;
-        for (k = 0; k < 8; k++) Sdi += (int64_t)WSB[k] * s->di[k];
-        if (s->has_mc && Sds > e->p.prune * Sdm) skipc |= 2;  /* ZRES: MC predicts much better */
-        if (s->has_mc && Sdm > e->p.prune * Sds) skipc |= 1;  /* MCR: the reference in place predicts much better */
-        if (Sdi > 2 * e->p.prune * Smin) skipc |= 4;          /* INTRA: an inter prediction is much better than the flat fill */
+    Sds = wsum(ds); if (has_mc) Sdm = wsum(dm); Sdi = wsum(di);
+    h->Jds = (float)(Sds / DSCALE); h->Jdm = has_mc ? (float)(Sdm / DSCALE) : INFINITY; h->Jdi = (float)(Sdi / DSCALE);
+    if (e->p.prune && e->nact >= e->p.prune_nact) { /* heavy frame: residual candidates whose prediction is worse than another candidate's rarely win, don't transform them */
+        int64_t Smin = has_mc && Sdm < Sds ? Sdm : Sds; double pr = e->p.prune_r;
+        if (has_mc && Sds > pr * Sdm) skipc |= 2;  /* ZRES: MC predicts better */
+        if (has_mc && Sdm > pr * Sds) skipc |= 1;  /* MCR: the reference in place predicts better */
+        if (Sdi > pr * Smin) skipc |= 4;              /* INTRA: an inter prediction is better than the flat fill */
     }
-    for (c = 0; c < 3; c++) {
-        const uint8_t *pr = c == 0 ? P : c == 1 ? Z : I; const uint32_t *doff = c == 0 ? s->dm : c == 1 ? s->ds : s->di; int sb;
-        if ((c == 0 && !s->has_mc) || (c == 1 && e->key) || (skipc >> c & 1)) { s->nz[c] = 0; continue; } /* key: a residual on black is a worse INTRA */
-        KC(3, 1), e->k->fwd8(S, pr, T);
-        s->nz[c] = (uint8_t)quant_bits(e, T, c == 2 ? qa : qi, s->L3[c], s->bits[c], s->cyc[c]);
-        if (s->nz[c]) {
-            recon_res(e, s->L3[c], s->nz[c], e->step, pr, rec); KC(2, 1), e->k->pd8(S, rec, e->kappa16, e->thr, s->don[c]);
-            for (sb = 0; sb < 8; sb++) if (s->nz[c] & (1 << sb)) { s->Don[c][sb] = WSB[sb] * (double)s->don[c][sb] / DSCALE; s->Doff[c][sb] = WSB[sb] * (double)doff[sb] / DSCALE; }
+    /* the same error shows more on a smooth block than in texture: steer bits there.  pw 1 from a range of 48 up, pw_max at 6 and below */
+    { int ra = ry > rc ? ry : rc; double pw = ra >= 48 ? 1.0 : ra <= 6 ? e->p.pw_max : 1.0 + (e->p.pw_max - 1.0) * (48 - ra) / 42.0; h->ipw = (float)(1.0 / pw); }
+    if (!e->key && !e->burst && e->p.force_mode <= 0) {
+        /* Last frame's lambda and nu, with room for them to fall.  A subblock whose whole error is less than one coefficient costs cannot be worth coding, whatever its residual looks like: skip the candidate if none is.
+         * And a candidate cannot win if the plain prediction beats its bits and cycles alone */
+        const float lg = (float)(RES_GATE_LAM * e->lamp) * h->ipw, ng = (float)(RES_GATE_LAM * e->mup) * h->ipw, jp = h->Jdm + lg * (3 + h->mvbits) + ng * (CY_HDR + h->mcc), js = h->Jds + lg + ng * h->cskip, j0 = jp < js ? jp : js;
+        const double sbmin = (double)(lg * RES_SB_BITS + ng * RES_SB_CYC) * DSCALE;
+        const uint32_t *dv[3]; dv[0] = dm; dv[1] = ds; dv[2] = di;
+        for (c = 0; c < 3; c++) if (!(c == 0 && !has_mc)) {
+            const uint32_t *d = dv[c]; uint32_t my_ = d[0] > d[1] ? d[0] : d[1], m2_; int64_t ms;
+            if (d[2] > my_) my_ = d[2]; if (d[3] > my_) my_ = d[3];
+            ms = 20 * (int64_t)my_; m2_ = d[4] > d[5] ? d[4] : d[5]; if (44 * (int64_t)m2_ > ms) ms = 44 * (int64_t)m2_; m2_ = d[6] > d[7] ? d[6] : d[7]; if (33 * (int64_t)m2_ > ms) ms = 33 * (int64_t)m2_;
+            if ((double)ms <= sbmin) skipc |= 1u << c;
+            else if (j0 < lg * (RES_MINBITS + (c == 0 ? 3 + h->mvbits : c == 1 ? 3 : 18)) + ng * (CY_HDR + RES_SB_CYC + (c == 0 ? h->mcc : c == 1 ? CY_ZRES : CY_FILL))) skipc |= 1u << c;
         }
     }
+    for (c = 0; c < 3; c++) {
+        const uint8_t *pr = c == 0 ? P : c == 1 ? Z : I; const uint32_t *doff = c == 0 ? dm : c == 1 ? ds : di; int sb, nz, pos = 0;
+        h->cand[c] = DCNONE;
+        if ((c == 0 && !has_mc) || (c == 1 && e->key) || (skipc >> c & 1)) continue; /* key: a residual on black is a worse INTRA */
+        KC(3, 1), e->k->fwd8(S, pr, T);
+        nz = quant_bits(e, T, c == 2 ? qa : qi, s->L3[c], cbits, ccyc);
+        if (nz) {
+            recon_res(e, s->L3[c], nz, e->step, pr, rec); KC(2, 1), e->k->pd8(S, rec, e->kappa16, e->thr, don);
+            for (sb = 0; sb < 8; sb++) { float g = -1; if (nz & (1 << sb)) { g = (float)(WSB[sb] * ((double)doff[sb] - (double)don[sb]) / DSCALE); pos |= g > 0; } dcn->g[sb] = g; dcn->bits[sb] = cbits[sb]; dcn->cyc[sb] = ccyc[sb]; }
+            if (pos) { h->cand[c] = (uint16_t)(dcn - e->dcp); dcn++; ++*ncand; } /* no subblock gains at any lambda: the candidate does not exist */
+        }
+    }
+    h->Dlat[0] = h->Dlat[1] = h->Dlat[2] = h->Dbtc[0] = h->Dbtc[1] = INFINITY;
 }
-static void job_analyse(rnv2enc *e, int row) { int b; for (b = row * BW; b < (row + 1) * BW; b++) analyse_block(e, b); }
+static void job_analyse(rnv2enc *e, int row) { int b, nc = 0; for (b = row * BW; b < (row + 1) * BW; b++) analyse_block(e, b, &nc); }
+#define ANA_ALL 800   /* fewer active blocks than this: all of them are the sample */
+#define ANA_STEP 5    /* one block in this many */
+#define GATE_LAM 0.5  /* the gates use this fraction of the sample's lambda: the fill pass goes below the frame's lambda */
+#define KEY_QPMAX 20  /* a key frame leans on fills and tone blocks, residuals above this cost it more than they save */
+#define GATE_REDO 1.5 /* the frame's lambda off the sample's by more than this: run the gates again */
+/* the block's best J without soft and tone candidates */
+static inline float jb_cheap(const rnv2enc *e, const blkdc *h, float lg, float ng) {
+    float j = h->Jdm + lg * (3 + h->mvbits) + ng * (CY_HDR + h->mcc), t; int c;
+    if (!e->key) { t = h->Jds + lg + ng * h->cskip; if (t < j) j = t; }
+    t = h->Jdi * (float)e->p.fill_pen + lg * (3 + 15 + CBPB(0)) + ng * (CY_HDR + CY_FILL); if (t < j) j = t;
+    if (e->p.use_raw) { t = lg * (3 + 1024) + ng * (CY_HDR + CY_RAW); if (t < j) j = t; }
+    for (c = 0; c < 3; c++) if (h->cand[c] != DCNONE) {
+        int B, cy; float g; unsigned cbp = dcand_eval(&e->dcp[h->cand[c]], lg, ng, &B, &cy, &g);
+        if (cbp) { t = (c == 0 ? h->Jdm : c == 1 ? h->Jds : h->Jdi) - g + lg * (3 + (c == 0 ? h->mvbits : c == 2 ? 15 : 0) + B + CBPB(cbp)) + ng * (CY_HDR + (c == 0 ? h->mcc : c == 1 ? CY_ZRES : CY_FILL) + cy); if (t < j) j = t; }
+    }
+    return j;
+}
+/* Luma flat over 2x2 cells of the block itself, chroma exact: what LAT8 and LAT4 cannot beat, because their luma is flat over those cells */
+static inline float cell_energy(const rnv2enc *e, const uint8_t *S) {
+#if defined(__ARM_NEON) && defined(__ARM_FEATURE_DOTPROD)
+    const uint8x16_t T = vdupq_n_u8((uint8_t)e->thr); uint32x4_t aa = vdupq_n_u32(0), mm = aa; int sb;
+    for (sb = 0; sb < 4; sb++) {
+        uint8x16_t q = vld1q_u8(S + 16 * sb), v = vrhaddq_u8(q, vreinterpretq_u8_u32(vrev64q_u32(vreinterpretq_u32_u8(q)))), a = vabdq_u8(q, vrhaddq_u8(v, vrev16q_u8(v))), m = vqsubq_u8(a, T);
+        aa = vdotq_u32(aa, a, a); mm = vdotq_u32(mm, m, m);
+    }
+    return (float)(20 * ((int64_t)16 * vaddvq_u32(aa) + (int64_t)e->kappa16 * vaddvq_u32(mm)) / DSCALE);
+#else
+    uint8_t M[128]; uint32_t d[8]; int sb;
+    memcpy(M + 64, S + 64, 64);
+    for (sb = 0; sb < 4; sb++) {
+        const uint8_t *p = S + 16 * sb; uint8_t *m = M + 16 * sb; int k;
+        for (k = 0; k < 16; k += 2) { int k2 = k ^ 4, v0 = (p[k] + p[k2] + 1) >> 1, v1 = (p[k + 1] + p[k2 + 1] + 1) >> 1; m[k] = m[k + 1] = (uint8_t)((v0 + v1 + 1) >> 1); }
+    }
+    e->k->pd8(S, M, e->kappa16, e->thr, d);
+    return (float)(wsum(d) / DSCALE);
+#endif
+}
+/* sum of squared differences of n 16-byte groups */
+static inline int ssd16(const uint8_t *a, const uint8_t *b, int n) {
+#if defined(__ARM_NEON) && defined(__ARM_FEATURE_DOTPROD)
+    uint32x4_t s = vdupq_n_u32(0); int i;
+    for (i = 0; i < n; i++) { uint8x16_t d = vabdq_u8(vld1q_u8(a + 16 * i), vld1q_u8(b + 16 * i)); s = vdotq_u32(s, d, d); }
+    return (int)vaddvq_u32(s);
+#else
+    int k, s = 0; for (k = 0; k < 16 * n; k++) { int t = a[k] - b[k]; s += t * t; } return s;
+#endif
+}
+/* phase 4b: soft and tone blocks, which take most of the analysis and win rarely.  gated: this frame's lambda is known (lam_gate), so skip what cannot beat the block's best J at that lambda.
+ * The constants come from a per-block study: nearly nothing is lost at these values (GATE_* below) */
+#define GATE_L84 1.3f   /* LAT8, LAT4 distortion against cell_energy */
+#define GATE_L2 0.35f   /* LAT2 distortion against cell_energy: it has detail, this is not a bound but rarely passes when it should not */
+#define GATE_B2 0.8f    /* BTC2 distortion against the energy of the two-tone fit */
+#define GATE_B4 0.15f   /* BTC4 the same */
+#define LAT2_MINBITS 25
+static void analyse_soft(rnv2enc *e, int b, int gated) {
+    static const int CL_[3] = {CY_LAT8, CY_LAT4, CY_LAT2};
+    blkstat *s = &e->bs[b]; blkdc *h = &e->dc[b]; uint8_t S[128], rec[128]; uint32_t dd[8]; int d, k, ry = h->ry, rc = h->rc, skip84 = 0;
+    double Dl[3] = {-1, -1, -1}; float ip = h->ipw, lg = (float)e->lam_gate * ip, ng = (float)e->nu_gate * ip, jb = 0, E22 = 0;
+    if (!e->p.r3) return;
+    if (e->p.force_mode > 0 || e->p.stale_w > 0) gated = 0;
+    h->Dlat[0] = h->Dlat[1] = h->Dlat[2] = h->Dbtc[0] = h->Dbtc[1] = INFINITY;
+    if (gated) {
+        jb = jb_cheap(e, h, lg, ng);
+        if (jb < lg * 8 + ng * (CY_HDR + CY_LAT8)) return; /* within what the cheapest soft block costs in bits and cycles alone, and every other candidate costs more */
+    }
+    gather_blk(e->tY, e->tU, e->tV, b, S);
+    if (gated && !e->p.dither) { E22 = cell_energy(e, S); skip84 = jb < GATE_L84 * E22 + lg * 8 + ng * (CY_HDR + CY_LAT8); }
+    if (e->lat_ok) for (d = 0; d < 3; d++) {
+        if (d < 2 && skip84) continue;
+        if (d > 0 && Dl[d - 1] >= 0 && Dl[d - 1] < 16) break; /* a coarser lattice is already nearly exact */
+        if (d == 2 && gated && jb < GATE_L2 * E22 + lg * LAT2_MINBITS + ng * (CY_HDR + CY_LAT2)) break;
+        h->blat[d] = (uint16_t)lat_bits_est(e, b, d);
+        if (gated && d > 0 && Dl[d - 1] >= 0 && (lg * (h->blat[d] - h->blat[d - 1]) + ng * (CL_[d] - CL_[d - 1])) > 1.5 * Dl[d - 1]) break; /* even an exact block would not pay for the extra bits and cycles */
+        lat_recon(e, b, d, rec); e->k->pd8(S, rec, e->kappa16, e->thr, dd);
+        Dl[d] = wsum(dd) / DSCALE; h->Dlat[d] = (float)Dl[d];
+        if (gated) { float t = (float)Dl[d] + lg * (5 + h->blat[d]) + ng * (CY_HDR + CL_[d]); if (t < jb) jb = t; }
+    }
+    { int tone = ry >= 10 || rc >= 10;
+      if (gated) { /* a block already within what the tone bits would cost cannot gain; at a very low lambda RAW beats it anyway */
+          if (jb < lg * 84 + ng * (CY_HDR + CY_BTC2) || e->lam_est * ip < e->p.btc_lmin) tone = 0;
+      }
+      if (tone && ry >= rc) { /* most pixels in the middle of the range: texture or a gradient, not two tones */
+          int n_mid = 0, ymn = 255; for (k = 0; k < 64; k++) if (S[k] < ymn) ymn = S[k]; { int q_ = ry / 4, m0 = ymn + q_, m1 = ymn + ry - q_; for (k = 0; k < 64; k++) n_mid += S[k] > m0 && S[k] < m1; if (n_mid > 26) tone = 0; } }
+      if (tone) { /* tone blocks are for real edges */
+        int E, E2; btcctx bc; uint8_t Fl[128];
+        memset(Fl, s->fill[0], 64); memset(Fl + 64, s->fill[1], 32); memset(Fl + 96, s->fill[2], 32);
+        E = ssd16(S, Fl, 4) + 2 * ssd16(S + 64, Fl + 64, 4);
+        btc_load(e, b, &bc); btc_first(&bc, &s->btc[1], s->m2, &s->btc[0]);
+        btc2_rec(&s->btc[1], s->m2, rec);
+        E2 = ssd16(S, rec, 4) + 2 * ssd16(S + 64, rec + 64, 4);
+        if (E2 * e->p.btc_gate <= E) {
+            if (!gated || jb >= GATE_B2 * (float)E2 + lg * (4 + 64 + 16) + ng * (CY_HDR + CY_BTC2)) { e->k->pd8(S, rec, e->kappa16, e->thr, dd); h->Dbtc[1] = (float)(wsum(dd) / DSCALE); }
+            if (!gated || jb >= GATE_B4 * (float)E2 + lg * (3 + 128 + 16) + ng * (CY_HDR + CY_BTC4)) { btc_full(&bc, &s->btc[0], s->m4); btc4_rec(&s->btc[0], s->m4, rec); e->k->pd8(S, rec, e->kappa16, e->thr, dd); h->Dbtc[0] = (float)(wsum(dd) / DSCALE); }
+        }
+      } }
+}
+static void job_soft0(rnv2enc *e, int row) { int b; for (b = row * BW; b < (row + 1) * BW; b++) if (e->dc[b].valid == 1 && e->smp[b]) analyse_soft(e, b, 0); }
+static void job_soft1(rnv2enc *e, int row) { int b; for (b = row * BW; b < (row + 1) * BW; b++) if (e->dc[b].valid == 1 && !e->smp[b]) analyse_soft(e, b, !e->key && !e->burst); }
 
 /* ------------------------------------------------------------------ phase 5: mode decision at (lambda, mu) */
-static void decide_block(rnv2enc *e, int b) {
-    const blkstat *s = &e->bs[b]; blkdec *d = &e->bd[b];
-    double lam = e->lam, mu = e->cmu, J[6], Dc[3]; int cbp[3], B[3], cy[3], c, sb, m, best;
-    int cskip = e->prevmode[b] != SKIP ? CY_SKIPCOPY : CY_SKIP;
-    if (s->valid != 1) { d->mode = SKIP; d->cbp = 0; d->cbits = 0; d->cyc = cskip; return; }
-    for (c = 0; c < 3; c++) {
-        const uint32_t *doff = c == 0 ? s->dm : c == 1 ? s->ds : s->di; int64_t D = 0;
-        cbp[c] = 0; B[c] = 0; cy[c] = 0;
-        if (c == 0 && !s->has_mc) { Dc[c] = 0; continue; }
-        for (sb = 0; sb < 8; sb++) {
-            int on = 0;
-            if (s->nz[c] & (1 << sb)) on = s->Don[c][sb] + lam * (s->bits[c][sb] + mu * s->cyc[c][sb]) < s->Doff[c][sb];
-            if (on) { cbp[c] |= 1 << sb; B[c] += s->bits[c][sb]; cy[c] += s->cyc[c][sb]; D += (int64_t)WSB[sb] * s->don[c][sb]; }
-            else D += (int64_t)WSB[sb] * doff[sb];
-        }
-        Dc[c] = D / DSCALE;
-    }
-    J[SKIP] = s->Jds + lam * 1.0 + lam * mu * cskip;
-    J[MC] = s->has_mc ? s->Jdm + lam * (3 + s->mvbits) + lam * mu * (CY_HDR + s->mcc) : INFINITY;
-#define CBPB(x) (CBPL_LEN[(x) & 15] + CBPC_LEN[(x) >> 4])
-    J[MCR] = (s->has_mc && cbp[0]) ? Dc[0] + lam * (3 + s->mvbits + B[0] + CBPB(cbp[0])) + lam * mu * (CY_HDR + s->mcc + cy[0]) : INFINITY;
-    J[ZRES] = cbp[1] ? Dc[1] + lam * (3 + B[1] + CBPB(cbp[1])) + lam * mu * (CY_HDR + CY_ZRES + cy[1]) : INFINITY;
-    J[INTRA] = Dc[2] + lam * (3 + 15 + B[2] + CBPB(cbp[2])) + lam * mu * (CY_HDR + CY_FILL + cy[2]);
-    J[RAW] = e->p.use_raw ? lam * (3 + 1024) + lam * mu * (CY_HDR + CY_RAW) : INFINITY;
+typedef struct { float lam, nu, K[M_COUNT]; } decpar; /* K: the part of lambda bits + nu cycles that is the same for every block */
+static inline void decide_block(const rnv2enc *e, int b, const decpar *q) {
+    const blkdc *h = &e->dc[b]; blkdec *d = &e->bd[b];
+    float J[M_COUNT], Dc[3], ip, lp, np, bj; int cbp[3] = {0, 0, 0}, B[3] = {0, 0, 0}, cy[3] = {0, 0, 0}, c, m, best;
+    if (h->valid != 1) { d->mode = SKIP; d->cbp = 0; d->cbits = 0; d->cyc = h->cskip; d->ebits = 0; d->dist = 0; return; }
+    ip = h->ipw; lp = q->lam * ip; np = q->nu * ip;
+    Dc[0] = h->Jdm; Dc[1] = h->Jds; Dc[2] = h->Jdi;
+    for (c = 0; c < 3; c++) if (h->cand[c] != DCNONE) { float g; cbp[c] = (int)dcand_eval(&e->dcp[h->cand[c]], lp, np, &B[c], &cy[c], &g); if (cbp[c]) Dc[c] -= g; }
+    J[SKIP] = h->Jds + lp + np * h->cskip;
+    J[MC] = h->Jdm + lp * (3 + h->mvbits) + np * (CY_HDR + h->mcc);
+    J[MCR] = cbp[0] ? Dc[0] + lp * (3 + h->mvbits + B[0] + CBPB(cbp[0])) + np * (CY_HDR + h->mcc + cy[0]) : INFINITY;
+    J[ZRES] = cbp[1] ? Dc[1] + lp * (3 + B[1] + CBPB(cbp[1])) + np * (CY_HDR + CY_ZRES + cy[1]) : INFINITY;
+    J[INTRA] = (cbp[2] ? Dc[2] : Dc[2] * (float)e->p.fill_pen) + lp * (3 + 15 + B[2] + CBPB(cbp[2])) + np * (CY_HDR + CY_FILL + cy[2]);
+    J[RAW] = ip * q->K[RAW];
+    J[M_LAT8] = h->Dlat[0] + lp * h->blat[0] + ip * q->K[M_LAT8];
+    J[M_LAT4] = h->Dlat[1] + lp * h->blat[1] + ip * q->K[M_LAT4];
+    J[M_LAT2] = h->Dlat[2] + lp * h->blat[2] + ip * q->K[M_LAT2];
+    J[M_BTC4] = h->Dbtc[0] + ip * q->K[M_BTC4];
+    J[M_BTC2] = h->Dbtc[1] + ip * q->K[M_BTC2];
+    if (e->key) J[SKIP] = INFINITY;
     if (e->p.stale_w > 0) { /* picture that stays visibly wrong costs extra: a coarse replacement beats a cheap stale block */
-        double sd = e->p.stale_d, w = e->p.stale_w;
-        if (s->Jds > sd) J[SKIP] += w * (s->Jds - sd);
-        if (s->has_mc && s->Jdm > sd) J[MC] += w * (s->Jdm - sd);
+        float sd = (float)e->p.stale_d, w = (float)e->p.stale_w;
+        if (h->Jds > sd) J[SKIP] += w * (h->Jds - sd);
+        if (h->Jdm < INFINITY && h->Jdm > sd) J[MC] += w * (h->Jdm - sd);
         if (J[MCR] < INFINITY && Dc[0] > sd) J[MCR] += w * (Dc[0] - sd);
         if (J[ZRES] < INFINITY && Dc[1] > sd) J[ZRES] += w * (Dc[1] - sd);
         if (Dc[2] > sd) J[INTRA] += w * (Dc[2] - sd);
     }
-    best = 0;
-    for (m = 1; m < 6; m++) if (J[m] < J[best]) best = m;
+    best = 0; bj = J[0];
+    for (m = 1; m < M_COUNT; m++) { int lt = J[m] < bj; bj = lt ? J[m] : bj; best = lt ? m : best; }
+    if (e->p.force_mode > 0 && J[e->p.force_mode] < INFINITY) best = e->p.force_mode; /* test streams: one mode everywhere */
     d->mode = (uint8_t)best; d->cbp = 0; d->cbits = 0;
     switch (best) {
-    case SKIP: d->cyc = cskip; break;
-    case MC: d->cyc = CY_HDR + s->mcc; break;
-    case MCR: d->cand = 0; d->cbp = (uint8_t)cbp[0]; d->cbits = B[0]; d->cyc = CY_HDR + s->mcc + cy[0]; break;
-    case ZRES: d->cand = 1; d->cbp = (uint8_t)cbp[1]; d->cbits = B[1]; d->cyc = CY_HDR + CY_ZRES + cy[1]; break;
-    case INTRA: d->cand = 2; d->cbp = (uint8_t)cbp[2]; d->cbits = B[2]; d->cyc = CY_HDR + CY_FILL + cy[2]; break;
-    default: d->cyc = CY_HDR + CY_RAW; break;
+    case SKIP: d->cyc = h->cskip; d->dist = h->Jds; d->ebits = 0; break;
+    case MC: d->cyc = CY_HDR + h->mcc; d->dist = h->Jdm; d->ebits = 4 + h->mvbits; break;
+    case MCR: d->cand = 0; d->cbp = (uint8_t)cbp[0]; d->cbits = B[0]; d->cyc = CY_HDR + h->mcc + cy[0]; d->dist = Dc[0]; d->ebits = 6 + h->mvbits + B[0] + CBPB(cbp[0]); break;
+    case ZRES: d->cand = 1; d->cbp = (uint8_t)cbp[1]; d->cbits = B[1]; d->cyc = CY_HDR + CY_ZRES + cy[1]; d->dist = Dc[1]; d->ebits = 6 + B[1] + CBPB(cbp[1]); break;
+    case INTRA: d->cand = 2; d->cbp = (uint8_t)cbp[2]; d->cbits = B[2]; d->cyc = CY_HDR + CY_FILL + cy[2]; d->dist = Dc[2]; d->ebits = 6 + 15 + B[2] + CBPB(cbp[2]); break;
+    case M_LAT8: d->cyc = CY_HDR + CY_LAT8 + (e->p.dither ? CY_DITH : 0); d->dist = h->Dlat[0]; d->ebits = 8 + h->blat[0]; break;
+    case M_LAT4: d->cyc = CY_HDR + CY_LAT4 + (e->p.dither ? CY_DITH : 0); d->dist = h->Dlat[1]; d->ebits = 8 + h->blat[1]; break;
+    case M_LAT2: d->cyc = CY_HDR + CY_LAT2; d->dist = h->Dlat[2]; d->ebits = 8 + h->blat[2]; break;
+    case M_BTC4: d->cyc = CY_HDR + CY_BTC4; d->dist = h->Dbtc[0]; d->ebits = 6 + 128 + 16; break;
+    case M_BTC2: d->cyc = CY_HDR + CY_BTC2; d->dist = h->Dbtc[1]; d->ebits = 7 + 64 + 16; break;
+    default: d->cyc = CY_HDR + CY_RAW; d->dist = 0; d->ebits = 7 + 1024; break;
     }
 }
 /* only the active blocks: the decision of a forced block is fixed for the whole frame */
 #define DSLICE 128
-static void job_decide(rnv2enc *e, int j) { int i, n = (j + 1) * DSLICE; if (n > e->nact) n = e->nact; for (i = j * DSLICE; i < n; i++) decide_block(e, e->act[i]); }
+#define DECIDE() run_w(e, job_decide, (e->nact + DSLICE - 1) / DSLICE, e->nact, 256)
+static inline void decide_list(rnv2enc *e, const uint16_t *list, int cnt, int j) {
+    int i, n = (j + 1) * DSLICE, dc_ = e->p.dither ? CY_DITH : 0; double l = e->lam, nu = e->lam * e->cmu; decpar q;
+    q.lam = (float)l; q.nu = (float)nu;
+    q.K[RAW] = e->p.use_raw ? (float)(l * (3 + 1024) + nu * (CY_HDR + CY_RAW)) : INFINITY;
+    q.K[M_LAT8] = (float)(l * 5 + nu * (CY_HDR + CY_LAT8 + dc_)); q.K[M_LAT4] = (float)(l * 5 + nu * (CY_HDR + CY_LAT4 + dc_)); q.K[M_LAT2] = (float)(l * 5 + nu * (CY_HDR + CY_LAT2));
+    q.K[M_BTC4] = (float)(l * (3 + 128 + 16) + nu * (CY_HDR + CY_BTC4)); q.K[M_BTC2] = (float)(l * (4 + 64 + 16) + nu * (CY_HDR + CY_BTC2));
+    if (n > cnt) n = cnt;
+    for (i = j * DSLICE; i < n; i++) decide_block(e, list[i], &q);
+}
+static void job_decide(rnv2enc *e, int j) { decide_list(e, e->act, e->nact, j); }
+static void job_decide_s(rnv2enc *e, int j) { decide_list(e, e->sact, e->nsact, j); }
+/* This frame's lambda and nu from a sample of the blocks (all their candidates are in), before the rest of the analysis.  The search below starts from them, and the rest of the analysis gates against them */
+static void sample_eval(rnv2enc *e, double l, double nu, double scale, double cyfix, double rat, double *bits, double *cyc) {
+    int64_t sb = 0, sc = 0; int i;
+    e->lam = l; e->cmu = nu / l; run_w(e, job_decide_s, (e->nsact + DSLICE - 1) / DSLICE, e->nsact, 256);
+    for (i = 0; i < e->nsact; i++) { const blkdec *d = &e->bd[e->sact[i]]; sb += d->ebits; sc += d->cyc; }
+    *bits = (double)sb * scale * rat; *cyc = cyfix + (double)sc * scale;
+}
+static void lam_presearch(rnv2enc *e, double lam, double nu, double Tb, double cb, double rat, double LMIN, double LMAX, int n1) {
+    const int cold = e->key || e->burst; const double tol = cold ? 1.0 : 1.03; /* a sample cannot tell 1.00 from 1.02, and nu is slow: the search below has the last word */
+    double scale = (double)n1 / e->nsact, cyfix = CY_FRAME, l = lam, n = nu, lo = 0, hi = 0, lp_ = 0, bp = 0, b0, c0, slope = e->rslope; int b, it;
+    for (b = 0; b < NB; b++) { const blkdc *h = &e->dc[b]; if (e->forced[b]) cyfix += e->bd[b].cyc; else if (h->valid != 1) cyfix += h->cskip; }
+    for (it = 0; it < (cold ? 10 : 6); it++) {
+        double eb, ec, next;
+        sample_eval(e, l, n, scale, cyfix, rat, &b0, &c0); eb = b0 / Tb; ec = c0 / cb;
+        if (lp_ > 0 && b0 > 0 && bp > 0 && l != lp_) { double sl = log(b0 / bp) / log(l / lp_); if (sl < -0.1 && sl > -8) slope = sl; }
+        if (eb <= tol && (eb >= 0.9 || l <= LMIN)) { /* the bytes are right: now the cycles, by their price */
+            double r = ec / 0.98;
+            if (ec <= tol) break;
+            r *= r; if (n <= 0) n = l * 0.002; n *= cold && r < 1.2 ? 1.2 : r; lo = hi = lp_ = 0;
+            continue;
+        }
+        if (eb > tol) lo = l; else hi = l;
+        if (lo > 0 && hi > 0 && hi / lo < 1.04) break; /* a cliff in the size: the search below deals with it */
+        next = l * pow((eb > 1e-3 ? eb : 1e-3) / 0.97, -1 / slope);
+        if (next < LMIN) next = LMIN; if (next > LMAX) next = LMAX; if (next > l * 64) next = l * 64; if (next < l / 64) next = l / 64;
+        if (lo > 0 && hi > 0 && (next <= lo || next >= hi)) next = sqrt(lo * hi);
+        lp_ = l; bp = b0; l = next;
+    }
+    e->rslope = slope; e->lam_est = l; e->nu_est = n;
+}
+/* what the search uses: the decisions' own bit estimates and cycles, summed.  The exact walker corrects it through a ratio */
+static void fast_size(const rnv2enc *e, double *bits, double *cyc) {
+    int64_t bb = 0; int64_t cy = CY_FRAME; int b;
+    for (b = 0; b < NB; b++) { const blkdec *d = &e->bd[b]; bb += d->ebits; cy += d->cyc; }
+    *bits = (double)bb; *cyc = (double)cy;
+}
 
 /* exact frame size (bytes incl. 24-byte header) and modelled decode cycles of the current decisions */
 static void frame_size(rnv2enc *e, size_t *bytes, double *cyc) {
-    int64_t b0 = 0, b1 = 0, b2 = 0, nraw = 0; int run = 0, pmx = 0, pmy = 0, pf[3] = {128, 128, 128}, b, nc = 0; double cy = CY_FRAME;
+    int64_t b0 = 0, b1 = 0, b2 = 0, nraw = 0, ns3 = 0; int run = 0, pmx = 0, pmy = 0, pf[3] = {128, 128, 128}, b, nc = 0; double cy = CY_FRAME; emit_t st;
+    static const uint8_t ML[M_COUNT] = {0, 2, 3, 3, 3, 4, 5, 5, 5, 3, 4}; int r3 = e->p.r3;
+    memset(&st, 0, sizeof st); { int i_, j_; for (i_ = 0; i_ < 3; i_++) for (j_ = 0; j_ < 3; j_++) st.last[i_][j_] = 128; for (i_ = 0; i_ < 6; i_++) st.btc[i_] = 128; }
     for (b = 0; b < NB; b++) {
         const blkdec *d = &e->bd[b]; int m = d->mode;
         cy += d->cyc;
         if (m == SKIP) { run++; continue; }
-        b0 += ue_len((uint32_t)run) + (m >= INTRA ? 3 : 2); run = 0; nc++;
+        b0 += ue_len((uint32_t)run) + (r3 ? ML[m] : (m >= INTRA ? 3 : 2)); run = 0; nc++;
+        if (m >= M_LAT8 && m <= M_LAT2) { b1 += lat_emit(e, b, m - M_LAT8, &st, NULL); continue; }
+        if (m == M_BTC4) { b1 += btc_emit(&e->bs[b].btc[0], &st, NULL); ns3 += 16; continue; }
+        if (m == M_BTC2) { b1 += btc_emit(&e->bs[b].btc[1], &st, NULL); ns3 += 8; continue; }
         if (m == MCR || m == ZRES || m == INTRA) b0 += CBPB(d->cbp);
         if (m == MC || m == MCR) { int mx = e->mv0[b][0], my = e->mv0[b][1]; b1 += ue_len(se_map(mx - pmx)) + ue_len(se_map(my - pmy)); pmx = mx; pmy = my; }
         if (m == INTRA) { int k; for (k = 0; k < 3; k++) { b1 += ue_len(se_map(e->bs[b].fill[k] - pf[k])); pf[k] = e->bs[b].fill[k]; } }
@@ -673,7 +1111,7 @@ static void frame_size(rnv2enc *e, size_t *bytes, double *cyc) {
         b2 += d->cbits;
     }
     if (run) b0 += ue_len((uint32_t)run);
-    *bytes = (size_t)(24 + (b0 + 7) / 8 + (b1 + 7) / 8 + (b2 + 7) / 8 + 128 * nraw);
+    { size_t h = (size_t)(24 + (b0 + 7) / 8 + (b1 + 7) / 8 + (b2 + 7) / 8); if (r3) h = (h + 3) & ~(size_t)3; *bytes = h + (size_t)(128 * nraw + ns3); }
     *cyc = cy; e->ncoded = nc;
 }
 
@@ -685,6 +1123,9 @@ static void commit_block(rnv2enc *e, int b) {
     case SKIP: return; /* reference unchanged */
     case MC: mc_pred(e, b, mx, my, rec); break;
     case RAW: gather_blk(e->tY, e->tU, e->tV, b, rec); break;
+    case M_LAT8: case M_LAT4: case M_LAT2: lat_recon(e, b, d->mode - M_LAT8, rec); break;
+    case M_BTC4: btc4_rec(&e->bs[b].btc[0], e->bs[b].m4, rec); break;
+    case M_BTC2: btc2_rec(&e->bs[b].btc[1], e->bs[b].m2, rec); break;
     default: {
         const blkstat *s = &e->bs[b];
         if (d->mode == MCR) mc_pred(e, b, mx, my, P);
@@ -692,6 +1133,7 @@ static void commit_block(rnv2enc *e, int b) {
         else { memset(P, s->fill[0], 64); memset(P + 64, s->fill[1], 32); memset(P + 96, s->fill[2], 32); }
         recon_res(e, s->L3[d->cand], d->cbp, e->step, P, rec);
     } }
+    { uint8_t S_[128]; gather_blk(e->tY, e->tU, e->tV, b, S_); e->clean[b] = d->mode == RAW ? 1 : (uint8_t)glass_equal(S_, rec); }
 }
 static void job_commit(rnv2enc *e, int row) { int b; for (b = row * BW; b < (row + 1) * BW; b++) commit_block(e, b); }
 /* after all blocks are committed (MC reads the old reference), write the coded blocks into the single reference */
@@ -728,14 +1170,24 @@ static void job_halfpel(rnv2enc *e, int idx) { /* idx = 3 components x BH row ba
 
 /* serial bitstream writer */
 static void write_stream(rnv2enc *e, int qp) {
-    int b, run = 0, pmx = 0, pmy = 0, pf[3] = {128, 128, 128};
-    static const uint8_t MCODE[6][2] = {{0, 0}, {0, 2}, {1, 2}, {2, 2}, {6, 3}, {7, 3}};
+    int b, run = 0, pmx = 0, pmy = 0, pf[3] = {128, 128, 128}, r3 = e->p.r3; emit_t st;
+    static const uint8_t MCODE2[6][2] = {{0, 0}, {0, 2}, {1, 2}, {2, 2}, {6, 3}, {7, 3}};
+    static const uint8_t MCODE3[M_COUNT][2] = {{0, 0}, {0, 2}, {2, 3}, {3, 3}, {4, 3}, {15, 4}, {20, 5}, {21, 5}, {22, 5}, {6, 3}, {14, 4}}; /* MC 00, MCR 010, ZRES 011, INTRA 100, LAT 101dd, BTC4 110, BTC2 1110, RAW 1111 */
+    memset(&st, 0, sizeof st); { int i_, j_; for (i_ = 0; i_ < 3; i_++) for (j_ = 0; j_ < 3; j_++) st.last[i_][j_] = 128; for (i_ = 0; i_ < 6; i_++) st.btc[i_] = 128; }
     bw_reset(&e->w0); bw_reset(&e->w1); bw_reset(&e->w2); e->s3n = 0;
     for (b = 0; b < NB; b++) {
         const blkdec *d = &e->bd[b]; int m = d->mode;
         if (m == SKIP) { run++; continue; }
         bw_ue(&e->w0, (uint32_t)run); run = 0;
-        bw_put(&e->w0, MCODE[m][0], MCODE[m][1]);
+        if (r3) bw_put(&e->w0, MCODE3[m][0], MCODE3[m][1]); else bw_put(&e->w0, MCODE2[m][0], MCODE2[m][1]);
+        if (m >= M_LAT8 && m <= M_LAT2) { lat_emit(e, b, m - M_LAT8, &st, &e->w1); continue; }
+        if (m == M_BTC4 || m == M_BTC2) {
+            int nb = m == M_BTC4 ? 16 : 8;
+            btc_emit(&e->bs[b].btc[m == M_BTC4 ? 0 : 1], &st, &e->w1);
+            if (e->s3n + nb > e->s3cap) { size_t nc = e->s3cap * 2; uint8_t *nbuf = xmalloc(nc); memcpy(nbuf, e->s3, e->s3n); free(e->s3); e->s3 = nbuf; e->s3cap = nc; }
+            memcpy(e->s3 + e->s3n, m == M_BTC4 ? e->bs[b].m4 : e->bs[b].m2, (size_t)nb); e->s3n += nb;
+            continue;
+        }
         if (m == MCR || m == ZRES || m == INTRA) {
             bw_put(&e->w0, (uint32_t)CBPL_CODE[d->cbp & 15], CBPL_LEN[d->cbp & 15]);
             bw_put(&e->w0, (uint32_t)CBPC_CODE[d->cbp >> 4], CBPC_LEN[d->cbp >> 4]);
@@ -781,11 +1233,12 @@ static void write_stream(rnv2enc *e, int qp) {
     }
     if (run) bw_ue(&e->w0, (uint32_t)run);
     bw_flush(&e->w0); bw_flush(&e->w1); bw_flush(&e->w2);
+    if (r3) while ((24 + e->w0.n + e->w1.n + e->w2.n) & 3) { if (e->w2.n + 1 > e->w2.cap) bw_grow(&e->w2); e->w2.buf[e->w2.n++] = 0; } /* stream 3 starts word aligned: the masks are read as words */
     {
         size_t n = 24 + e->w0.n + e->w1.n + e->w2.n + e->s3n; uint8_t *o; size_t l[4]; int i;
         if (n > e->ocap) { free(e->obuf); e->ocap = n * 2; e->obuf = xmalloc(e->ocap); }
         o = e->obuf; l[0] = e->w0.n; l[1] = e->w1.n; l[2] = e->w2.n; l[3] = e->s3n;
-        o[0] = 'R'; o[1] = '2'; o[2] = (uint8_t)((e->fn >> 8) & 0xFF); o[3] = (uint8_t)(e->fn & 0xFF); o[4] = (uint8_t)qp; o[5] = 1; o[6] = o[7] = 0;
+        o[0] = 'R'; o[1] = r3 ? '3' : '2'; o[2] = (uint8_t)((e->fn >> 8) & 0xFF); o[3] = (uint8_t)(e->fn & 0xFF); o[4] = (uint8_t)qp; o[5] = r3 ? (uint8_t)(e->p.dither ? 1 : 0) : 1; o[6] = r3 ? (uint8_t)(e->q4 | e->q2a << 4) : 0; o[7] = r3 ? (uint8_t)(e->q2b | e->q4c << 4) : 0;
         for (i = 0; i < 4; i++) { o[8 + 4 * i] = (uint8_t)(l[i] >> 24); o[9 + 4 * i] = (uint8_t)(l[i] >> 16); o[10 + 4 * i] = (uint8_t)(l[i] >> 8); o[11 + 4 * i] = (uint8_t)l[i]; }
         o += 24;
         memcpy(o, e->w0.buf, l[0]); o += l[0]; memcpy(o, e->w1.buf, l[1]); o += l[1]; memcpy(o, e->w2.buf, l[2]); o += l[2]; memcpy(o, e->s3, l[3]);
@@ -802,59 +1255,6 @@ static void canon(const unsigned char *L, int n, uint32_t *code) {
     for (i = 0; i < n; i++) { int s = order[i]; if (i) { c = (c + 1) << (L[s] - prev); } prev = L[s]; code[s] = c; }
 }
 
-/* converge: does block b of the reference equal the target, and how far is it */
-static void block_exact(rnv2enc *e, int b) {
-    int by = b / BW, bx = b % BW, r, c; uint32_t sse = 0; const uint8_t *RY = e->R[e->rb][0], *RU = e->R[e->rb][1], *RV = e->R[e->rb][2];
-    for (r = 0; r < 8; r++) {
-        size_t oy = (size_t)(by * 8 + r) * W + bx * 8, oc = (size_t)(by * 8 + r) * CW + bx * 4;
-        if (memcmp(RY + oy, e->tY + oy, 8)) for (c = 0; c < 8; c++) { int d = (int)RY[oy + c] - e->tY[oy + c]; sse += (uint32_t)(d * d); }
-        if (memcmp(RU + oc, e->tU + oc, 4)) for (c = 0; c < 4; c++) { int d = (int)RU[oc + c] - e->tU[oc + c]; sse += (uint32_t)(d * d); }
-        if (memcmp(RV + oc, e->tV + oc, 4)) for (c = 0; c < 4; c++) { int d = (int)RV[oc + c] - e->tV[oc + c]; sse += (uint32_t)(d * d); }
-    }
-    e->berr[b] = sse; e->exact[b] = sse == 0;
-}
-/* panel model as csc_common.h: full range BT.601, nearest chroma, 6 bits kept.  Channels of one pixel that land on another panel level than the source */
-static inline int fit_miss(const int *s, int y, int uu, int vv) {
-    int r = y + OR_(vv), g = y + OG_(uu, vv), b = y + OB_(uu);
-    r = CL255(r); g = CL255(g); b = CL255(b);
-    return ((r >> 2) != (s[0] >> 2)) + ((g >> 2) != (s[1] >> 2)) + ((b >> 2) != (s[2] >> 2));
-}
-static inline int rnd_i(double x) { return (int)floor(x + 0.5); }
-/* re-choose the target of a still block.  The common chroma comes from the middle of the two pixels' panel levels, so values sit away from the step edges */
-static void fit_block(rnv2enc *e, int b) {
-    int by = b / BW, bx = b % BW, r, x, i;
-    for (r = 0; r < 8; r++) for (x = 0; x < 4; x++) {
-        size_t oy = (size_t)(by * 8 + r) * W + bx * 8 + 2 * x, oc = (size_t)(by * 8 + r) * CW + bx * 4 + x;
-        const uint8_t *rp = e->refrgb + oy * 3; int s[2][3], y0 = e->tY[oy], y1 = e->tY[oy + 1], u0 = e->tU[oc], v0 = e->tV[oc], cur, best, bu = u0, bv = v0, by0 = y0, by1 = y1, du, dv; double cr = 0, cg = 0, cb = 0, yc[2];
-        for (i = 0; i < 2; i++) { int k; for (k = 0; k < 3; k++) s[i][k] = rp[3 * i + k]; }
-        { int k, dd = 0; for (k = 0; k < 3; k++) { int a = s[0][k] - s[1][k]; if (a < 0) a = -a; if (a > dd) dd = a; } if (dd > 8) continue; } /* a hard edge inside the pair: shared chroma cannot serve both, the glass-aware target stays */
-        if (e->p.csc_fit == 2) { /* still-only ordered dither: the panel level is taken from source + a screen-locked 2x2 offset, mean preserved through the panel's truncation */
-            static const int D[2][2] = {{0, 2}, {3, 1}}; int k, yy = by * 8 + r, xx = bx * 8 + 2 * x;
-            for (i = 0; i < 2; i++) for (k = 0; k < 3; k++) { int a = s[i][k] + D[yy & 1][(xx + i) & 1]; s[i][k] = a > 255 ? 255 : a; }
-        }
-        cur = fit_miss(s[0], y0, u0 - 128, v0 - 128) + fit_miss(s[1], y1, u0 - 128, v0 - 128);
-        if (!cur) continue;
-        best = cur;
-        for (i = 0; i < 2; i++) { double R_ = (s[i][0] & 0xFC) + 1.5, G_ = (s[i][1] & 0xFC) + 1.5, B_ = (s[i][2] & 0xFC) + 1.5; cr += R_ / 2; cg += G_ / 2; cb += B_ / 2; yc[i] = 0.299 * R_ + 0.587 * G_ + 0.114 * B_; }
-        { int uc = rnd_i(-0.168736 * cr - 0.331264 * cg + 0.5 * cb), vc = rnd_i(0.5 * cr - 0.418688 * cg - 0.081312 * cb);
-          for (du = 0; du < 5 && best; du++) for (dv = 0; dv < 5 && best; dv++) {
-            static const int O[5] = {0, -1, 1, -2, 2}; int uu = uc + O[du], vv = vc + O[dv], tot = 0, ybest[2], dy;
-            if (uu < -128 || uu > 127 || vv < -128 || vv > 127) continue;
-            for (i = 0; i < 2; i++) {
-                int m = 4, yy0 = rnd_i(yc[i]);
-                ybest[i] = yy0;
-                for (dy = 0; dy < 7 && m; dy++) { int yy = yy0 + (dy & 1 ? (dy + 1) / 2 : -(dy / 2)), mm; if (yy < 0 || yy > 255) continue; mm = fit_miss(s[i], yy, uu, vv); if (mm < m) { m = mm; ybest[i] = yy; } }
-                tot += m;
-            }
-            if (tot < best) { best = tot; bu = uu + 128; bv = vv + 128; by0 = ybest[0]; by1 = ybest[1]; }
-          }
-        }
-        e->tY[oy] = (uint8_t)by0; e->tY[oy + 1] = (uint8_t)by1; e->tU[oc] = (uint8_t)bu; e->tV[oc] = (uint8_t)bv;
-    }
-    e->fitted[b] = 1;
-}
-void rnv2enc_modes(const rnv2enc *e, uint8_t *out) { memcpy(out, e->prevmode, NB); }
-
 /* ------------------------------------------------------------------ public API */
 void rnv2enc_default_params(rnv2enc_params *p) {
     memset(p, 0, sizeof *p);
@@ -862,8 +1262,8 @@ void rnv2enc_default_params(rnv2enc_params *p) {
     p->kappa = 4; p->thr = 3; p->dz_inter = 0.22; p->dz_intra = 0.33; p->mu_min = 0.002; p->mu_max = 2.0; p->use_raw = 1;
     p->link_cap = 0; p->adapt = 1; p->nlevels = 12; p->lam_lo = 0.0025; p->lam_x = 0.01; p->kappa_lo = 16; p->thr_lo = 0; p->fill_target = 0.25; p->hyst = 0.85; p->dwell = 4; p->pin_level = -1;
     p->max_tries = 12; p->threads = 1; p->static_skip = 1; p->simd = 1; p->me_level = 2; p->me_win_thr = 0; p->me_win_max = 1024; p->rt_rc = 1; p->prune = 3; p->qp_pred = 1;
-    p->lag_target = 0.5; p->refine_static = 1; p->max_frame = 1.5; p->stale_d = 6000; p->stale_w = 2; p->burst_probe = 1; p->mu_relax = 1; p->qp_drop = 4; p->fast_refine = 1; p->dither = 0; p->dither_range = 24;
-    p->sf_budget = 0; p->trim_ratio = 1.35; p->spill_qp = 18; p->spill_sf = 2; p->spill_gap = 30; p->spill_carry = 1; p->trim_max = 3; p->spill_cyc = 1; p->converge = 0; p->conv_sf = 2; p->csc_fit = 0;
+    p->lag_target = 0.5; p->refine_static = 1; p->max_frame = 1.5; p->stale_d = 6000; p->stale_w = 0; p->burst_probe = 1; p->mu_relax = 1; p->qp_drop = 4; p->fast_refine = 1; p->dither = 0; p->dither_range = 24;
+    p->rc_tol = 0.88; p->btc_lmin = 0.02; p->fill_gap = 1; p->prune_nact = 1200; p->prune_r = 1.5; p->smooth = 0; p->src_mean = 48; p->pw_max = 3; p->btc_gate = 5; p->fill_pen = 2.0; p->r3 = 1; p->src_dead = 3; p->glass_dead = 1; p->lat_q4 = 2; p->lat_q2a = 2; p->lat_q2b = 3; p->lat_q4c = 3; p->lat_sharp = 0; p->rc_gamma = 1.0; p->sf_budget = 0; p->trim_ratio = 1.35; p->spill_qp = 18; p->spill_sf = 2; p->spill_gap = 30; p->spill_carry = 1; p->trim_max = 3; p->spill_cyc = 1; p->nu_relax = 0; p->nu_relax_thr = 0.94; p->nu_relax_n = 3;
 }
 
 static void set_level(rnv2enc *e, int L);
@@ -872,7 +1272,7 @@ void rnv2enc_force_key(rnv2enc *e) {
     int i;
     memset(e->R[0][0], 0, W * H); memset(e->R[0][1], 128, CW * H); memset(e->R[0][2], 128, CW * H);
     for (i = 0; i < 3; i++) { memset(e->HP[0][i], 0, W * H); memset(e->HP[1][i], 128, CW * H); memset(e->HP[2][i], 128, CW * H); } /* half-pel planes of black: the old ones must not survive the key */
-    e->rb = 0; e->first = 1; memset(e->prevmode, INTRA, NB); memset(e->prev_mv, 0, sizeof e->prev_mv);
+    e->rb = 0; e->first = 1; memset(e->prevmode, INTRA, NB); memset(e->prev_mv, 0, sizeof e->prev_mv); memset(e->clean, 0, NB);
 }
 
 rnv2enc *rnv2enc_create(const rnv2enc_params *p) {
@@ -902,8 +1302,9 @@ rnv2enc *rnv2enc_create(const rnv2enc_params *p) {
     for (i = 0; i < BH; i++) { e->hx0[i] = 0; e->hx1[i] = W; }
     e->G = xmalloc(sizeof(gme_t));
     for (i = 0; i < 52; i++) { qtab(e, i, 0); qtab(e, i, 1); } /* build all quantiser tables up front (no first-use stalls) */
-    e->rec = xmalloc(128 * NB);
-    e->bs = xmalloc(sizeof(blkstat) * NB); e->bs2 = xmalloc(sizeof(blkstat) * NB); e->bs2_cls = -1; e->bd = xmalloc(sizeof(blkdec) * NB);
+    e->rec = xmalloc(128 * NB); e->L = xmalloc(sizeof(latgrid)); e->q4 = p->lat_q4; e->q2a = p->lat_q2a; e->q2b = p->lat_q2b; e->q4c = p->lat_q4c; e->lamp = 1.0; e->mup = 0; e->rslope = -0.6;
+    e->dc = xmalloc(sizeof(blkdc) * NB); e->dcp = xmalloc(sizeof(dcand) * NB * 3);
+    e->bs = xmalloc(sizeof(blkstat) * NB); e->bs2 = xmalloc(sizeof(blkstat) * NB); e->bs2_cls = -1; e->bd = xmalloc(sizeof(blkdec) * NB); e->bd2 = xmalloc(sizeof(blkdec) * NB); e->bd3 = xmalloc(sizeof(blkdec) * NB);
     memset(e->prevmode, INTRA, NB); memset(e->prev_mv, 0, sizeof e->prev_mv);
     e->rate_pf = e->p.rate / p->fps; e->buf = p->buf_frames * e->p.rate / p->fps; e->fill = 0; e->qp = p->qp_min; e->mu = p->mu_min; e->pend_dt = -1; e->dtf = 1; e->since_spill = 1 << 20;
     e->w2.cap = 0; e->s3cap = 1 << 20; e->s3 = xmalloc(e->s3cap); e->ocap = 1 << 21; e->obuf = xmalloc(e->ocap);
@@ -923,7 +1324,7 @@ void rnv2enc_destroy(rnv2enc *e) {
     for (i = 0; i < 2; i++) for (c = 0; c < 3; c++) free(e->R[i][c]);
     for (c = 0; c < 3; c++) for (i = 0; i < 3; i++) free(e->HP[c][i]);
     for (i = 0; i < 52; i++) { free(e->qt[i][0]); free(e->qt[i][1]); }
-    free(e->G); free(e->rec); free(e->bs); free(e->bs2); free(e->bd); free(e->w0.buf); free(e->w1.buf); free(e->w2.buf); free(e->s3); free(e->obuf);
+    free(e->L); free(e->G); free(e->rec); free(e->bs); free(e->dc); free(e->dcp); free(e->bs2); free(e->bd); free(e->w0.buf); free(e->w1.buf); free(e->w2.buf); free(e->s3); free(e->obuf);
     free(e);
 }
 
@@ -963,7 +1364,7 @@ int rnv2enc_encode(rnv2enc *e, const uint8_t *pix, int stride, enum rnv2_fmt fmt
                    const uint8_t **out, size_t *outlen, rnv2enc_info *info) {
     double t0 = now_ms(), t1, t2, t3, ta = 0, td = 0, t5, t6, cap, soft, mu, cyc = 0; size_t n = 0; int qp, tries = 0, aqp = -1, b, i, nana = 0, rtok = 0, ad, Lprev, acls = -1, want0;
     int Lprev0 = e->lvl; double alw = 0, hard0 = 0; int hint = -1, evs = 0, keytry0 = 0;
-    int nconv = 0, nchanged = 0; int bm = 0, spill = 0, trims = 0; double C = 0, cb = e->p.cyc_budget, n_pre = 0, alim = 1e18;
+    int bm = 0, spill = 0, trims = 0, resoft = 0, nact1 = 0; double C = 0, cb = e->p.cyc_budget, n_pre = 0, alim = 1e18;
     e->bs2_cls = -1;
     if (info) memset(info, 0, sizeof *info);
     { double c = atomic_exchange(&e->pend_cap, 0.0); if (c > 0 && c != e->p.rate) set_cap(e, c); }
@@ -992,17 +1393,14 @@ int rnv2enc_encode(rnv2enc *e, const uint8_t *pix, int stride, enum rnv2_fmt fmt
     e->key = (uint8_t)e->first;
 #endif
     { int nd = NB; if (ndmg >= 0 && !e->first) { nd = 0; for (b = 0; b < NB; b++) nd += e->damaged[b]; } run_w(e, job_csc, BH, nd, 128); }
-    if (e->p.dither) { dither_pass(e); run_jobs(e, job_csc2, BH); }
-    if (e->p.converge && e->p.csc_fit) { /* the fit is per block and lives with the block's target.  A small update (a selector, a clock) is fitted before coding, so it never shows a different texture than its neighbours; a large one (a pan) is fitted when it stops */
-        int nc = 0; for (b = 0; b < NB; b++) if (e->cscneed[b]) { e->fitted[b] = 0; nc++; }
-        if (nc <= 300 && !e->first) for (b = 0; b < NB; b++) if (e->cscneed[b]) fit_block(e, b);
-    }
+    if (e->p.dither || e->p.smooth) { smooth_classify(e); run_w(e, job_smooth, BH, NB, 256); }
+    if (e->p.tone_pal > 0) { tone_palette(e); run_w(e, job_tonepal, BH, NB, 256); }
     e->first = 0; e->tvalid = 1;
     /* blocks that need any work this frame; the decision of the others is SKIP for the whole frame */
     e->nprev_act = e->nact; e->nact = 0;
     for (b = 0; b < NB; b++) {
         if (!e->forced[b]) e->act[e->nact++] = (uint16_t)b;
-        else { blkdec *d = &e->bd[b]; d->mode = SKIP; d->cbp = 0; d->cbits = 0; d->cyc = e->prevmode[b] != SKIP ? CY_SKIPCOPY : CY_SKIP; }
+        else { blkdec *d = &e->bd[b]; d->mode = SKIP; d->cbp = 0; d->cbits = 0; d->ebits = 0; d->cyc = e->prevmode[b] != SKIP ? CY_SKIPCOPY : CY_SKIP; }
     }
     t1 = now_ms();
     if (e->key) { /* the reference is black: nothing to search */
@@ -1018,186 +1416,154 @@ int rnv2enc_encode(rnv2enc *e, const uint8_t *pix, int stride, enum rnv2_fmt fmt
     t3 = now_ms();
     e->n_forced = NB - e->nact; e->n_search = 0;
     for (b = 0; b < NB; b++) e->n_search += !e->medone[b];
-    /* rnv2.py Encoder2.encode rate / cycle control */
-    cap = e->buf + e->rate_pf - e->fill;
-    soft = e->rate_pf + (e->buf - e->fill > 0 ? e->buf - e->fill : 0) * 0.35;
-    hard0 = cap;
-    if (e->p.max_frame > 0 && !e->key) { double rp = e->rate_pf * e->dtf, mf = e->p.max_frame * rp; if (cap > mf) cap = mf; soft = rp + (e->p.lag_target * e->buf - e->fill) * 0.35; if (soft > mf) soft = mf; if (soft < 0.6 * rp) soft = 0.6 * rp; }
-    bm = e->p.sf_budget > 0 && !e->key; C = e->p.sf_budget; /* superframe budget: every frame is cut to the ceiling unless it spills deliberately, and then it fills what it takes */
-    if (bm) { if (cap > C) cap = C; if (soft > C) soft = C; alim = C; }
-    qp = e->qp0; mu = e->mu0; /* = max(qp_min, qp - 2), max(mu_min, 0.6 mu) as rnv2.py (rt_rc: see rnv2enc.h) */
-#define CANSPILL() (e->p.spill_sf > 1 && e->since_spill >= e->p.spill_gap && hard0 >= e->p.spill_sf * C)
-#define GOSPILL() do { spill = 1; cap = soft = e->p.spill_sf * C; cb = e->p.cyc_budget * e->p.spill_cyc; hint = -1; alim = cap; } while (0)
-    ad = e->nlev > 2 && e->p.pin_level < 0; /* headroom-driven level selection active */
-    if (e->p.qp_pred && ad) { /* the first qp comes from the size of the last comparable frame: an analysis pass that is sure to overrun the hard cap is the costliest retry */
-        double est = e->key ? e->pkey : e->pbpa * e->nact; int pq = e->key ? e->pkq : e->pq;
-        if (est > 0) {
-            double eq = est * pow(2.0, -(qp - pq) / 7.5);
-            if (eq > 1.15 * cap) { qp += (int)ceil(7.5 * log2(eq / cap)); if (qp > e->p.qp_max) qp = e->p.qp_max; } /* clearly over: anything near the cap is left to the normal path */
-        }
-    }
-    if (e->p.burst_probe && ad && !e->key && e->nact >= 1500 && e->nact > 2 * e->nprev_act + 256) { /* sudden burst, no usable history: a row sample at the coarse point sets the first qp, cheaper than one wrong analysis pass */
-        int by, nb = 0, Ls = e->nlev - 1, qs = qp > 18 ? qp : 18; double bytes = 0; /* probe at a mid qp: near qp 0 RAW saturates the size and the slope says nothing */
-        if (e->bmu > mu) mu = e->bmu; /* a burst is cycle-limited like the last one: start there, not 8 doublings below (--murelax comes back down if it is too strict) */
-        set_level(e, Ls); set_qp(e, qs); e->cmu = mu;
-        for (by = 3; by < BH; by += 8) { int bx; for (bx = 0; bx < BW; bx++) { int bk = by * BW + bx; const blkdec *d = &e->bd[bk]; analyse_block(e, bk); decide_block(e, bk); nb++; bytes += d->mode == SKIP ? 0 : d->mode == RAW ? 128 : (d->cbits + 12 + (d->mode == INTRA ? 15 : 0)) / 8.0; } }
-        bytes = bytes * NB / nb + 24;
-        { int qt = qs + (int)ceil(BURST_QP_OCT * log2(bytes / (0.9 * cap))); if (qt > qp) qp = qt > e->p.qp_max ? e->p.qp_max : qt; }
-        e->lvl = Lprev0;
-    }
-    if (bm && qp >= e->p.spill_qp && CANSPILL()) { GOSPILL(); qp -= (int)(BURST_QP_OCT * log2(e->p.spill_sf)); if (qp < e->qp0) qp = e->qp0; } /* qp_pred or the probe say one superframe cannot hold this frame at a usable quality */
-    Lprev = e->lvl; want0 = ad && Lprev == 0 && (!e->key || e->kl0 != 2); if (e->l0cool > 0) e->l0cool--; /* a key that did not fit near-exact last time: no wasted analysis pass */
-    keytry0 = e->key && want0;
-    alw = e->rate_pf * e->dtf + (e->p.fill_target * e->buf - e->fill) * 0.35; /* per-frame allowance for choosing the level: keeps (1-fill_target) of the bucket free for bursts */
-    if (alw < 0.25 * e->rate_pf * e->dtf) alw = 0.25 * e->rate_pf * e->dtf;
-    if (spill) alw = 2 * cap;
-/* the previous analysis stays in bs2: going back to the class analysed just before (failed level-0 probe) needs no new pass */
-#define ANALYSE(LV) do { double t_ = now_ms(); int cl_ = (LV) ? 1 : 0; blkstat *sw_ = e->bs; e->lvl = (LV); set_level(e, e->lvl); set_qp(e, qp); e->bs = e->bs2; e->bs2 = sw_; { int c2_ = e->bs2_cls, q2_ = e->bs2_qp; e->bs2_cls = acls; e->bs2_qp = aqp; if (!(c2_ == cl_ && q2_ == qp)) { run_w(e, job_analyse, BH, e->nact, 64); nana++; } } aqp = qp; acls = cl_; ta += now_ms() - t_; } while (0)
-#define DECIDE() run_w(e, job_decide, (e->nact + DSLICE - 1) / DSLICE, e->nact, 256)
-#define EVAL(LV) do { e->lvl = (LV); set_lam(e, e->lvl); DECIDE(); frame_size(e, &n, &cyc); evs++; } while (0)
-#define FITS(LV) ((double)n <= alw * ((LV) < Lprev ? e->p.hyst : 1.0) && (double)n <= alim) /* bytes only: a decode-cycle overrun is fixed by the mu loop below */
-    for (;;) {
-        double tt = now_ms();
-        if (!ad) {
-            if (qp != aqp) { ANALYSE(e->lvl); tt = now_ms(); }
-            e->cmu = mu;
-            DECIDE();
-            frame_size(e, &n, &cyc);
-        } else {
-            int lo = spill ? 1 : Lprev > 1 ? (e->since >= e->p.dwell || (e->p.fast_refine && e->lastn < 0.5 * alw) ? (e->p.fast_refine && e->lastn < 0.25 * alw && Lprev > 2 ? Lprev - 2 : Lprev - 1) : Lprev) : 1, hi = e->nlev - 1, a, bb, done = 0;
-            e->cmu = mu;
-            if (e->p.max_frame > 0 && tries > 0 && qp == aqp && acls == 1 && hint >= 0 && cyc > cb) { EVAL(hint); done = 1; want0 = 0; } /* cycle retry: mu moved, the level from the last try stands */
-            if (want0) { /* previous frame was near-exact: try to stay there */
-                if (qp != aqp || acls != 0) { ANALYSE(0); tt = now_ms(); }
-                EVAL(0);
-                if (FITS(0)) done = 1; else { want0 = 0; e->l0cool = 30; }
-            }
-            if (!done) {
-                int last = -1;
-                if (qp != aqp || acls != 1) { ANALYSE(1); tt = now_ms(); }
-                /* smallest level whose frame fits the allowance (monotone in lambda); none fits -> coarsest = classic point.
-                   Search outward from the likely answer (this frame's previous try, else the lowest allowed level, else coarsest
-                   for a burst) instead of bisecting: a retry or a steady frame usually needs 1-2 passes, not 4. */
-                a = lo; bb = hi;
-                if (a < bb) {
-                    int m = hint >= 0 ? hint : (e->key || e->nact > 2 * e->nprev_act + 256) ? hi : lo, st = 1;
-                    if (m < lo) m = lo;
-                    if (m > hi) m = hi;
-                    EVAL(m); last = m;
-                    if (FITS(m)) { bb = m; while (a < bb) { int q = bb - st; if (q < a) q = a; EVAL(q); last = q; if (FITS(q)) { bb = q; st *= 2; } else { a = q + 1; break; } } }
-                    else { a = m < bb ? m + 1 : bb; while (a < bb) { int q = a + st - 1; if (q >= bb) break; EVAL(q); last = q; if (FITS(q)) { bb = q; break; } a = q + 1; st *= 2; } }
-                    while (a < bb) { int q = (a + bb) / 2; EVAL(q); last = q; if (FITS(q)) bb = q; else a = q + 1; }
-                }
-                if (last != a) EVAL(a);
-                hint = a;
-                if (a == 1 && Lprev <= 1 && e->l0cool == 0 && (Lprev == 0 || e->since >= e->p.dwell) && (double)n <= 0.4 * alw) { /* lots of room at the finest lambda: try the near-exact point */
-                    ANALYSE(0); tt = now_ms(); EVAL(0);
-                    if (!FITS(0)) { e->l0cool = 30; ANALYSE(1); tt = now_ms(); EVAL(1); }
+    /* Rate control.  Every frame fits one superframe, keys included: no spills, no 300 KB frames.  Lambda is searched so the frame fills what the link has; the block decisions do the rest.
+     * A cold burst falls back to soft blocks and sharpens over the next frames as lambda comes down.  The cycle cap is a second multiplier (mu). */
+    {
+        double T, rp = e->rate_pf, lam; int it; const double LMIN = e->p.rc_lmin > 0 ? e->p.rc_lmin : 0.001, LMAX = 20000;
+        cb = e->p.cyc_budget;
+        C = e->p.sf_budget > 0 ? e->p.sf_budget - 64 : 1e12;
+        T = rp + (e->p.lag_target * e->buf - e->fill) * 0.35; if (T < 0.7 * rp) T = 0.7 * rp; if (T > C) T = C;
+        e->burst = e->nact > 2 * e->nprev_act + 512; lam = e->lamp; if (e->burst && e->lamb > lam) lam = e->lamb; /* a sudden burst is like the last one, not like the quiet frame before it */
+        e->lamp = lam; /* the analysis prunes against this */
+        /* qp of the residual candidates follows lambda (RD slope of a uniform quantiser), one analysis per frame */
+        { double st_ = sqrt(lam / (e->p.lam_k > 0 ? e->p.lam_k : 0.04)); qp = 0; while (qp < e->p.qp_max && QSTEP2[qp] < st_) qp++; if (qp < e->qp - e->p.qp_drop) qp = e->qp - e->p.qp_drop; if (qp < e->p.qp_min) qp = e->p.qp_min; }
+        e->lvl = e->nlev - 1; set_level(e, e->lvl); set_qp(e, qp);
+        e->lat_ok = 0;
+        if (e->p.r3) { int any = e->key; for (b = 0; b < NB && !any; b++) any = e->changed[b]; if (any || !e->lat_valid) { run_w(e, job_lat_filter, 3, e->nact, 256); run_w(e, job_lat_quant, 4, e->nact, 256); e->lat_valid = 1; } e->lat_ok = 1; }
+        { /* the block analysis has two steps: the sample decides this frame's lambda, and the expensive candidates of all other blocks are gated against it */
+            double t_ = now_ms(), rat_ = e->szrat > 0 ? e->szrat : 1.05;
+            run_w(e, job_analyse, BH, e->nact, 64); nana++;
+            int n1 = 0;
+            resoft = 0; e->nsact = 0;
+            for (i = 0; i < e->nact; i++) { int b_ = e->act[i]; if (e->dc[b_].valid == 1) { n1++; e->smp[b_] = e->nact < ANA_ALL || ((b_ % BW) + 2 * (b_ / BW)) % ANA_STEP == 0; if (e->smp[b_]) e->sact[e->nsact++] = (uint16_t)b_; } }
+            run_w(e, job_soft0, BH, e->nsact, 64);
+            e->lam_est = lam; e->nu_est = e->mup;
+            if (e->nsact > 0) {
+                lam_presearch(e, lam, e->mup, (T - 24) * 8, cb, rat_, LMIN, LMAX, n1); lam = e->lam_est;
+                if (e->key || e->burst) { /* a cold start: qp above came from a lambda that has nothing to do with this frame, and residual candidates at the wrong qp cost quality on just the frame that needs it */
+                    int q_; double st_ = sqrt(lam / (e->p.lam_k > 0 ? e->p.lam_k : 0.04)); q_ = 0; while (q_ < e->p.qp_max && QSTEP2[q_] < st_) q_++; if (q_ < e->p.qp_min) q_ = e->p.qp_min; if (e->key && q_ > KEY_QPMAX) q_ = KEY_QPMAX;
+                    if (q_ > qp + 2 || q_ < qp - 2) {
+                        qp = q_; set_qp(e, qp); run_w(e, job_analyse, BH, e->nact, 64); nana++; run_w(e, job_soft0, BH, e->nsact, 64);
+                        lam_presearch(e, lam, e->nu_est, (T - 24) * 8, cb, rat_, LMIN, LMAX, n1); lam = e->lam_est;
+                    }
                 }
             }
+            e->lam_gate = GATE_LAM * lam; e->nu_gate = GATE_LAM * e->nu_est;
+            if (n1 > e->nsact) run_w(e, job_soft1, BH, n1 - e->nsact, 64);
+            nact1 = n1;
+            ta += now_ms() - t_;
         }
-        td += now_ms() - tt;
-        tries++;
-        if (bm && !spill && (double)n > e->p.trim_ratio * C && (qp > 10 ? qp : 10) + BURST_QP_OCT * log2(n / C) >= e->p.spill_qp && CANSPILL()) { GOSPILL(); alw = 2 * cap; if (tries < e->p.max_tries) continue; }
-        /* rt_rc: after rt_rc analysis passes accept anything within the hard bucket cap (no more qp re-analysis) */
-        rtok = e->p.rt_rc && nana >= e->p.rt_rc && (double)n <= (bm ? e->p.trim_ratio * cap : e->p.max_frame > 0 && !e->key ? 1.25 * cap : cap);
-        if (e->p.max_frame > 0 && nana >= (bm ? 3 : 2) && (double)n <= hard0) rtok = 1; /* encode-time bound: the second analysis pass stands if the bucket can take it */
-        if (((n <= soft || rtok) && cyc <= cb) || (qp >= e->p.qp_max && mu >= e->p.mu_max) || tries >= e->p.max_tries) break;
-        if (cyc > cb && mu < e->p.mu_max) { double r = pow(cyc / cb, 3); mu = mu * (r > 2 ? r : 2); if (mu > e->p.mu_max) mu = e->p.mu_max; }
-        if (bm && (double)n > cap && !rtok) { int q = (qp > 10 ? qp : 10) + (int)ceil(BURST_QP_OCT * log2(n / cap)); qp = q > e->p.qp_max ? e->p.qp_max : q; } /* near qp 0 RAW saturates the size, so the slope only holds from about qp 10 */
-        else if ((double)n > soft && !rtok && !bm) { int dq = (int)ceil(6 * log2(n / soft) * 0.8); qp += dq > 1 ? dq : 1; if (qp > e->p.qp_max) qp = e->p.qp_max; }
-        else if (cyc > cb && mu >= e->p.mu_max) { qp += 2; if (qp > e->p.qp_max) qp = e->p.qp_max; }
-    }
-    if (e->p.mu_relax && cyc < 0.8 * cb && mu > 4 * e->p.mu_min && e->nact >= 1000) { /* the mu of the last frames was too strict for this one: blocks are being skipped for cycles it has spare */
-        double tt = now_ms(), m0 = mu; int it;
-        for (it = 0; it < 2; it++) {
-            double mt = mu * (it ? 0.5 : 0.25); size_t n1; double c1;
-            if (mt < e->p.mu_min) mt = e->p.mu_min;
-            e->cmu = mt; DECIDE(); frame_size(e, &n1, &c1); evs++;
-            if (c1 <= 0.97 * cb && (double)n1 <= (rtok ? cap : soft)) { n = n1; cyc = c1; mu = mt; break; }
-        }
-        if (mu == m0 && it == 2) { e->cmu = mu; DECIDE(); frame_size(e, &n, &cyc); evs++; }
-        td += now_ms() - tt;
-    }
-    n_pre = (double)n;
-    if (bm) { /* last step, cheap: a frame just over its whole number of superframes is cut by a higher lambda, mode decision only (the analysis stands).  A spill that came out small returns to one superframe rather than waste the tail */
-        double T = spill && (double)n >= 1.25 * C ? cap : C, base = e->lam, x = 1; int it;
-        for (it = 0; it < 4 && (double)n > T && x < e->p.trim_max; it++) { double f = pow(n / T, 1.6); x *= f > 1.25 ? f : 1.25; if (x > e->p.trim_max) x = e->p.trim_max; e->lam = base * x; DECIDE(); frame_size(e, &n, &cyc); evs++; trims++; }
-        if ((double)n > T && trims) { e->lam = base; DECIDE(); frame_size(e, &n, &cyc); evs++; } /* cannot be cut without wrecking it: it spills anyway, at its own quality */
-    }
-    if (e->p.sf_budget > 0 && cyc > cb) { /* the cycle cap is hard in this mode: a higher lambda can turn RAW blocks into coded ones and raise the cycles, and the loop above can run out of tries.  The decode time of one frame is what starves the audio on the unit, so it wins over the byte ceiling.  mu alone pushes blocks to RAW and so over the ceiling: lambda moves with it when the frame is near the ceiling */
-        double T = bm ? (spill && n_pre >= 1.25 * C ? cap : C) : 1e18, lx = 1; int it;
-        for (it = 0; it < 16 && (cyc > cb || ((double)n > T && (double)n <= e->p.trim_ratio * T && lx < e->p.trim_max)); it++) {
-            if (cyc > cb) { double r = pow(cyc / cb, 3); mu *= r > 2 ? r : 2; if (mu > 64) { mu = 64; e->lam *= 1.5; } }
-            if ((double)n > T && (double)n <= e->p.trim_ratio * T && lx < e->p.trim_max) { lx *= 1.25; e->lam *= 1.25; }
-            e->cmu = mu; DECIDE(); frame_size(e, &n, &cyc); evs++; trims++;
-        }
-        if (cyc > cb) fprintf(stderr, "rnv2enc: frame %d over the cycle cap (%.0f > %.0f)\n", e->fn, cyc, cb);
-    }
-    if (e->nact >= 1500 && mu > 8 * e->p.mu_min) e->bmu = mu;
-    e->alvl = e->lvl; if (ad) e->since = e->lvl != Lprev ? 0 : e->since + 1;
-    if (e->key) {
-        if (e->lvl == e->nlev - 1) { e->pkey = (double)n; e->pkq = qp; } else e->pkey = 0;
-        if (keytry0) e->kl0 = e->lvl == 0 ? 1 : 2; else if (e->lvl <= 1) e->kl0 = 0; /* finest lambda fitted: worth a near-exact try next time */
-    }
-    else if (e->nact >= 128) { if (e->lvl == e->nlev - 1) { e->pbpa = (double)n / e->nact; e->pq = qp; } else e->pbpa = 0; }
-    e->mu = mu;
-    if ((double)n > hard0 && !bm) fprintf(stderr, "rnv2enc: frame %d exceeds the bucket hard cap (%zu > %.0f)\n", e->fn, n, hard0);
-    e->fill = e->fill + n - e->rate_pf; if (e->fill < 0) e->fill = 0;
-    if (bm) {
-        if ((double)n > C) { e->since_spill = 0; if (!e->p.spill_carry) { e->fill -= (double)n - C; if (e->fill < 0) e->fill = 0; } } else e->since_spill++;
-    }
-    e->lastn = (double)n;
-    e->qp_raised = qp > e->qp0;
-    e->qp = qp;
-    if (bm && trims && n_pre > soft) { /* cut by lambda: the next frame starts at a qp where it should not need that */
-        int dq = (int)ceil(6 * log2(n_pre / soft) * 0.8);
-        e->qp = qp + (dq > 1 ? dq : 1); if (e->qp > e->p.qp_max) e->qp = e->p.qp_max;
-        e->qp_raised = 1;
-    }
-    else if (rtok && (double)n > soft) { /* rt_rc accepted an oversize frame: raise qp for the next frame instead */
-        int dq = (int)ceil(6 * log2(n / soft) * 0.8);
-        e->qp = qp + (dq > 1 ? dq : 1); if (e->qp > e->p.qp_max) e->qp = e->p.qp_max;
-        e->qp_raised = 1;
-    }
-    { int nc = 0; for (b = 0; b < NB; b++) nc += e->changed[b]; nchanged = nc; }
-    if (e->p.converge && !e->key && e->p.sf_budget > 0) { /* spend what the link and the decoder have left on blocks not yet equal to the target, worst first.  RAW writes the target itself: the error of that block is 0 from here on.  Comes after the rate state: this frame's decisions and the next frame's qp do not see it, only the bucket does */
-        double L, Cc = e->p.sf_budget; int pass;
-        if (e->p.csc_fit && nchanged == 0) { int nf = 0, mx = 400; for (b = 0; b < NB && nf < mx; b++) if (!e->fitted[b] && !e->changed[b] && e->bd[b].mode == SKIP) { fit_block(e, b); block_exact(e, b); nf++; } }
-        if (e->dtf >= 1.5) { int k = (int)(e->dtf * 0.8); if (k < 1) k = 1; if (k > e->p.conv_sf) k = e->p.conv_sf; L = k * Cc; } /* the source has slowed: the next frame is ticks away */
-        else { L = (double)n > 0.5 * Cc ? 0 : alw < Cc ? alw : Cc; }                                                                                         /* frames every tick: only a light frame (a selector move, not a pan) gives room, and only what this superframe has anyway */
-        if (L > hard0) L = hard0;
-        if ((double)n < L) {
-            double room = L - (double)n, croom = cb - cyc; int nmax = (int)(room / 131);
-            for (pass = 0; pass < 2 && nmax > 0 && croom > 0; pass++) for (b = 0; b < NB && nmax > 0 && croom > 0; b++) {
-                blkdec *d = &e->bd[b]; double dc;
-                if (d->mode != SKIP || e->changed[b] || e->exact[b]) continue;
-                if (pass == 0 && e->berr[b] < 128) continue;   /* first the blocks with an error of 1 level RMS or more */
-                dc = CY_HDR + CY_RAW - d->cyc; if (dc > croom) { croom = 0; break; }
-                d->mode = RAW; d->cbp = 0; d->cbits = 0; d->cyc = CY_HDR + CY_RAW; croom -= dc; nmax--; nconv++;
-            }
-            if (nconv) { double f0 = (double)n; frame_size(e, &n, &cyc); e->fill += (double)n - f0; if ((double)n > Cc) spill = 1; }
-        }
+        { double tt = now_ms(), rat = e->szrat > 0 ? e->szrat : 1.05, Tb = (T - 24) * 8, fb = 0, fc = 0, nu = e->nu_est; int round_, relaxed = 0;
+          /* J = D + lambda R + nu C.  lambda holds the bytes, nu the decode cycles; they are solved in turn */
+#define FEVAL(L) do { e->lam = (L); e->cmu = nu / e->lam; DECIDE(); fast_size(e, &fb, &fc); evs++; } while (0)
+          research:
+          FEVAL(lam);
+          relaxed = 0;
+          for (round_ = 0; round_ < 2 + (e->p.nu_relax > 0 ? e->p.nu_relax_n : 0); round_++) {
+              { /* lambda for the bytes.  Secant on log size vs log lambda inside a bracket: size has cliffs (many similar blocks turn RAW at once), so a plain secant can stop far under the target */
+                  double l0 = lam, b0 = fb * rat, slope = e->rslope, lo = 0, hi = 0; int its;
+                  for (its = 0; its < 6 && evs < 10 + 3 * round_; its++) {
+                      double err = b0 / Tb, next;
+                      if (err <= 1) { hi = l0; if (err >= e->p.rc_tol || lam <= LMIN) break; } else lo = l0;
+                      if (lo > 0 && hi > 0 && hi / lo < 1.04) break;
+                      next = l0 * pow(err * (err > 1 ? 1.02 : 1.01), -1 / slope);
+                      if (next < LMIN) next = LMIN; if (next > LMAX) next = LMAX; if (next > l0 * 64) next = l0 * 64; if (next < l0 / 64) next = l0 / 64;
+                      if (lo > 0 && hi > 0 && (next <= lo || next >= hi || its >= 3)) next = sqrt(lo * hi);
+                      else if (lo > 0 && next <= lo) next = lo * 1.15;
+                      else if (hi > 0 && next >= hi) next = hi / 1.15;
+                      if (next == l0) break;
+                      FEVAL(next);
+                      { double b1 = fb * rat; if (b1 > 0 && b0 > 0 && next != l0) { double sl = log(b1 / b0) / log(next / l0); if (sl < -0.1 && sl > -8) { slope = sl; e->rslope = sl; } } l0 = next; b0 = b1; lam = next; }
+                  }
+                  if (b0 > Tb && hi > 0) { lam = hi; FEVAL(lam); }
+                  for (its = 0; its < 8 && fb * rat > Tb && lam < LMAX; its++) { lam *= 1.2; FEVAL(lam); }
+              }
+              if (fc <= cb) {
+                  /* cycles left over: the carried nu is too high for this frame, so a smooth block is still priced into a fill.  Lower it and solve lambda again */
+                  if (e->p.nu_relax > 0 && nu > 0 && relaxed < e->p.nu_relax_n && fc < e->p.nu_relax_thr * cb) { nu *= e->p.nu_relax; relaxed++; FEVAL(lam); continue; }
+                  break;
+              }
+              { /* nu for the cycles: only as far as this frame needs, the controller below carries it to the next frame */
+                  int its;
+                  if (nu <= 0) nu = lam * 0.002;
+                  for (its = 0; its < 5 && fc > cb; its++) { double r = fc / cb; r = r * r; nu *= r > 1.2 ? r : 1.2; FEVAL(lam); }
+              }
+          }
+          if (!resoft && !e->key && !e->burst && e->nsact < nact1 && (lam > GATE_REDO * e->lam_est || lam < e->lam_est / GATE_REDO)) { /* the sample was wrong by a lot, and the gates with it */
+              double t_ = now_ms(); resoft = 1; e->lam_gate = GATE_LAM * lam; e->nu_gate = GATE_LAM * nu; e->lam_est = lam;
+              run_w(e, job_soft1, BH, nact1 - e->nsact, 64); ta += now_ms() - t_;
+              goto research;
+          }
+          frame_size(e, &n, &cyc);
+          if (fb > 1000) { double nr = ((double)n - 24) * 8 / fb; if (nr > 0.5 && nr < 3) e->szrat = 0.6 * rat + 0.4 * nr; }
+          /* exact correction, up or down.  Down is only taken if it still fits */
+          if ((double)n < 0.75 * T && lam > LMIN && cyc < 0.97 * cb) {
+              double keep = lam, f = pow((double)n / (0.9 * T), 1.6); if (f < 1 / 16.0) f = 1 / 16.0;
+              lam *= f; if (lam < LMIN) lam = LMIN; FEVAL(lam); frame_size(e, &n, &cyc);
+              if ((double)n > T || cyc > cb) { lam = keep; FEVAL(lam); frame_size(e, &n, &cyc); }
+          }
+          for (it = 0; it < 6 && (double)n > T; it++) { double f = (double)n / T; lam *= pow(f, 1.5) * 1.03; FEVAL(lam); frame_size(e, &n, &cyc); }
+          for (it = 0; it < 12 && cyc > cb; it++) { nu *= 1.3; FEVAL(lam); frame_size(e, &n, &cyc); }
+          for (it = 0; it < 24 && (cyc > cb || (double)n > C); it++) { nu *= 1.3; lam *= 1.3; FEVAL(lam); frame_size(e, &n, &cyc); }
+          /* Fill.  Frame size has cliffs in lambda: many similar blocks change mode at once, so the search can end well under the target with bytes the picture could use.
+           * Take the decisions at a lower lambda, and move blocks over to them one by one, best distortion gain per bit first, until the frame is full */
+          if (e->p.fill_gap && (double)n < 0.97 * T && lam > LMIN && cyc < cb) {
+              static __thread struct fillc { float g; int b, dr, dc; } *fc_ = NULL; struct fillc *L_; int nf_ = 0, nap = 0, i_; double room, croom = cb - cyc, lo_ = lam * 0.35, nrat = fb > 1000 ? ((double)n - 24) * 8 / fb : rat; size_t n0 = n; double cyc0 = cyc;
+              if (!e->fillc) e->fillc = xmalloc(sizeof(struct fillc) * NB);
+              L_ = e->fillc; (void)fc_;
+              if (lo_ < LMIN) lo_ = LMIN;
+              memcpy(e->bd2, e->bd, sizeof(blkdec) * NB);
+              e->lam = lo_; e->cmu = nu / e->lam; DECIDE(); evs++;
+              memcpy(e->bd3, e->bd, sizeof(blkdec) * NB);
+              memcpy(e->bd, e->bd2, sizeof(blkdec) * NB);
+              for (i_ = 0; i_ < e->nact; i_++) {
+                  int b_ = e->act[i_]; const blkdec *A = &e->bd2[b_], *Z = &e->bd3[b_]; double dD; int dR;
+                  if (A->mode == Z->mode && A->cbp == Z->cbp) continue;
+                  dD = (double)(A->dist - Z->dist) / e->dc[b_].ipw; dR = Z->ebits - A->ebits;
+                  if (dD <= 0) continue;
+                  L_[nf_].g = (float)(dD / (dR > 8 ? dR : 8)); L_[nf_].b = b_; L_[nf_].dr = dR; L_[nf_].dc = Z->cyc - A->cyc; nf_++;
+              }
+              qsort(L_, (size_t)nf_, sizeof(struct fillc), fill_cmp);
+              room = (0.985 * T - (double)n) * 8 / (nrat > 0.5 ? nrat : 1.0);
+              for (i_ = 0; i_ < nf_ && room > 0; i_++) {
+                  if (L_[i_].dr > room || L_[i_].dc > croom) continue;
+                  e->bd[L_[i_].b] = e->bd3[L_[i_].b]; room -= L_[i_].dr; croom -= L_[i_].dc; L_[nap++] = L_[i_];
+              }
+              frame_size(e, &n, &cyc);
+              /* the walker has the last word: neighbours sharing lattice points change the true size a little */
+              for (it = 0; it < 6 && ((double)n > T || cyc > cb) && nap > 0; it++) { int un = nap / 8 + 1; while (un-- > 0 && nap > 0) { nap--; e->bd[L_[nap].b] = e->bd2[L_[nap].b]; } frame_size(e, &n, &cyc); }
+              if ((double)n > T || cyc > cb) { memcpy(e->bd, e->bd2, sizeof(blkdec) * NB); n = n0; cyc = cyc0; }
+              e->cmu = nu / lam; e->lam = lam;
+          }
+          if (cyc > cb) fprintf(stderr, "rnv3enc: frame %d over the cycle cap (%.0f > %.0f)\n", e->fn, cyc, cb);
+          if ((double)n > C) fprintf(stderr, "rnv3enc: frame %d over the superframe (%zu)\n", e->fn, n);
+          { double r = cyc / (0.97 * cb); r = r * r; nu *= r < 0.7 ? 0.7 : r > 1.3 ? 1.3 : r; if (nu < lam * 1e-4) nu = 0; }
+          if (getenv("RCDBG")) fprintf(stderr, "F %d T %.0f n %zu fbr %.0f rat %.3f szrat %.3f lam %.3f est %.3f nu %.4f est %.4f cyc %.0f ev %d qp %d nact %d ns %d\n", e->fn, T, n, fb * rat / 8, rat, e->szrat, lam, e->lam_est, nu, e->nu_est, cyc, evs, qp, e->nact, e->nsact);
+          e->mup = nu; e->lamp = lam; mu = e->cmu; if (e->nact >= 3000 && (double)n > 0.7 * T) e->lamb = lam; /* an active frame that did not fill says nothing about the next burst */
+          td += now_ms() - tt; }
+        tries = evs;
+        e->fill = e->fill + (double)n - rp; if (e->fill < 0) e->fill = 0; if (e->fill > e->buf) e->fill = e->buf;
+        e->lastn = (double)n; e->qp = qp; e->alvl = e->lvl;
     }
     t5 = now_ms();
     run_w(e, job_commit, BH, e->ncoded, 64);
     run_w(e, job_scatter, BH, e->ncoded, 256);
-    if (e->p.converge) { for (b = 0; b < NB; b++) if (!e->forced[b] || e->bd[b].mode != SKIP) block_exact(e, b); }
     e->wqp = qp;
     run_w(e, job_post, 1 + 3 * BH, e->ncoded, 128); /* serial bitstream write overlapped with the half-pel planes of the new reference */
     t6 = now_ms();
     for (b = 0; b < NB; b++) {
         int m = e->bd[b].mode;
         e->prevmode[b] = (uint8_t)m;
-        if (m == SKIP && !e->forced[b]) { e->skq[b] = (uint8_t)qp; e->skmu[b] = mu; e->skl[b] = (uint8_t)(trims ? e->nlev : e->alvl); } /* a SKIP forced by the trim is judged again next frame */
+        /* clean: the reference equals the target at the panel, so only a source change wakes this block */
+        if (m == SKIP) e->clean[b] = e->forced[b] ? e->clean[b] : (uint8_t)(e->dc[b].valid == 2);
         if (m == SKIP) e->prev_mv[b][0] = e->prev_mv[b][1] = 0; else { e->prev_mv[b][0] = e->mv0[b][0]; e->prev_mv[b][1] = e->mv0[b][1]; }
         if (info) info->modes[m]++;
     }
     *out = e->obuf; *outlen = 24 + e->w0.n + e->w1.n + e->w2.n + e->s3n;
     if (*outlen != n) fprintf(stderr, "rnv2enc: internal size mismatch %zu vs %zu\n", *outlen, n);
     if (info) {
-        info->bytes = (int)*outlen; info->qp = qp; info->level = e->alvl; info->link_cap = e->p.rate; info->lamk = e->lamk; info->tries = tries; info->cycles = cyc; info->mu = mu; info->fill = e->fill;
-        info->n_skip_forced = e->n_forced; info->n_searched = e->n_search; info->trims = trims; info->nchanged = nchanged; info->nraw_conv = nconv; if (e->p.converge) { int ne = 0; for (b = 0; b < NB; b++) ne += e->exact[b]; info->nexact = ne; } info->spill = !e->p.sf_budget || (double)n <= C ? 0 : (spill || e->key) ? 1 : 2;
+        info->bytes = (int)*outlen; info->qp = qp; info->level = e->alvl; info->link_cap = e->p.rate; info->lamk = e->lamp; info->tries = tries; info->cycles = cyc; info->mu = mu; info->fill = e->fill;
+        info->n_skip_forced = e->n_forced; info->n_searched = e->n_search; info->trims = trims; info->spill = !e->p.sf_budget || (double)n <= C ? 0 : (spill || e->key) ? 1 : 2;
         info->sizes[0] = (int)e->w0.n; info->sizes[1] = (int)e->w1.n; info->sizes[2] = (int)e->w2.n; info->sizes[3] = (int)e->s3n;
         info->gmv_n = e->ng; for (i = 0; i < e->ng; i++) { info->gmv[i][0] = e->g[i][0]; info->gmv[i][1] = e->g[i][1]; }
         info->t_ms[0] = t1 - t0; info->t_ms[1] = t2 - t1; info->t_ms[2] = t3 - t2; info->t_ms[3] = ta; info->t_ms[4] = td;

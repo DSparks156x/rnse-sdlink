@@ -40,6 +40,8 @@ typedef struct {
     rnv_u32 last_err;  /* last error code */
     rnv_u32 err_blk;   /* block index of the last error */
     rnv_u8 age[RNV_NB];
+    rnv_u8 rowm[RNV_BW + 2];   /* RNV3: mode of the block above, per column */
+    rnv_u8 topY[RNV_BW][5], topC[2][RNV_BW][3], crn[3][3][RNV_BW + 1];
 } rnv_state;
 
 /* tables shared by both variants (Huffman fast tables, clamp, symbol split); call once */

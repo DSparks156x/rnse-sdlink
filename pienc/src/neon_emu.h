@@ -117,6 +117,12 @@ E uint16x8_t vorrq_u16(uint16x8_t a, uint16x8_t b) { LOOP(8) a.v[i] |= b.v[i]; r
 E uint16x8_t vaddq_u16(uint16x8_t a, uint16x8_t b) { LOOP(8) a.v[i] = (uint16_t)(a.v[i] + b.v[i]); return a; }
 E uint16x8_t vshlq_u16(uint16x8_t a, int16x8_t s) { LOOP(8) a.v[i] = (uint16_t)(s.v[i] >= 0 ? (s.v[i] > 15 ? 0 : a.v[i] << s.v[i]) : (s.v[i] < -15 ? 0 : a.v[i] >> -s.v[i])); return a; }
 E int16x8_t vdupq_n_s16_(int16_t x) { int16x8_t r; LOOP(8) r.v[i] = x; return r; }
+E uint8x16_t vdupq_n_u8(uint8_t x) { uint8x16_t r; LOOP(16) r.v[i] = x; return r; }
+E uint8x16_t vqsubq_u8(uint8x16_t a, uint8x16_t b) { LOOP(16) a.v[i] = (uint8_t)(a.v[i] > b.v[i] ? a.v[i] - b.v[i] : 0); return a; }
+E uint16x8_t vmull_high_u8(uint8x16_t a, uint8x16_t b) { uint16x8_t r; LOOP(8) r.v[i] = (uint16_t)(a.v[i + 8] * b.v[i + 8]); return r; }
+E uint32x4_t vpaddlq_u16(uint16x8_t a) { uint32x4_t r; LOOP(4) r.v[i] = (uint32_t)a.v[2 * i] + a.v[2 * i + 1]; return r; }
+E uint32x4_t vmulq_n_u32(uint32x4_t a, uint32_t b) { LOOP(4) a.v[i] *= b; return a; }
+E uint32x4_t vshlq_n_u32(uint32x4_t a, int n) { LOOP(4) a.v[i] <<= n; return a; }
 #undef E
 #undef LOOP
 #endif

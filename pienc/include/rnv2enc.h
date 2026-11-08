@@ -67,6 +67,9 @@ typedef struct {
     int dither;                /* 1: static 2x2 ordered dither of the source in smooth gradient blocks, for the 6-bit panel.  Prototype: default off */
     int dither_range;          /* gradient test: max-min per channel within a block and its 4 neighbours at most this (default 24) */
     /* superframe budget (0 = off, the old rate control bit for bit).  See README.txt "SUPERFRAME BUDGET". */
+    double rc_tol, btc_lmin; int fill_gap; int prune_nact; double prune_r; int force_mode, smooth, src_mean; double pw_max; int btc_gate; double fill_pen; int r3, src_dead, glass_dead, lat_q4, lat_q2a, lat_q2b, lat_q4c, lat_sharp; double rc_gamma, rc_lmin; /* RNV3 */
+    int tone_pal; /* --tonepal T: pixels within T codes of a flat pale colour on screen get that colour's mid-level target; 0 = off */
+    double nu_relax, nu_relax_thr; int nu_relax_n; /* cycle price: nu_relax = factor applied inside a frame while cycles are under nu_relax_thr of the cap, at most nu_relax_n times, 0 = off */
     double sf_budget;          /* bytes of video one superframe carries (avlink --maxvid x 512).  Non-key frames are held to this ceiling, or to a whole number of superframes when they spill deliberately */
     double trim_ratio;         /* a frame up to this x the ceiling is cut by re-running the mode decision at a higher lambda, no qp analysis pass (1.35) */
     double trim_max;           /* largest lambda factor of that cut (3): beyond it the picture suffers more than a lost frame */
@@ -74,20 +77,16 @@ typedef struct {
     int spill_sf;              /* superframes a deliberate spill takes (2) */
     int spill_gap;             /* frames between deliberate spills (30): each one costs a displayed frame */
     double spill_cyc;          /* x cyc_budget a deliberate spill may use (1: the cap holds on every frame, since one long decode starves the audio) */
-    int converge;              /* 1: blocks whose source stopped changing are sent RAW (exact against the YUY2 target) as link and cycles allow, worst first, until the whole frame matches.  0 = off */
-    int csc_fit;               /* with converge, 1: a block whose source stopped changing gets its Y/U/V re-chosen so the modelled panel equals the source's 6 bits per channel (with room from the step edges), then is sent exact */
-    int conv_sf;               /* superframes a frame may take for that when the source has slowed (still screen, 2) */
     int spill_carry;           /* 1: the excess of a spill stays in the bucket as debt; 0: forgiven (the tick it took is paid in lost frames) */
 } rnv2enc_params;
 
 typedef struct {
     int bytes, qp, tries, n_skip_forced, n_searched, level;
     double cycles, mu, fill, link_cap, lamk; /* level: ladder step used (0 = near-exact); link_cap: bucket rate in force */
-    int modes[6];
+    int modes[11];
     int sizes[4];
     int gmv_n, gmv[8][2];      /* global motion candidates found (half-pel units) */
     double t_ms[8];            /* phase timings: csc, gme, me, analyse, decide, commit, write, total */
-    int nchanged, nexact, nraw_conv; /* blocks whose source changed; blocks equal to the target after this frame (converge); blocks sent RAW by converge */
     int spill, trims;          /* sf_budget: 0 fits, 1 deliberate spill or key, 2 missed the ceiling; lambda trim passes */
 } rnv2enc_info;
 
@@ -113,8 +112,6 @@ void rnv2enc_target_yuy2(const rnv2enc *e, uint8_t *dst);
 void rnv2enc_planes(const rnv2enc *e, const uint8_t **rY, const uint8_t **rU, const uint8_t **rV,
                     const uint8_t **tY, const uint8_t **tU, const uint8_t **tV);
 const char *rnv2enc_kernel_name(const rnv2enc *e);
-/* the mode of each of the 6000 blocks (raster) in the last frame: 0 SKIP 1 MC 2 MCR 3 ZRES 4 INTRA 5 RAW */
-void rnv2enc_modes(const rnv2enc *e, uint8_t *out);
 
 #ifdef __cplusplus
 }

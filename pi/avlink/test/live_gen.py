@@ -12,19 +12,22 @@ if sys.argv[1] == 'video':
     size, fps, keysize = int(sys.argv[2]), float(sys.argv[3]), int(sys.argv[4])
     kf = os.open(sys.argv[5], os.O_RDONLY | os.O_NONBLOCK)
     out = sys.stdout.buffer.raw
-    per = 1e6 / fps; nx = now(); no = 0; key = False
+    per = 1e6 / fps; nx = now(); no = 0; key = False; capn = size
     every = float(sys.argv[6]) * 1e6 if len(sys.argv) > 6 else 0; lastk = now()   # periodic key, as rnv2enc --keyint
     while True:
         t = now()
         if t < nx:
             time.sleep((nx - t) / 1e6); t = now()
         try:
-            if b'key' in os.read(kf, 256): key = True
+            ctl = os.read(kf, 4096)
+            if b'key' in ctl: key = True
+            for line in ctl.split(b'\n'):                  # "cap B/s", as rnv2enc --linkctl: a frame never plans on more than its share of the link
+                if line.startswith(b'cap '): cap = float(line[4:]); capn = max(64, int(cap / fps))
         except BlockingIOError:
             pass
         if every and t - lastk >= every: key = True
         if key: lastk = t
-        n = keysize if key else size
+        n = keysize if key else min(size, capn)
         hdr = struct.pack('>IQII', n | (0x80000000 if key else 0), t, no, 1 if key else 0)
         m = memoryview(hdr + bytes(n - 16))
         while len(m):

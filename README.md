@@ -23,16 +23,15 @@ bench day, cold power-up and live Android Auto by ear are untested. Details and 
 
 ## How the chain fits
 ```
-Hudiy/AA --(wlr screencopy)--> pi/wlcap --raw--> pienc/rnv2enc --RNV2--> pi/avlink --USB CDC--> teensy/sdemu
+Hudiy/AA --(wlr screencopy)--> pi/wlcap --raw--> pienc/rnv2enc --RNV3--> pi/avlink --USB CDC--> teensy/sdemu
   pw-record of the Hudiy sink (48 kHz s16) ---------------------------------^                    | emulated SD card
                                                                                                   v
         rnse/src/sdstream.c on the RNS-E: SD read, RNV2 decode, display flip, audio sink
         (started on TV entry by rnse/hook, or loaded into RAM by rnse/benchd.py)
 ```
 - `pi/wlcap`: screen capture with damage tracking, newest-frame-wins.
-- `pienc`: RNV2 video encoder (NEON on the Pi, scalar and emulated NEON on x86), rate-limited to the SD bus budget (`--linkcap`),
-  with the superframe budget and still-screen convergence options. This is the working tree's `pienc_budget`; with no extra flag
-  it produces the same stream as the older plain encoder, which is not kept here.
+- `pienc`: RNV3 video encoder, the working tree's `enc3` and what the Pi runs. The built binary is named `rnv2enc` (`docs/DEPLOYMENT.md` has the deployment and settings) (NEON on the Pi, scalar and emulated NEON on x86), rate-limited to the SD bus budget (`--linkcap`),
+  with the superframe budget and still-screen convergence options. `ref/` is the older RNV2 reference decoder, `dec/` the RNV3 one.
 - `pi/avlink`: packs video, audio and control into superframes and sends them to the Teensy with credit-based flow control
   (`--whole-sf 1` hands over whole superframes). Tests in `pi/avlink/test`.
 - `pi/scripts`: `hud2.sh` starts capture, encoder and link with the flags in use; `car/` has the systemd units and install
@@ -64,7 +63,7 @@ Hudiy/AA --(wlr screencopy)--> pi/wlcap --raw--> pienc/rnv2enc --RNV2--> pi/avli
 ## Install / run (bench procedure, in short)
 1. Flash the Teensy (`teensy/tools/bench/flash.py` for the Windows HalfKay path, or any Teensy loader with `firmware.hex`).
 2. On the Pi build wlcap, the encoder and avlink under `~/avsd`. `pi/scripts/hud2.sh` expects `~/avsd/pi/{wlcap,avlink}` and the
-   encoder at `~/avsd/pienc_budget/rnv2enc` (copy `pienc/` there, or set `ENC_BIN`). `hud2.sh SECONDS` starts capture, encoder
+   encoder at `~/avsd/pienc_rnv3/rnv3enc` (copy `pienc/` there, or set `ENC_BIN`). `hud2.sh SECONDS` starts capture, encoder
    and link. For starting the chain with the Pi, see `pi/scripts/car/CAR_INSTALL.md`. The flags in use on the author's Pi
    differ slightly from this script: see `docs/BENCH_NOTES.md`.
 3. RAM start from the PC: `python -I rnse/benchd.py serve` (owns the CowCAN, keeps the RNS-E awake), then

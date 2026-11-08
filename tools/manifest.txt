@@ -58,13 +58,19 @@ skip pi/avlink/test/out_fixes/*
 skip pi/avlink/test/credit_review/*
 
 # ---- pienc (encoder)
-# The repo folder pienc/ is the 'pienc_budget' encoder of the working tree (superframe budget + settled-quality options).
+# The repo folder pienc/ is the 'enc3' RNV3 encoder of the working tree, what the Pi runs; ref/, README and test tools still come from pienc_budget. Older note: the 'pienc_budget' encoder of the working tree (superframe budget + settled-quality options).
 # With no new flag it produces the same stream as the older plain 'pienc' encoder, so only this one is kept.
-pienc/Makefile analysis/av_over_sd_v1/pienc_budget/Makefile
+pienc/Makefile analysis/av_over_sd_v1/enc3/Makefile
 pienc/README.txt analysis/av_over_sd_v1/pienc_budget/README.txt
-pienc/include/ analysis/av_over_sd_v1/pienc_budget/include/*.h
-pienc/src/ analysis/av_over_sd_v1/pienc_budget/src/*.c
-pienc/src/ analysis/av_over_sd_v1/pienc_budget/src/*.h
+pienc/RNV3_REPORT.md analysis/av_over_sd_v1/enc3/RNV3_REPORT.md
+pienc/dec/rnv3dec.c analysis/av_over_sd_v1/enc3/dec/rnv3dec.c
+pienc/dec/rnv2_tables.h analysis/av_over_sd_v1/enc3/dec/rnv2_tables.h
+docs/DEPLOYMENT.md analysis/av_over_sd_v1/DEPLOYMENT.md
+pi/scripts/avsd.env analysis/av_over_sd_v1/pi/scripts/avsd.env
+pienc/include/ analysis/av_over_sd_v1/enc3/include/*.h
+pienc/src/ analysis/av_over_sd_v1/enc3/src/*.c
+pienc/src/ analysis/av_over_sd_v1/enc3/src/*.h
+pienc/src/ analysis/av_over_sd_v1/enc3/src/*.inc
 pienc/ref/ analysis/av_over_sd_v1/pienc_budget/ref/*
 pienc/tools/closed_loop_test.sh analysis/av_over_sd_v1/pienc_budget/tools/closed_loop_test.sh
 pienc/tools/synth.c analysis/av_over_sd_v1/pienc_budget/tools/synth.c
@@ -139,3 +145,6 @@ skip rnse_proto/src/uplink_stub.c
 skip rnse_proto/tone48.py
 skip rnse_proto/uiprobe.py
 skip rnse_proto/verify_sdwrite.py
+pi/scripts/ analysis/av_over_sd_v1/pi/scripts/*.py
+skip pienc_budget/include/*
+skip pienc_budget/src/*

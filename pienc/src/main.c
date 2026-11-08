@@ -243,7 +243,6 @@ int main(int argc, char **argv) {
     rnv2enc *e; linkctl_t lc = {-1, 0, {0}, 0, 0}; const char *ghostp = NULL; ghost_t gh;
     struct timespec cpu0, cpu1; double tdmg = 0;
     int refill = 0, srcticks = 1; double simsf = 0, sim_t = 0, sim_free = 0, sim_fin[4096], sim_b[4096], tw = 0; int sim_h = 0, sim_n = 0; /* --refill */
-    int keystill = 0, last_nch = 6000; double keymax = 300; FILE *fmodes = NULL; int simstill = 0; FILE *fsim = NULL; /* --simstill N: a frame identical to the last one came N ticks later, as wlcap's 10 fps refresh of a still screen; periodic keys then follow simulated time, as on a pipe */
     rnv2enc_default_params(&p);
     for (i = 1; i < argc; i++) {
         const char *a = argv[i];
@@ -297,6 +296,27 @@ int main(int argc, char **argv) {
         else if (!strcmp(a, "--qpdrop")) p.qp_drop = atoi(ARG);
         else if (!strcmp(a, "--fastrefine")) p.fast_refine = atoi(ARG);
         else if (!strcmp(a, "--sfbudget")) p.sf_budget = atof(ARG);
+        else if (!strcmp(a, "--r3")) p.r3 = atoi(ARG);
+        else if (!strcmp(a, "--fill")) p.fill_gap = atoi(ARG);
+        else if (!strcmp(a, "--rctol")) p.rc_tol = atof(ARG);
+        else if (!strcmp(a, "--btclmin")) p.btc_lmin = atof(ARG);
+        else if (!strcmp(a, "--prunen")) p.prune_nact = atoi(ARG);
+        else if (!strcmp(a, "--pruner")) p.prune_r = atof(ARG);
+        else if (!strcmp(a, "--forcemode")) p.force_mode = atoi(ARG);
+        else if (!strcmp(a, "--btcgate")) p.btc_gate = atoi(ARG);
+        else if (!strcmp(a, "--pwmax")) p.pw_max = atof(ARG);
+        else if (!strcmp(a, "--srcmean")) p.src_mean = atoi(ARG);
+        else if (!strcmp(a, "--smooth")) p.smooth = atoi(ARG);
+        else if (!strcmp(a, "--tonepal")) p.tone_pal = atoi(ARG);
+        else if (!strcmp(a, "--fillpen")) p.fill_pen = atof(ARG);
+        else if (!strcmp(a, "--nurelax")) p.nu_relax = atof(ARG);
+        else if (!strcmp(a, "--nurelaxthr")) p.nu_relax_thr = atof(ARG);
+        else if (!strcmp(a, "--nurelaxn")) p.nu_relax_n = atoi(ARG);
+        else if (!strcmp(a, "--srcdead")) p.src_dead = atoi(ARG);
+        else if (!strcmp(a, "--glassdead")) p.glass_dead = atoi(ARG);
+        else if (!strcmp(a, "--latq")) { const char *f = ARG; sscanf(f, "%d,%d,%d,%d", &p.lat_q4, &p.lat_q2a, &p.lat_q2b, &p.lat_q4c); }
+        else if (!strcmp(a, "--latsharp")) p.lat_sharp = atoi(ARG);
+        else if (!strcmp(a, "--lmin")) p.rc_lmin = atof(ARG);
         else if (!strcmp(a, "--maxvid")) p.sf_budget = atof(ARG) * 512;   /* same value as avlink --maxvid */
         else if (!strcmp(a, "--trimratio")) p.trim_ratio = atof(ARG);
         else if (!strcmp(a, "--trimmax")) p.trim_max = atof(ARG);
@@ -305,16 +325,8 @@ int main(int argc, char **argv) {
         else if (!strcmp(a, "--spillgap")) p.spill_gap = atoi(ARG);
         else if (!strcmp(a, "--spillcarry")) p.spill_carry = atoi(ARG);
         else if (!strcmp(a, "--spillcyc")) p.spill_cyc = atof(ARG);
-        else if (!strcmp(a, "--converge")) { p.converge = atoi(ARG); keystill = p.converge; }
-        else if (!strcmp(a, "--convsf")) p.conv_sf = atoi(ARG);
-        else if (!strcmp(a, "--cscfit")) p.csc_fit = atoi(ARG);
-        else if (!strcmp(a, "--keystill")) keystill = atoi(ARG);   /* 1: no periodic key while the source is still: a key would throw the settled picture away.  A key asked for on --linkctl still goes at once */
-        else if (!strcmp(a, "--keymax")) keymax = atof(ARG);
-        else if (!strcmp(a, "--modes-out")) fmodes = fopen(ARG, "wb");
         else if (!strcmp(a, "--refill")) { const char *f = ARG; refill = !strcmp(f, "wall") ? 1 : !strcmp(f, "sim") ? 2 : !strcmp(f, "frame") ? 0 : (usage(), 0); } /* frame: one 1/fps per frame (old).  wall: the clock.  sim: the link model below, reproducible, for offline runs */
         else if (!strcmp(a, "--srcticks")) srcticks = atoi(ARG);          /* sim: the source offers a frame every N ticks */
-        else if (!strcmp(a, "--simstill")) simstill = atoi(ARG);
-        else if (!strcmp(a, "--simlog")) fsim = fopen(ARG, "w");
         else if (!strcmp(a, "--simsf")) simsf = atof(ARG);                /* sim: bytes per superframe if not --sfbudget */
         else if (!strcmp(a, "--dither")) p.dither = atoi(ARG);
         else if (!strcmp(a, "--ditherrange")) p.dither_range = atoi(ARG);
@@ -361,7 +373,7 @@ int main(int argc, char **argv) {
     if (ghostp) ghost_init(&gh, ghostp);
     e = rnv2enc_create(&p);
     if (!quiet) fprintf(stderr, "rnv2enc: kernels %s, %d thread(s)\n", rnv2enc_kernel_name(e), p.threads);
-    if (fs) fprintf(fs, "# i bytes qp tries cycles mu fill searched forced  SKIP MC MCR ZRES INTRA RAW  psnr_y psnr_666 psnr_666c psnr_rgb vis_src vis_cod vis_fmt  t_csc t_gme t_me t_ana t_dec t_- t_commit t_total  ngmv  level  linkcap  spill trims nchanged nexact nraw_conv\n");
+    if (fs) fprintf(fs, "# i bytes qp tries cycles mu fill searched forced  SKIP MC MCR ZRES INTRA RAW  psnr_y psnr_666 psnr_666c psnr_rgb vis_src vis_cod vis_fmt  t_csc t_gme t_me t_ana t_dec t_- t_commit t_total  ngmv  level  linkcap  spill trims\n");
     clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &cpu0);
     for (fn = 0;; fn++) {
         const uint8_t *out; size_t olen; rnv2enc_info inf; rnv2_rect dr[64]; int nd = -1; double t0, t1, td0, td1; uint8_t *cur;
@@ -375,13 +387,11 @@ int main(int argc, char **argv) {
         td1 = now_ms() - td0;
         { double cv = linkctl_poll(&lc); if (cv > 0) rnv2enc_set_linkcap(e, cv); }
         { /* keyint: frames from a file; real time (keyint/60 s) from a pipe, where a still screen delivers few frames and a key must still come */
-            static int since = 0; static double tk = 0; double tn = refill == 2 && simstill ? 1 + sim_t * 1000.0 / p.fps : now_ms(); int live = !strcmp(in, "-") || (refill == 2 && simstill), due; static int deferred = 0;
+            static int since = 0; static double tk = 0; double tn = now_ms(); int live = !strcmp(in, "-"), due; static int deferred = 0;
             if (!tk) tk = tn;
             due = keyint > 0 && (live ? tn - tk >= keyint * 1000.0 / 60 : since >= keyint - 1);
             /* a periodic key is a 250 KB burst: on a still or quiet screen nobody sees it, in motion it starves the frames after it.  Wait for a quiet frame, within limits; a key the link asked for goes at once */
-            if (keystill) { /* a key rebuilds the whole screen from black.  A still screen or a small update (a selector move) must not pay for it: the periodic key waits for a large change, where nothing is lost, or for --keymax seconds.  A key asked for on --linkctl goes at once */
-                if (due && !lc.key && last_nch < 3000 && (tn - tk) / 1000.0 < keymax) due = 0;
-            } else if (due && !lc.key && keydefer > 0 && lastbytes > 20000 && deferred < keydefer) { due = 0; deferred++; } else if (due) deferred = 0;
+            if (due && !lc.key && keydefer > 0 && lastbytes > 20000 && deferred < keydefer) { due = 0; deferred++; } else if (due) deferred = 0;
             iskey = fn > 0 && (due || lc.key); lc.key = 0;
             if (iskey) { since = 0; tk = tn; } else since++;
         }
@@ -389,8 +399,6 @@ int main(int argc, char **argv) {
         t0 = now_ms();
         rnv2enc_encode(e, cur, stride, fmt, dr, nd, &out, &olen, &inf);
         t1 = now_ms();
-        last_nch = inf.nchanged;
-        if (fmodes) { static uint8_t ml[6000]; rnv2enc_modes(e, ml); fwrite(ml, 1, 6000, fmodes); }
         tdmg += td1;   /* damage scan (outside t_total); stats column t_- = decide passes + 100 x analysis passes this frame */
         ttot += t1 - t0; if (t1 - t0 > tmax) tmax = t1 - t0;
         for (i = 0; i < 8; i++) tph[i] += inf.t_ms[i];
@@ -399,12 +407,6 @@ int main(int argc, char **argv) {
             if (sim_free < sim_t) sim_free = sim_t;
             sim_free += fr; sim_fin[(sim_h + sim_n) % 4096] = sim_free; sim_b[(sim_h + sim_n) % 4096] = (double)olen; if (sim_n < 4095) sim_n++; else sim_h = (sim_h + 1) % 4096;
             t1s = sim_t + srcticks;
-            if (fsim) fprintf(fsim, "%d %.0f %d %zu\n", fn, sim_t, fr, olen);
-            if (simstill) { /* the next frame's distance from this one: known here only for a file source, peek at it */
-                long pos = ftell(fi); uint8_t *nx = malloc(fsz);
-                if (fread(nx, 1, fsz, fi) == fsz && !memcmp(nx, cur, fsz)) t1s = sim_t + simstill;
-                fseek(fi, pos, SEEK_SET); free(nx);
-            }
             for (;;) {
                 while (sim_n && sim_fin[sim_h] <= t1s) { sim_h = (sim_h + 1) % 4096; sim_n--; }
                 for (q = 0, k = 0; k < sim_n; k++) q += sim_b[(sim_h + k) % 4096];
@@ -430,11 +432,11 @@ int main(int argc, char **argv) {
                 s_p666 += m.p666; s_p666c += m.p666c; s_py += m.py; s_vs += m.vsrc; s_vc += m.vcod; s_vf += m.vfmt;
                 if (m.p666c < min_p666c) min_p666c = m.p666c; if (m.py < min_py) min_py = m.py;
             }
-            if (fs) fprintf(fs, "%d %d %d %d %.0f %.4f %.0f %d %d  %d %d %d %d %d %d  %.3f %.3f %.3f %.3f %d %d %d  %.3f %.3f %.3f %.3f %.3f %.3f %.3f %.3f  %d  %d  %.0f  %d %d %d %d %d\n",
+            if (fs) fprintf(fs, "%d %d %d %d %.0f %.4f %.0f %d %d  %d %d %d %d %d %d  %.3f %.3f %.3f %.3f %d %d %d  %.3f %.3f %.3f %.3f %.3f %.3f %.3f %.3f  %d  %d  %.0f  %d %d  %d %d %d %d %d  %.4f\n",
                             fn, inf.bytes, inf.qp, inf.tries, inf.cycles, inf.mu, inf.fill, inf.n_searched, inf.n_skip_forced,
                             inf.modes[0], inf.modes[1], inf.modes[2], inf.modes[3], inf.modes[4], inf.modes[5],
                             m.py, m.p666, m.p666c, m.prgb, m.vsrc, m.vcod, m.vfmt,
-                            inf.t_ms[0], inf.t_ms[1], inf.t_ms[2], inf.t_ms[3], inf.t_ms[4], inf.t_ms[5], inf.t_ms[6], t1 - t0, inf.gmv_n, inf.level, inf.link_cap, inf.spill, inf.trims, inf.nchanged, inf.nexact, inf.nraw_conv);
+                            inf.t_ms[0], inf.t_ms[1], inf.t_ms[2], inf.t_ms[3], inf.t_ms[4], inf.t_ms[5], inf.t_ms[6], t1 - t0, inf.gmv_n, inf.level, inf.link_cap, inf.spill, inf.trims, inf.modes[6], inf.modes[7], inf.modes[8], inf.modes[9], inf.modes[10], inf.lamk);
         }
         if (autod) { /* this frame becomes the previous one without a copy */
             if (bench) prevframe = cur;

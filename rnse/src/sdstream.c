@@ -181,17 +181,24 @@ static inline u32 be16(const u8 *p) { return ((u32)p[0] << 8) | p[1]; }
 static inline u32 swap16x2(u32 w) { return ((w & 0x00FF00FFu) << 8) | ((w >> 8) & 0x00FF00FFu); }
 
 /* ---------------------------------------------------------------- audio */
+#define FADE 256u
+#define FADE_SHIFT 8
 static u32 g_scan;
+static u32 a_gap, a_prev_w, a_prev_seq, a_prev_valid;
+static inline u32 mix2(u32 a, u32 b, s32 g);
 static void a_push(const u8 *p, u32 frames)
 {
     u32 *fifo = (u32 *)AFIFO, i, room = AFIFO_FRAMES - (a_wr - a_rd);
     const u32 *s = (const u32 *)p;
-    if (frames > room) { ST(S_A_OVER) += frames - room; frames = room; }
+    if (frames > room) { ST(S_A_OVER) += frames - room; frames = room; a_gap = 1; }
     for (i = 0; i < frames; i++) {
         u32 w = s[i];                                   /* BE s16 L, s16 R -> L in the high half */
         if (lrswap) w = (w << 16) | (w >> 16);
         if (!p1c) w = swap16x2(w);                      /* +1C = 0: the worker swaps bytes, pre-swap here */
+        if (a_gap && p1c) w = mix2(a_prev_w, w, (s32)(a_gap - 1));
+        if (a_gap && p1c && ++a_gap > FADE) a_gap = 0;
         fifo[(a_wr + i) & (AFIFO_FRAMES - 1)] = w;
+        a_prev_w = w;
     }
     if (g_scan) {                                       /* bench: a steady tone must not jump at the input */
         volatile u32 *d = (volatile u32 *)0x8F72FFD0u;
@@ -221,7 +228,6 @@ static u32 sink_max;
  * step = 1 + PI on fill, clamp +-500 ppm (inaudible). Q16, 1 unit = 15.3 ppm. Bigger errors are faults, not drift: a backlog is cut (cross-fade), an empty FIFO rebuffers (fade). */
 #define RS_MAX 33
 #define RESYNC_OVER 3600u                   /* 75 ms over target: drop the excess */
-#define FADE 64u
 static u32 rs_frac, a_fadein;
 static s32 rs_step, rs_ema, rs_int, a_last_l, a_last_r;
 static void rs_steer(u32 fill)
@@ -237,24 +243,13 @@ static void rs_steer(u32 fill)
     rs_step = 65536 + x;
     ST(S_FL_BLK) = (u32)x;
 }
-static inline s32 cub(s32 y0, s32 y1, s32 y2, s32 y3, s32 f)      /* Catmull-Rom, f Q11 */
-{
-    s32 a = 3 * (y1 - y2) + y3 - y0, b = 2 * y0 - 5 * y1 + 4 * y2 - y3, c = y2 - y0, v;
-    v = (((((((a * f) >> 11) + b) * f) >> 11) + c) * f) >> 12;
-    v += y1;
-    return v > 32767 ? 32767 : v < -32768 ? -32768 : v;
-}
+#include "rs_fir.h"
 static u32 rs_fill_block(u32 *dst, const u32 *fifo)  /* blk frames out; returns frames consumed */
 {
     u32 i, pos = rs_frac;
     const u32 m = AFIFO_FRAMES - 1, rd = a_rd;
     for (i = 0; i < blk; i++) {
-        u32 k = rd + (pos >> 16);
-        u32 w0 = fifo[(k - 1) & m], w1 = fifo[k & m], w2 = fifo[(k + 1) & m], w3 = fifo[(k + 2) & m];
-        s32 f = (s32)((pos & 0xFFFF) >> 5);
-        s32 l = cub((s16)(w0 >> 16), (s16)(w1 >> 16), (s16)(w2 >> 16), (s16)(w3 >> 16), f);
-        s32 r = cub((s16)w0, (s16)w1, (s16)w2, (s16)w3, f);
-        dst[i] = ((u32)l << 16) | ((u32)r & 0xFFFF);
+        dst[i] = fir_frame(fifo, m, rd + (pos >> 16), pos & 0xFFFF);
         pos += (u32)rs_step;
     }
     rs_frac = pos & 0xFFFF;
@@ -262,7 +257,7 @@ static u32 rs_fill_block(u32 *dst, const u32 *fifo)  /* blk frames out; returns 
 }
 static inline u32 mix2(u32 a, u32 b, s32 g)          /* g/FADE of b, the rest of a */
 {
-    s32 n = (s32)FADE, l = ((s16)(a >> 16) * (n - g) + (s16)(b >> 16) * g) >> 6, r = ((s16)a * (n - g) + (s16)b * g) >> 6;
+    s32 n = (s32)FADE, l = ((s16)(a >> 16) * (n - g) + (s16)(b >> 16) * g) >> FADE_SHIFT, r = ((s16)a * (n - g) + (s16)b * g) >> FADE_SHIFT;
     return ((u32)l << 16) | ((u32)r & 0xFFFF);
 }
 
@@ -279,7 +274,7 @@ static void a_service(void)
     while (a_state == 2 && credits > ST(S_A_BLOCKS)) {
         u32 *dst = (u32 *)(TONE_BUF + a_k * MAXBLK * 4), n, i;
         const u32 *fifo = (const u32 *)AFIFO;
-        u32 rs = p1c != 0, need = rs ? ((rs_frac + blk * (u32)rs_step) >> 16) + 3 : blk, used, keep_frac = rs_frac, old_rd = 0, cut = 0;
+        u32 rs = p1c != 0, need = rs ? ((rs_frac + blk * (u32)rs_step) >> 16) + FIR_AHEAD : blk, used, keep_frac = rs_frac, old_rd = 0, cut = 0;
         int r;
         rf = RING_WR - RING_RD;
         if (rf >= sink_max) break;
@@ -289,14 +284,14 @@ static void a_service(void)
         }
         fill = a_wr - a_rd;
         if (a_rebuf && fill >= target) { a_rebuf = 0; a_fadein = 1; }   /* the ring is already full of silence here */   /* jitter buffer full again: play */
-        n = a_rebuf ? 0 : (fill < need ? fill : blk);
+        n = a_rebuf ? 0 : (fill < blk ? fill : blk);
         if (n < blk && rf >= 2) break;                  /* sink still holds two blocks: wait for more data */
         if (n == blk && rs && fill > target + RESYNC_OVER) {   /* backlog after a stall: latency matters more than these frames */
             old_rd = a_rd; cut = 1;
             a_rd = a_wr - target; fill = target; rs_frac = 0;
             ST(S_A_RESYNC)++;
         }
-        if (n == blk && rs) {
+        if (n == blk && rs && fill >= need) {
             used = rs_fill_block(dst, fifo);
             if (cut) for (i = 0; i < FADE; i++) dst[i] = mix2(fifo[(old_rd + i) & (AFIFO_FRAMES - 1)], dst[i], (s32)i);
             if (a_fadein) { a_fadein = 0; for (i = 0; i < FADE; i++) dst[i] = mix2(0, dst[i], (s32)i); }
@@ -307,7 +302,7 @@ static void a_service(void)
                 u32 w = n ? dst[n - 1] : (((u32)a_last_l << 16) | ((u32)a_last_r & 0xFFFF));
                 for (i = n; i < blk; i++) { u32 g = i - n; dst[i] = g < FADE ? mix2(w, 0, (s32)g) : 0; }
                 a_last_l = a_last_r = 0;
-            }
+            } else { a_last_l = (s16)(dst[blk - 1] >> 16); a_last_r = (s16)dst[blk - 1]; }
             used = n;
         }
         if (n < blk && !a_rebuf) { ST(S_A_UNDER)++; a_rebuf = 1; rs_frac = 0; }   /* rebuffer behind silence, or supply = demand keeps it empty */
@@ -912,7 +907,10 @@ void reader_main(void)
             if (ab && asec >= 1 && asec * 512 + ab <= total * 512) {
                 const u8 *ap = sf + asec * 512;
                 if ((flags & F_PAYCRC) && crc32_upd(0, ap, ab) != be32(sf + 48)) ST(S_A_CRC_BAD)++;
-                else if (fmt == 1 && afr * 4 <= ab) { if (flags & F_AUDIO) a_push(ap, afr); else ST(S_A_IN) += afr; }
+                else if (fmt == 1 && afr * 4 <= ab) {
+                    if (flags & F_AUDIO) { if (a_prev_valid && sseq != a_prev_seq + 1 && !a_gap) a_gap = 1; a_prev_seq = sseq; a_prev_valid = 1; a_push(ap, afr); }
+                    else ST(S_A_IN) += afr;
+                }
                 else ST(S_A_FMT_BAD)++;
             }
         }

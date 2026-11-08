@@ -37,6 +37,12 @@ if wlr-randr 2>/dev/null | grep -q '^HDMI-A-'; then say "WARNING: an HDMI output
 mkdir -p "$CHAINDIR"
 ln -sf /dev/null "$CHAINDIR/st.txt"
 : > "$CHAINDIR/live.log"
+: > "$CHAINDIR/enc.log"
+# Keep logs across reboots: tmpfs is lost at power-off. About 2 MB/h. The newest 40 runs stay.
+LOGD=$A/logs; mkdir -p "$LOGD"; ls -1t "$LOGD"/*.log 2>/dev/null | tail -n +81 | xargs -r rm -f
+STAMP=$(date +%Y%m%d-%H%M%S)-$(cut -c1-8 /proc/sys/kernel/random/boot_id)
+tail -n +1 -F "$CHAINDIR/live.log" >> "$LOGD/$STAMP-live.log" 2>/dev/null &
+tail -n +1 -F "$CHAINDIR/enc.log" >> "$LOGD/$STAMP-enc.log" 2>/dev/null &
 say "starting chain on $DEV, logs in $CHAINDIR"
 "$A/hud2.sh" 315360000 &
 HUD=$!

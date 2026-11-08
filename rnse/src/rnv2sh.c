@@ -345,6 +345,12 @@ WHT_FN void wht_add_c(rnv_s32 *c, rnv_u8 *pr, const rnv_u8 *CL)   /* pr = first 
 }
 #endif
 
+#if RNV_FAST
+enum { M_LAT8 = 6, M_LAT4, M_LAT2, M_BTC4, M_BTC2 };
+#define RNV3_QC2 2
+#define LAT_DITH_BASE 2
+#include "rnv3_sh.inc"
+#endif
 /* ------------------------------------------------------------------ frame */
 static rnv_u32 rd32(const rnv_u8 *p) { return ((rnv_u32)p[0] << 24) | ((rnv_u32)p[1] << 16) | ((rnv_u32)p[2] << 8) | p[3]; }
 
@@ -378,10 +384,24 @@ int DECODE_FN(rnv_state *s, const rnv_u8 *f, rnv_u32 len)
 #if RNV_FAST
     rnv_s32 lvt[2 * RNV_LVMAX + 2];
     rnv_win W;
+    int r3 = 0, lm = 0, tl = 0; r3local z;
 #endif
 
     if (len < 24) return fail(s, RNV_E_LEN, 0);
+#if RNV_FAST
+    if (f[0] != 'R' || (f[1] != '2' && f[1] != '3')) return fail(s, RNV_E_MAGIC, 0);
+    r3 = f[1] == '3';
+    if (r3) {
+        int a_, b_;
+        z.q4 = f[6] & 15; z.q2a = f[6] >> 4; z.q2b = f[7] & 15; z.q4c = f[7] >> 4; z.dith = f[5] & 1;
+        if (!z.q4 || !z.q2a || !z.q2b || !z.q4c) return fail(s, RNV_E_LEN, 0);
+        for (a_ = 0; a_ < 3; a_++) for (b_ = 0; b_ < 3; b_++) z.last[a_][b_] = 128;
+        for (a_ = 0; a_ < 6; a_++) z.btc[a_] = 128;
+        for (a_ = 0; a_ < RNV_BW + 2; a_++) s->rowm[a_] = 0;
+    }
+#else
     if (f[0] != 'R' || f[1] != '2') return fail(s, RNV_E_MAGIC, 0);
+#endif
     qp = f[4];
     if (qp > 51) return fail(s, RNV_E_QP, 0);
     l0 = rd32(f + 8); l1 = rd32(f + 12); l2 = rd32(f + 16); l3 = rd32(f + 20);
@@ -408,6 +428,9 @@ int DECODE_FN(rnv_state *s, const rnv_u8 *f, rnv_u32 len)
         if (bad || run > (rnv_u32)(RNV_NB - blk)) BAD(RNV_E_RUN);
         while (run--) {                                   /* skipped blocks: copy only if changed recently */
             int a = age[blk];
+#if RNV_FAST
+            if (r3) { int bx_ = x0 >> 3; tl = s->rowm[bx_]; s->rowm[bx_] = 0; lm = 0; }
+#endif
             if (a < sat) {
                 if (RNV_PF && !(x0 & 8)) { int r; for (r = 0; r < 8; r++) PF(ref + off + 32 + r * S); }
                 copy8r(cur + off, S, ref + off, S);
@@ -417,8 +440,51 @@ int DECODE_FN(rnv_state *s, const rnv_u8 *f, rnv_u32 len)
         }
         if (blk >= RNV_NB) break;
         if (p0 > e0) BAD(RNV_E_OVERRUN);
+#if RNV_FAST
+        if (r3) {
+            rnv_u32 v_ = peek32(w0, p0) >> 27;   /* MC 00, MCR 010, ZRES 011, INTRA 100, LAT 101dd, BTC4 110, BTC2 1110, RAW 1111 */
+            if (v_ < 8) { mode = MC; p0 += 2; }
+            else if (v_ < 12) { mode = MCR; p0 += 3; }
+            else if (v_ < 16) { mode = ZRES; p0 += 3; }
+            else if (v_ < 20) { mode = INTRA; p0 += 3; }
+            else if (v_ < 24) { mode = M_LAT8 + (int)(v_ & 3); p0 += 5; if (mode > M_LAT2) BAD(RNV_E_HUFF); }
+            else if (v_ < 28) { mode = M_BTC4; p0 += 3; }
+            else if (v_ < 30) { mode = M_BTC2; p0 += 4; }
+            else { mode = RAW; p0 += 4; }
+            {
+                int bx_ = x0 >> 3, kL = 0, kT, kTL, kTR, m_, up;
+                if (!bx_) { lm = 0; tl = 0; }
+                up = s->rowm[bx_];
+                if (mode >= M_LAT8 && mode <= M_LAT2) {
+                    m_ = mode;
+                    kL = lm == m_; kT = up == m_; kTL = kL || kT || tl == m_; kTR = kT || s->rowm[bx_ + 1] == m_;
+                    if (lat_block(s, &z, w1, &p1, mode - M_LAT8, bx_, kL, kT, kTL, kTR, cur + off)) BAD(RNV_E_UE);
+                    if (p1 > e1) BAD(RNV_E_OVERRUN);
+                    goto r3_done;
+                }
+                if (mode == M_BTC4 || mode == M_BTC2) {
+                    int k_, nb_ = mode == M_BTC4 ? 16 : 8;
+                    if (s3e - s3 < nb_) BAD(RNV_E_RAW);
+                    for (k_ = 0; k_ < 6; k_++) z.btc[k_] += se(w1, &p1, &bad);
+                    if (bad) BAD(RNV_E_UE);
+                    if (mode == M_BTC4) btc4_block(cur + off, z.btc, s3); else btc2_block(cur + off, z.btc, s3);
+                    s3 += nb_;
+                    goto r3_done;
+                }
+                goto r3_old;
+            r3_done:
+                tl = up; s->rowm[bx_] = (rnv_u8)mode; lm = mode;
+                age[blk] = 0; ADV();
+                continue;
+            r3_old:
+                tl = up; s->rowm[bx_] = (rnv_u8)mode; lm = mode;
+            }
+        } else
+#endif
+        {
         mode = 1 + (int)getb(w0, &p0, 2);
         if (mode == 4) mode += (int)getb(w0, &p0, 1);
+        }
         if (mode == RAW) {
             if (s3e - s3 < 128) BAD(RNV_E_RAW);
             rawcopy(cur + off, s3); s3 += 128;
