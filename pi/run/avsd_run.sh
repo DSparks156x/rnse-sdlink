@@ -9,6 +9,13 @@ export XDG_RUNTIME_DIR=${XDG_RUNTIME_DIR:-/run/user/$(id -u)} WAYLAND_DISPLAY=wa
 export CHAINDIR=$XDG_RUNTIME_DIR/avsd
 STALE_S=${AVSD_STALE_S:-20}     # avlink prints a STAT line every 5 s
 say() { echo "avsd: $*"; }
+# Front end: Hudiy by default, LIVI (or anything else) through avsd.env:
+#   APP_PROC=livi-core   process the chain waits for and watches
+#   CAP_SINK=avsd_out    sink whose output goes to the RNS-E
+#   CAP_SINK_CREATE=1    create CAP_SINK as a null sink and make it the default output
+A_ENV=$A/avsd.env; [ -f "$A_ENV" ] && . "$A_ENV"
+APP_PROC=${APP_PROC:-hudiy}
+CAP_SINK=${CAP_SINK:-hudiy_equalizer_sink}
 # update_avsd.sh quits Hudiy to get off the hotspot, then shows its terminal through this chain.
 # While this file exists a missing Hudiy is not a reason to stop. tmpfs, so a reboot clears it.
 UPDATING=$XDG_RUNTIME_DIR/avsd-updating
@@ -23,16 +30,22 @@ waitfor() {   # waitfor DESCRIPTION COMMAND...: retry for ever, one line every 3
   say "$what ok after ${n} s"
 }
 have_noop()  { wlr-randr 2>/dev/null | grep -q '^NOOP-1'; }
-have_sink()  { pactl list short sinks 2>/dev/null | awk '{print $2}' | grep -Fxq hudiy_equalizer_sink; }
+have_sink()  {
+  pactl list short sinks 2>/dev/null | awk '{print $2}' | grep -Fxq "$CAP_SINK" && return 0
+  [ "${CAP_SINK_CREATE:-0}" = 1 ] || return 1
+  pw-cli create-node adapter "{ factory.name=support.null-audio-sink node.name=$CAP_SINK node.description=$CAP_SINK media.class=Audio/Sink audio.position=[FL FR] audio.rate=48000 object.linger=true }" >/dev/null
+  sleep 0.5; pactl set-default-sink "$CAP_SINK"
+  pactl list short sinks 2>/dev/null | awk '{print $2}' | grep -Fxq "$CAP_SINK"
+}
 have_teensy() { ls /dev/serial/by-id/usb-Teensyduino_SDemu_Touch_*-if00; }
 port_free()  { ! fuser -s "$(ls /dev/serial/by-id/usb-Teensyduino_SDemu_Touch_*-if00 | head -1)"; }
 
 waitfor "wayland socket" test -S "$XDG_RUNTIME_DIR/$WAYLAND_DISPLAY"
 waitfor "pulse server" pactl info
 waitfor "headless output NOOP-1" have_noop
-hudiy_or_update() { updating || pgrep -x hudiy; }
-waitfor "hudiy" hudiy_or_update
-waitfor "sink hudiy_equalizer_sink" have_sink
+app_or_update() { updating || pgrep -x "$APP_PROC"; }
+waitfor "$APP_PROC" app_or_update
+waitfor "sink $CAP_SINK" have_sink
 # The music must run on the Pi's clock. A USB mic can drive, and every echo canceller links its mic to echo_cancel_sink, so a mic that is
 # plugged in became the clock of the music avlink taps. The dome mic ran it more than 0.72% slow, past what the tick can follow: 1-2.5 s of
 # padded silence per minute, then short pads heard as crackles (car log 2026-11-07 16:22-17:10, clean unplugged). A silent sink on the
@@ -90,7 +103,7 @@ while :; do
   alive "$CHAINDIR/enc.pid" || why="encoder gone"
   alive "$CHAINDIR/link.pid" || why="avlink gone"
   pgrep -x 'parec|pw-record' >/dev/null || why="audio capture gone (avlink would stay on silence)"
-  updating || pgrep -x hudiy >/dev/null || why="hudiy gone"
+  updating || pgrep -x "$APP_PROC" >/dev/null || why="$APP_PROC gone"
   age=$(( $(date +%s) - $(stat -c %Y "$CHAINDIR/live.log" 2>/dev/null || echo 0) ))
   [ "$age" -gt "$STALE_S" ] && why="avlink silent for ${age} s"
   if [ -n "$why" ]; then

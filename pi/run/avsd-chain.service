@@ -1,5 +1,5 @@
 [Unit]
-Description=A/V over SD: Hudiy screen + audio to the RNS-E through the Teensy
+Description=A/V over SD: front-end screen + audio to the RNS-E through the Teensy
 After=pipewire-pulse.service
 Wants=pipewire-pulse.service
 # touch ~/avsd/car/DISABLE and restart: bench use without uninstalling

@@ -1,5 +1,5 @@
 #!/bin/bash
-# Hudiy screen + Hudiy audio -> RNS-E
+# Front-end screen + audio -> RNS-E (Hudiy by default; APP_PROC/CAP_SINK in avsd.env for LIVI)
 # Env: KEYINT (periodic key safety net, frames), LINKCAP (B/s), MAXVID (video sectors per superframe: must read in under a tick, so audio
 # keeps 60 superframes/s even when video lags), GAIN (dB, at most -3, above 0 wraps), ENCTHREADS.
 # CAPMODE: dmabuf (default: labwc hands over its buffer, no readback on the labwc thread) or shm (labwc reads back).
@@ -28,7 +28,7 @@ if [ "$R" -gt 0 ]; then
     # Hudiy's audio reaches PipeWire through pipewire-pulse's main thread, and Hudiy runs at normal priority under a real-time chain. AUDIOPRIO=0 turns this off.
     if [ "${AUDIOPRIO:-1}" = 1 ]; then
       for p in $(pgrep -x pipewire-pulse); do sudo -n chrt -f -p $((R + 2)) "$p"; done
-      for p in $(pgrep -x hudiy); do sudo -n renice -n -10 -p $(ls /proc/$p/task) >/dev/null; done
+      for p in $(pgrep -x "${APP_PROC:-hudiy}"); do sudo -n renice -n -10 -p $(ls /proc/$p/task) >/dev/null; done
     fi
     for p in $(pgrep -x pipewire) $(pgrep -x pipewire-pulse); do
       for t in /proc/$p/task/*; do
@@ -40,9 +40,11 @@ fi
 withpid() { f=$1; shift; bash -c 'echo $$ > "$0"; exec "$@"' "$f" "$@"; }
 # AUDIOCAP=parec reverts. parec goes through pipewire-pulse, which loses buffers ("out of buffers" in its log): 47724-47931 frames/s against pw-record's 48004 on the same monitor, 2026-11-05.
 # echo_cancel_sink is fed by the Hudiy EQ sink: capturing there follows Hudiy volume and EQ. The EQ sink's own monitor is before both (measured 2026-11-06).
-CAPSINK=hudiy_equalizer_sink; pactl list short sinks 2>/dev/null | awk '{print $2}' | grep -Fxq echo_cancel_sink && CAPSINK=echo_cancel_sink
+# CAP_SINK (avsd.env) overrides: LIVI plays into its own null sink.
+if [ -n "$CAP_SINK" ]; then CAPSINK=$CAP_SINK; else
+CAPSINK=hudiy_equalizer_sink; pactl list short sinks 2>/dev/null | awk '{print $2}' | grep -Fxq echo_cancel_sink && CAPSINK=echo_cancel_sink; fi
 if [ "${AUDIOCAP:-pw}" = parec ]; then
-  timeout $1 parec -d hudiy_equalizer_sink.monitor --rate=48000 --format=s16le --channels=2 --raw --latency-msec=20 > pcm.fifo 2>parec.log &
+  timeout $1 parec -d "${CAP_SINK:-hudiy_equalizer_sink}".monitor --rate=48000 --format=s16le --channels=2 --raw --latency-msec=20 > pcm.fifo 2>parec.log &
 else
   timeout $1 pw-record --target "$CAPSINK" -P '{stream.capture.sink=true}' --rate 48000 --channels 2 --format s16 --latency 20ms --raw - > pcm.fifo 2>parec.log &
 fi
