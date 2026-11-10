@@ -64,7 +64,7 @@ class DecoderCheckTests(unittest.TestCase):
         self.assertEqual(status, 0, err)
         result = json.loads(out)
         self.assertEqual(result['crc32'], '%08X' % zlib.crc32(self.image))
-        self.assertEqual((result['sector'], result['size']), (96, 131072))
+        self.assertEqual((result['sector'], result['size']), (107, 131072))
         self.assertNotIn('match', result)
         self.assertEqual(bus.requests, [(dc.DECODER_ADDRESS + n, 64)
                                         for n in range(0, dc.SECTOR_SIZE, 64)])
@@ -77,7 +77,7 @@ class DecoderCheckTests(unittest.TestCase):
         self.assertEqual(status, 2)
         self.assertEqual(read.call_count, 3)
         self.assertEqual(out, '')
-        self.assertIn('0x80C00000', json.loads(err)['error'])
+        self.assertIn('0x80D60000', json.loads(err)['error'])
         self.assertTrue(bus.closed)
 
     def test_short_read_never_produces_a_fingerprint(self):

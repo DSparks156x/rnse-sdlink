@@ -333,6 +333,7 @@ Sector numbers below are device LBAs (512 B). The card is 2 097 152 sectors.
 | 0x20000-0x3FFFF | **uplink write channels**: channel c (0..7) at 0x20000 + c * 0x4000 (8 MiB each), used circularly |
 | 0x40000 | Teensy info sector (read): firmware version, counters, newest seq, pool fill |
 | 0x40100-0x7FFFF | test pattern region: data = f(LBA), for BER and throughput tests with no Pi involved |
+| 0x80000-0xFFFFF | **version handshake window** (4.5): the LBA of each read carries 16 bits up; content as "everything else", except the ack sector |
 | everything else | zeros (FAT data of the big file) |
 
 The FS only touches LBA 0-4095 (mount) plus whatever it reads of the file. Our task reads the windows directly. The FS
@@ -606,6 +607,69 @@ write burst, bounded to `tick - read_time - 3 ms` margin; (4) restart the stream
 token is optimistic at 25 MHz, so each uplink message is acked by the Pi through the down-channel TLV `UPLINK_ACK`
 {channel, seq}. Messages without an ack after 3 ticks are resent.
 
+### 4.5 Version handshake (IMPLEMENTED 2026-11-10, read-only uplink in the read LBAs)
+
+Purpose: the Pi learns which module the unit runs, which stream formats its decoder plays and which firmware table it has, and
+streams only a format the unit plays. No card write, no CAN, no flashing. Constants in one place: `rnse/src/sdl_ver.h`
+(mirrored in `teensy/sdemu/avstream.h` `AVS_HS_*`, `pi/avlink/tlink.h` `TL_HS_*`).
+
+**Who announces, when.** `rnse/module/tvauto.c` `tva_task`, in its existing probe loop (LBA 0x10000 every 250 ms), and only after a
+probe read returned a sector starting with `RSAV`. A normal SD card never sees these reads. The probe itself is unchanged.
+
+**Announcement = 8 single-sector reads** (the same firmware read call as the probe, 150 ms bound each), in order i = 0..7:
+
+    LBA_i = 0x80000 + (i << 16) + w[i]          (w = 16-bit words; window 0x80000..0xFFFFF)
+
+| i | w[i] |
+|---|---|
+| 0 | `0x5D00 \| hs_ver` (layout version, 1) |
+| 1, 2 | module build id, high / low 16 bits (sector 107 header +0x94) |
+| 3 | `SDL_STREAM_FMT_MIN << 8 \| SDL_STREAM_FMT`: the stream formats the decoder plays |
+| 4, 5 | firmware table word 3 (fw_id), high / low |
+| 6 | firmware table word 1 (table version), low 16 bits |
+| 7 | `~(w0 + ... + w6) & 0xFFFF` (check) |
+
+The window lies inside `RSAVLINK.BIN`, below `SILENCE.MP3` (LBA 0x1FF800) and above the info and test-pattern sectors, so an
+older Teensy just returns its usual (zero / pattern) data for all 8 reads.
+
+**Teensy decoding** (`AvStream::read_begin` -> `hs_read`, interrupt side): read i = 0 with `w0 & 0xFF00 == 0x5D00` starts an
+announcement; each next handshake read must be i = previous + 1 (an out-of-order one restarts; reads outside the window, e.g. the
+probe or the FS, do not disturb it); after i = 7 the check word must match. A valid announcement is stored (seqlock to the main loop).
+
+**Ack sector** (the data of read 7, from a handshake-aware Teensy only; every other LBA keeps its usual content), big-endian:
+
+| off | size | field |
+|---|---|---|
+| 0 | 4 | `'SDHA'` 0x53444841 |
+| 4 | 16 | echo of w[0..7] |
+| 20 | 1 | verdict: 0 pending (no answer from the Pi yet), 1 accept, 2 reject |
+| 21 | 1 | stream format the Pi sends (0 = none / pending) |
+| 22 | 2 | 0 |
+| 24 | 4 | announcements decoded since the Teensy booted |
+| 28 | 484 | 0 |
+
+**Unit behaviour** (`hs_gate`, per `tva_task` run):
+- No ack (older Teensy, or a read failed): the probe result counts as before; the announcement is repeated every 8th probe (~2 s).
+- Ack, pending: announce on every probe and do not take over (at most 1 s, `HS_WAIT_MS`), then the probe result counts as before
+  (old avlink, or no Pi). On the bench the first verdict arrives with the second announcement, i.e. one extra probe cycle (250 ms).
+- Accept: the probe result counts; no more handshake reads in this run.
+- Reject: no takeover (the unit stays stock); repeated every 4th probe (~1 s), so an updated Pi can still accept.
+- State in TVA words 27..31 (`docs/FIRMWARE_CONTRACT.md`).
+
+**Teensy -> Pi:** `RNSE_INFO` (5.2) on every new announcement and again to every new sender (first TLNK message after a link reset).
+**Pi -> Teensy:** `HS_VERDICT` (5.2) for the announcement it names (build id + check); the Teensy keeps it for that announcement only
+and forgets it on a link reset (the next sender answers again).
+
+**Pi** (`pi/avlink/rnse_ver.h`): chosen format = the newest one in both the unit's `fmt_min..fmt` and the chain's (`AVL_FMT_MIN..MAX`,
+`--fmts`). Log `RNS-E module build XXXXXXXX fmt N table fw_id/ver: streaming fmt N`, or `RNS-E module too old: ...` / `too new: ...`
+with no superframes sent until an announcement with a common format arrives. Nothing announced (older Teensy or module): today's
+format (`AVL_FMT_DEFAULT` 1), and `no version announced` once the unit reads the stream. `--rnse-file` (the chain: `$CHAINDIR/rnse.txt`)
+holds shell lines `RNSE_ANNOUNCED, RNSE_BUILD, RNSE_FMT, RNSE_FMT_MIN, RNSE_FW_ID, RNSE_TABLE, RNSE_HS, STREAM_FMT` (0 = not streaming).
+
+**Compatibility matrix.** Old module or stock firmware: no announcement, nothing changes. New module + old Teensy: 8 extra reads every
+~2 s while probing, no other change. New Teensy + old avlink: `RNSE_INFO` ignored, no verdict, the unit waits 1 s once per run, then as
+before. New everything: as above.
+
 ---------------------------------------------------------------------------------------------------
 
 ## 5. Pi <-> Teensy USB protocol
@@ -642,6 +706,8 @@ reconnect.
 | 0x83 STATUS | T->Pi, 20 Hz | free pool sectors (credits), newest/served seq, underruns, CRC7 rejects, write CRC errors, hold events, state, bus width |
 | 0x84 CMDLOG | T->Pi | {u32 t_us, u8 idx (bit6 = ACMD), u32 arg, u8 responded} records (bring-up; can be disabled) |
 | 0x85 SERVED | T->Pi | u32 sf_seq, u32 t_us of its first start bit (latency) |
+| 0x08 HS_VERDICT | Pi->T | 8 B: u32 build_id, u16 check, u8 verdict (1 accept, 2 reject), u8 fmt (0 = none). Answers RNSE_INFO (4.5). An older Teensy ignores it |
+| 0x86 RNSE_INFO | T->Pi | 32 B, versioned: u16 ver 1, u16 size 32, u32 build_id, u8 fmt, u8 fmt_min, u8 hs_ver, u8 0, u32 fw_id, u16 table_ver, u16 check, u32 count, u32 age_ms, u32 0. A later layout keeps these 32 B first and raises size. An older avlink ignores it |
 
 IMPLEMENTED 2026-11-04 (`pi/avlink/tlink.h` = `teensy/sdemu/avstream.h`): CONFIG = 16 B {u16 hold_cut_ms (30),
 u16 hold_future_ms (20), u16 silent_ms (100), u16 stale_ms (200), u8 status_hz (20), 7 B reserved; 0 = keep}.

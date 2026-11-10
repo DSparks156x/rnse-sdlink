@@ -148,6 +148,10 @@ static int on_msg(link_t *l, uint16_t type, const uint8_t *p, uint32_t len)
         l->n_served++;
         l->last_served_seq = rd32le(p);
         l->last_served_t = rd32le(p + 4);
+    } else if (type == TL_RNSE_INFO && len >= sizeof(tl_rnse_info)) {
+        tl_rnse_info r;
+        memcpy(&r, p, sizeof r);
+        if (r.ver == 1 && r.size >= sizeof r) { l->rnse = r; l->n_rnse++; }   /* a newer layout keeps these 32 B first */
     }
     /* HOST_WRITE / UPLINK / CMDLOG: out of scope here (uplink agent) -- ignored */
     return 0;

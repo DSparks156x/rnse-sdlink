@@ -211,6 +211,15 @@ static void print_link(void) {
            (unsigned long)s.hold_timeouts, (unsigned long)s.notready, (unsigned long)s.expired, (unsigned long)s.idle,
            (unsigned long)s.evicted, (unsigned long)s.converted, (unsigned long)s.rx_errors);
   Serial.println(line);
+  AvsRnseInfo ri;                                    // version handshake (docs/PROTOCOL.md 4.5)
+  if (AVS.hs_info(&ri)) {
+    uint32_t v = AVS.hs_verdict_word();
+    snprintf(line, sizeof line, "  rnse module build %08lX fmt %u (min %u) table %lX/%u hs %u count %lu age %lu ms verdict %s",
+             (unsigned long)ri.build_id, ri.fmt, ri.fmt_min, (unsigned long)ri.fw_id, ri.table_ver, ri.hs_ver,
+             (unsigned long)ri.count, (unsigned long)ri.age_ms,
+             (v >> 16) != ri.check ? "pending" : (v & 0xFF) == AVS_HS_ACCEPT ? "accept" : (v & 0xFF) == AVS_HS_REJECT ? "reject" : "pending");
+  } else snprintf(line, sizeof line, "  rnse module: no version announced");
+  Serial.println(line);
   for (int i = 0; i < AVS_NSLOT; i++) {
     const AvsSlot *t = AVS.slot(i);
     if (!t->used) continue;

@@ -23,6 +23,7 @@ FILES
   sf.c/.h    superframe header + TLVs + payload layout, CRC-32s        wire.c/.h  wire4 / wire1 images (table CRC16)
   audio.c/.h the audio stage (only place that makes audio bytes)      link.c/.h  TLNK framing, tty setup, credits
   tlink.h    message layout (= teensy/sdemu/avstream.h)                crc.c/.h   CRC-32 / CRC16 (no zlib needed)
+  rnse_ver.h the RNS-E module's version announcement: format choice, log line, --rnse-file, verdict (docs/PROTOCOL.md 4.5)
   test/run_tests.py   all PC checks (see below)
 
 BUILD (Pi OS Bookworm: gcc + make preinstalled; WSL the same)

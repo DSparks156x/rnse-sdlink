@@ -329,6 +329,7 @@ static int build_img(Img &im, uint32_t lba) {
   } else {
     uint8_t sec[512];
     gen_sector(lba, sec, K.pattern, fx_info_sector);
+    if (lba - AVS_HS_LBA < AVS_HS_SECT) AVS.hs_patch(lba, sec);   // version handshake: read 7 gets the ack, the rest stays as it was
     im.n = (uint16_t)(S.bus4 ? wire4(sec, 512, im.w) : wire1(sec, 512, im.w));
   }
   return 1;

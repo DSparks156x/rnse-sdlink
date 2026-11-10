@@ -1,6 +1,9 @@
 #include "avsd.h"
 #include "sdmem_target.h"
-#define FW_SD_WRITE 0x80653776u
+#ifndef FWTAB
+#error "sdmem_target.c is table-only now (build -DFWTAB); r57 literal: FW_SD_WRITE 0x80653776"
+#endif
+#define FW_SD_WRITE FW(FWE_SD_WRITE)
 static int target_read(void *ctx,u32 a,u8 *dst,u32 n) {
     const volatile u8 *p=(const volatile u8 *)P2(a);
     (void)ctx;while(n--) *dst++=*p++;

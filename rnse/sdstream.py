@@ -26,7 +26,8 @@ MODES = {'verify': F_PAYCRC, 'decode': F_PAYCRC | F_DECODE | F_TLVCRC,
          'audio': F_PAYCRC | F_DECODE | F_AUDIO, 'av': F_PAYCRC | F_DECODE | F_AUDIO | F_DISPLAY}
 ERRS = {0: 'ok', 1: 'no CTL block', 2: 'bad parameters', 3: 'card-detect gate: no card', 4: 'PCM sink busy (MP3 player '
         'holds it)', 5: 'Snd_opn failed', 6: 'no initial credits within 300 ms', 7: '5 raw reads in a row failed',
-        8: 'stopped by host', 9: 'Snd_dyD returned -1', 10: 'source changed by the user (clean exit)'}
+        8: 'stopped by host', 9: 'Snd_dyD returned -1', 10: 'source changed by the user (clean exit)',
+        11: 'no/bad firmware table (SDLink v2: CTL words 62/63; reason in word 8)'}
 F = ['seq', 'sf_ok', 'hdr_bad', 'retry', 'expired', 'seq_mism', 'rd_calls', 'rd_err', 'rd_sect', 'rd_cnt_lo',
      'rd_cnt_max', 'v_dec', 'v_dec_err', 'v_crc_bad', 'v_drop', 'v_repeat', 'v_late', 'dec_max', 'dec_lo', 'dec_hi',
      'v_shown', 'tlv_ok', 'tlv_bad', 'a_crc_bad', 'a_in', 'a_under', 'a_blocks', 'a_credits', 'a_fill', 'a_min',

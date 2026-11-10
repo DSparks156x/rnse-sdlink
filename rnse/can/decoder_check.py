@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Read the installed SDLink decoder's sector 96 CRC32 as a firmware fingerprint.
+"""Read the installed SDLink module sector (107) CRC32 as a firmware fingerprint.
 
 Uses only the existing B1 read-memory command (r44+ replies on 0x7B6). No
 upload, flash write, reset, or stream-control command is sent. Reading all
@@ -27,7 +27,7 @@ import zlib
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import pi_memread_block as pm  # noqa: E402
 
-DECODER_SECTOR = 96
+DECODER_SECTOR = 107   # SDLink module (was 96 on r61..r64 units with the old module)
 SECTOR_SIZE = 0x20000
 DECODER_ADDRESS = 0x80000000 + DECODER_SECTOR * SECTOR_SIZE
 
@@ -37,7 +37,7 @@ class DecoderReadError(Exception):
 
 
 def read_decoder_crc(bus, timeout=1.0, retries=3):
-    """CRC32 of every byte in sector 96; incomplete reads never produce a CRC."""
+    """CRC32 of every byte of the module sector; incomplete reads never produce a CRC."""
     crc = 0
     for offset in range(0, SECTOR_SIZE, pm.MAX_LEN):
         address = DECODER_ADDRESS + offset

@@ -17,6 +17,19 @@
 #include "rnv2sh.h"
 #include "sdmem_target.h"
 
+/* SDLink v2: every firmware address and firmware-specific constant comes from the firmware table (fwtab.h), copied to g_fwt by
+ * fwt_load() before anything else runs. The pointer is in CTL word CTL_FWT (and its complement in CTL_FWT + 1), written by the
+ * loader (tvauto.c tva_task; on the bench, the host). Bench-only options that still use r57 literals are refused here. */
+#ifndef FWTAB
+#error "sdstream.c is table-only (build -DFWTAB)"
+#endif
+#if defined(SD_FASTSTUCK) || defined(SD_TRACE)
+#error "SD_FASTSTUCK / SD_TRACE use r57 literals: not with the table build"
+#endif
+u32 g_fwt[FWT_NWORDS];
+static u32 g_fwt_ok;
+#define CTL_FWT 62u                 /* CTL word: table address; word 63 = its complement */
+
 #define PROG_SDSTREAM 6
 
 enum { F_DECODE = 1, F_AUDIO = 2, F_DISPLAY = 4, F_TLVCRC = 8, F_PAYCRC = 16, F_PACE = 32, F_PREF = 64, F_MEM = 128, F_STANDBY = 512 };
@@ -36,7 +49,7 @@ enum { S_SEQ = 8, S_SF_OK, S_HDR_BAD, S_RETRY, S_EXPIRED, S_SEQ_MISM, S_RD_CALLS
        S_STUCK_N, S_STUCK_MS, S_STUCK_LBA, S_STUCK_CNT, S_SDR0, S_SDR1, S_SDR2, S_SDR3, S_SDR4, S_SDR5, S_SDR6, S_SDR7,
        S_FL_N, S_FL_WAIT, S_FL_F14, S_FL_F20, S_FL_F34, S_FL_F50, S_FL_MAX, S_FL_BLK,
        S_SESS, S_R_MIN, S_R_ZERO, S_RATE_MHZ, S_CTX_CHG, S_CTX_A, S_CTX_B, S_DU_FIX, S_A_RESYNC, S_MUTE_A, S_KEYS, S_RESTARTS };
-enum { E_OK, E_NOCTL, E_PARAM, E_NOCARD, E_SINK_BUSY, E_OPN, E_NO_CREDIT, E_READ, E_STOPPED, E_DYD, E_SRC_LEFT };
+enum { E_OK, E_NOCTL, E_PARAM, E_NOCARD, E_SINK_BUSY, E_OPN, E_NO_CREDIT, E_READ, E_STOPPED, E_DYD, E_SRC_LEFT, E_NOFWT };
 enum { L_SEQ, L_FLAGS, L_EV, L_RD, L_DEC, L_FILL, L_TOTAL, L_TICK };
 /* L_EV bits */
 enum { EV_HDR_BAD = 1, EV_RETRY = 2, EV_VDEC = 4, EV_VERR = 8, EV_VCRC = 16, EV_VDROP = 32, EV_LATE = 64,
@@ -59,23 +72,23 @@ static u32 a_k;                      /* next block buffer */
 static u32 replaced[3], front;
 static volatile u32 credits;
 /* video frame reassembly (frames spanning several superframes): two 768 KiB buffers, ping-pong */
-#define ASM0 0x8F800000u
-#define ASM1 0x8F8C0000u   /* ends 8F980000; firmware sink ring starts 8F9DA320 (bench 2026-11-05) */
+#define ASM0 ((u32)SDL_ASM0)
+#define ASM1 ((u32)SDL_ASM1)   /* ends 8F980000; firmware sink ring starts 8F9DA320 (bench 2026-11-05) */
 #define ASM_MAX 0xC0000u
 static u32 asm_on, asm_tot, asm_have, asm_span, asm_key, asm_buf;
 
 /* DSP input select through the V850 (AUDIO_ROUTE_RE.txt, untested until 2026-11-05): idx 3 = controller source 4 = IIS */
-#define FW_SRCSEL   0x805F3A94u
-#define FW_SRCIDX   0x805F782Eu
-#define SRC_CACHE   (*(volatile u8 *)0x8E9F08C4u)
-#define SRC_STATUS  (*(volatile u8 *)0x8E9F08CCu)
-#define SRC_OVERLAY (*(volatile u8 *)0x8E9DFF54u)
+#define FW_SRCSEL   FW(FWE_SRCSEL)
+#define FW_SRCIDX   FW(FWE_SRCIDX)
+#define SRC_CACHE   (*(volatile u8 *)FW(FWE_SRC_CACHE))
+#define SRC_STATUS  (*(volatile u8 *)FW(FWE_SRC_STATUS))
+#define SRC_OVERLAY (*(volatile u8 *)FW(FWE_SRC_OVERLAY))
 #define SRCSEL(i)   ((int (*)(int))FW_SRCSEL)(i)
 #define SRCIDX(s)   ((int (*)(int))FW_SRCIDX)(s)
 static u32 iis_req, iis_nohop, iis_idx, iis_t0, iis_check, src_saved, iis_st, ctx_t;
 static volatile u32 iis_on, src_left;
-#define SRC_CTX     (*(volatile u8 *)0x8E9DFF52u)   /* 07 = TV, 01 = FM, 06 = MP3 */
-#define CTX_WORD    (*(volatile u32 *)0x8E9DFF50u)
+#define SRC_CTX     (*(volatile u8 *)FW(FWE_SRC_CTX))   /* FWE_SRC_TV (07) = TV, 01 = FM, 06 = MP3 */
+#define CTX_WORD    (*(volatile u32 *)FW(FWE_CTX_WORD))
 #define IIS_LEAD_FRAMES 4800u                        /* SSI must run first: an idle SSI makes the DSP fall back */
 
 /* Route state machine, never blocks: it runs in the audio task, so the sink and the reader keep going during the switch. A blocking hop used to
@@ -92,27 +105,27 @@ static void iis_service(void)
         src_saved = SRC_CTX;
         ST(S_CTX_A) = CTX_WORD;
         iis_idx = (u32)SRCIDX((int)ST(S_IIS_SAVED)) & 0xFF;
-        if (ST(S_IIS_SAVED) == 4 && SRC_CTX == 7) { iis_idx = 6; ST(S_IIS_SAVED) = 8; }   /* a dead program left IIS selected on the TV source: restore means TV */
+        if (ST(S_IIS_SAVED) == FW(FWE_CTRL_IIS) && SRC_CTX == FW(FWE_SRC_TV)) { iis_idx = FW(FWE_SRCSEL_TV); ST(S_IIS_SAVED) = FW(FWE_CTRL_TV); }   /* a dead program left IIS selected on the TV source: restore means TV */
         ST(S_SSI_CR) = R32(SSI_CR); ST(S_SSI_SR) = R32(SSI_SR);
-        ST(S_E219_A) = *(volatile u8 *)0x8E9E0219u;
-        ST(S_MUTE_A) = ((u32)*(volatile u8 *)0x8E9E0216u << 8) | *(volatile u8 *)0x8E9E0217u;
-        if (ST(S_IIS_SAVED) != 3 && !iis_nohop) { SRCSEL(2); iis_t0 = now; iis_st = 1; return; }   /* hop through the FM input first (see BENCH_HANDOFF) */
+        ST(S_E219_A) = *(volatile u8 *)FW(FWE_AUD_E219);
+        ST(S_MUTE_A) = ((u32)*(volatile u8 *)FW(FWE_AUD_E216) << 8) | *(volatile u8 *)FW(FWE_AUD_E217);
+        if (ST(S_IIS_SAVED) != FW(FWE_CTRL_FM) && !iis_nohop) { SRCSEL((int)FW(FWE_SRCSEL_FM)); iis_t0 = now; iis_st = 1; return; }   /* hop through the FM input first (see BENCH_HANDOFF) */
         iis_st = 3;
         return;
     case 1:
-        if (SRC_STATUS == 3 || now - iis_t0 >= 1500) { iis_t0 = now; iis_st = 2; }
+        if (SRC_STATUS == FW(FWE_CTRL_FM) || now - iis_t0 >= 1500) { iis_t0 = now; iis_st = 2; }
         return;
     case 2:
         if (now - iis_t0 >= 300) iis_st = 3;
         return;
     case 3:
-        ST(S_IIS_RET) = (u32)SRCSEL(3);
+        ST(S_IIS_RET) = (u32)SRCSEL((int)FW(FWE_SRCSEL_IIS));
         iis_on = 1; iis_t0 = iis_check = ctx_t = now; iis_st = 4;
-        ST(S_E219_B) = *(volatile u8 *)0x8E9E0219u;
+        ST(S_E219_B) = *(volatile u8 *)FW(FWE_AUD_E219);
         return;
     }
     if (iis_st != 4) return;
-    if (!ST(S_IIS_MS) && SRC_STATUS == 4) ST(S_IIS_MS) = now - iis_t0 + 1;
+    if (!ST(S_IIS_MS) && SRC_STATUS == FW(FWE_CTRL_IIS)) ST(S_IIS_MS) = now - iis_t0 + 1;
     if (now - iis_check >= 5) {                        /* user left the source: stop at once, never fight it */
         iis_check = now;
         if (SRC_CTX != src_saved) {
@@ -121,17 +134,17 @@ static void iis_service(void)
             return;
         }
         ctx_t = now;
-        if (SRC_CACHE != 4 && SRC_OVERLAY == 0 && now - iis_t0 >= 500) { SRCSEL(3); iis_t0 = now; ST(S_IIS_REISSUE)++; }   /* firmware re-selected, same source: re-assert */
+        if (SRC_CACHE != FW(FWE_CTRL_IIS) && SRC_OVERLAY == 0 && now - iis_t0 >= 500) { SRCSEL((int)FW(FWE_SRCSEL_IIS)); iis_t0 = now; ST(S_IIS_REISSUE)++; }   /* firmware re-selected, same source: re-assert */
     }
 }
 
 /* bench only: host writes KEYREQ. 0xAC000100|mask = press + release a panel key through queue 6 (r31 design A1), 0xAC000200 = select TV */
-#define KEYREQ   (*(volatile u32 *)0x8F72FFF0u)
-#define FW_QPOST 0x8054BAC6u
+#define KEYREQ   (*(volatile u32 *)SDL_KEYREQ)
+#define FW_QPOST FW(FWE_QPOST)
 struct kslot { unsigned short busy; u8 bm[6]; };
-#define key_slot (*(volatile struct kslot *)0x8F72FFF4u)   /* fixed, so the host can see whether ACON consumed it */
+#define key_slot (*(volatile struct kslot *)SDL_KSLOT)   /* fixed, so the host can see whether ACON consumed it */
 static u32 key_msg[2], key_t, key_on;
-#define FW_PANEL 0x805FB0CCu                            /* the panel driver's own callback: bitmap6 */
+#define FW_PANEL FW(FWE_PANEL)                           /* the panel driver's own callback: bitmap6 */
 static u8 key_bm[8] __attribute__((aligned(4)));
 static void key_service(void)
 {
@@ -142,18 +155,18 @@ static void key_service(void)
     }
     if (key_on == 1 && tick() - key_t >= 100 && !key_slot.busy) {
         key_on = 0; key_slot.busy = 1; key_slot.bm[0] = 0;
-        ((int (*)(int, void *))FW_QPOST)(6, key_msg);
+        ((int (*)(int, void *))FW_QPOST)((int)FW(FWE_KEYQ), key_msg);
     }
     if ((v >> 24) != 0xACu || key_on || key_slot.busy) return;
     KEYREQ = 0; ST(S_KEYS)++;
     if ((v & 0xF00u) == 0x100u) {
         u32 i; for (i = 0; i < 6; i++) key_slot.bm[i] = 0;
         key_slot.busy = 1; key_slot.bm[0] = (u8)v;
-        key_msg[0] = 0x00010001u; key_msg[1] = (u32)&key_slot;
-        ((int (*)(int, void *))FW_QPOST)(6, key_msg);
+        key_msg[0] = FW(FWE_KEYMSG); key_msg[1] = (u32)&key_slot;
+        ((int (*)(int, void *))FW_QPOST)((int)FW(FWE_KEYQ), key_msg);
         key_on = 1; key_t = tick();
     } else if ((v & 0xF00u) == 0x200u) {
-        ((int (*)(int, int))0x80594D26u)((int)SRC_CTX, 13);
+        ((int (*)(int, int))FW(FWE_TVSEL))((int)SRC_CTX, (int)FW(FWE_TVSEL_ARG));
     } else if ((v & 0xF00u) == 0x300u) {                /* press through the driver callback, release 120 ms later */
         u32 i; for (i = 0; i < 8; i++) key_bm[i] = 0;
         key_bm[0] = (u8)v;
@@ -162,7 +175,7 @@ static void key_service(void)
     } else if ((v & 0xF00u) == 0x400u) {                /* simulate: source byte (session logic only) */
         SRC_CTX = (u8)v;
     } else if ((v & 0xF00u) == 0x500u) {                /* simulate: firmware takes the plane (shadow only, no commit) */
-        R32(0x8E8E7D14u) = 0x04004031u;
+        R32(FW(FWE_SH_MR)) = FW(FWE_MR_TV_A);
     }
 }
 
@@ -201,7 +214,7 @@ static void a_push(const u8 *p, u32 frames)
         a_prev_w = w;
     }
     if (g_scan) {                                       /* bench: a steady tone must not jump at the input */
-        volatile u32 *d = (volatile u32 *)0x8F72FFD0u;
+        volatile u32 *d = (volatile u32 *)SDL_SCANW;
         static s32 prev;
         for (i = 0; i < frames; i++) {
             s32 v = (s16)(fifo[(a_wr + i) & (AFIFO_FRAMES - 1)] >> 16), j = v - prev;
@@ -219,9 +232,9 @@ static volatile u32 a_flush, a_stop;
 /* Sink ring (DSP_DEC, RE 2026-11-05, read live: element size 16384, n 16): Snd_dyD posts one element per block, and a credit comes back while the ring has room,
  * so feeding by credit alone keeps the ring FULL: 16 blocks + byte FIFO. That was the ~0.65 s of audio delay, and swallowing those blocks at start also emptied our FIFO,
  * which made the rate loop run at its -0.4% clamp for the first ~40 s (mic: 1 kHz -> 995.86 Hz). Now a block goes in only while the ring holds fewer than sink_max blocks. */
-#define RING_RD   (*(volatile u32 *)0x8EA1987Cu)
-#define RING_WR   (*(volatile u32 *)0x8EA19880u)
-#define RING_N    (*(volatile u32 *)0x8EA19878u)
+#define RING_RD   (*(volatile u32 *)FW(FWE_RING_RD))
+#define RING_WR   (*(volatile u32 *)FW(FWE_RING_WR))
+#define RING_N    (*(volatile u32 *)FW(FWE_RING_N))
 static u32 sink_max;
 
 /* Rate match. Real sink rate is about 47994 Hz against 48000 from the Pi (mic, tone, clamp known; the old 48.11 kHz came from blocks vanishing into the ring). A cubic read of the FIFO,
@@ -344,11 +357,11 @@ static void fs_watch(void);
 #define SD_LEAVETRACE
 #endif
 #if defined(SD_LEAVETRACE)
-#define SH0_MR    0x8E8E7D14u
-#define SH0_DSA0  0x8E8E7E24u
-#define SH0_DPPR  0x8E8E7FCCu
-#define SH0_MASK  0x8E8E97D4u
-#define SH0_LAYER 0x8E8E9804u
+#define SH0_MR    FW(FWE_SH_MR)
+#define SH0_DSA0  FW(FWE_SH_DSA0)
+#define SH0_DPPR  FW(FWE_SH_DPPR)
+#define SH0_MASK  FW(FWE_SH_MASK)
+#define SH0_LAYER FW(FWE_SH_LAYER0)
 /* 0 = array 0 is still as we left it, 1 = the firmware registered a surface on it (80523C3E and friends write MR), 2 = it released the layer (8052322C / 80520D7C clear layer state and the DPPR bit, MR stays ours) */
 static inline u32 lf_fw_state(void)
 {
@@ -356,7 +369,7 @@ static inline u32 lf_fw_state(void)
     if (R32(SH0_LAYER) != 1 || !(R32(SH0_DPPR) & 8u)) return 2;
     return 0;
 }
-#define LT ((volatile u32 *)0x8F7FF800u)
+#define LT ((volatile u32 *)SDL_LT)
 #define LT_RING 32u   /* 60 entries of 8 words: tick, sh MR, sh DSA0, sh DPPR, layer | mask << 8 | src << 16 | screen << 24, hw MR, hw DSA0, hw DPPR. Only on a change; our own flips don't count */
 #define LT_NENT 60u
 enum { LT_MAGIC, LT_T_SESS, LT_T_SRC, LT_T_STOP, LT_T_MOVED, LT_SEEN, LT_T_BACK, LT_DONE, LT_T_RDDONE, LT_T_LOOP, LT_T_ROUTE, LT_T_AUDIO, LT_T_SINK, LT_T_END,
@@ -382,7 +395,7 @@ static void lt_sample(void)
 {
     u32 k[8], i, ch = 0;
     k[0] = R32(SH0_MR); k[1] = R32(SH0_DSA0); k[2] = R32(SH0_DPPR);
-    k[3] = (R32(SH0_LAYER) & 255u) | ((R32(SH0_MASK) & 255u) << 8) | ((u32)SRC_CTX << 16) | ((u32)*(volatile u8 *)0x8E9E083Du << 24);
+    k[3] = (R32(SH0_LAYER) & 255u) | ((R32(SH0_MASK) & 255u) << 8) | ((u32)SRC_CTX << 16) | ((u32)*(volatile u8 *)(FW(FWE_SCR_GROUP) + 1u) << 24);
     k[4] = R32(0xFFF80100u); k[5] = R32(0xFFF80120u); k[6] = R32(0xFFF80018u);
     for (i = 0; i < 7; i++) {
         u32 v = (i == 1 || i == 5) ? lt_ours(k[i]) : k[i];
@@ -402,15 +415,15 @@ static void lt_sample(void)
 #define LTS(i) ((void)0)
 #endif
 #ifdef SD_LEAVEFIX
-#define LF_MR      0x8E8E7D14u
-#define LF_DPPR    0x8E8E7FCCu
-#define LF_DIRTY   0x8E8E97D8u
-#define LF_COMMIT  0x80520908u
-static const u32 lf_addr[] = {   /* same words as avlib.c save_addr, in the same order; DPPR is handled apart: only our P1 bit goes back, the other planes' bits are the firmware's */
-    0x8E8E7D14u, 0x8E8E7D3Cu, 0x8E8E7D64u, 0x8E8E7D84u, 0x8E8E7DACu, 0x8E8E7DD4u, 0x8E8E7DFCu, 0x8E8E7E24u, 0x8E8E7E4Cu, 0x8E8E7E74u, 0x8E8E7E9Cu, 0x8E8E7EC4u,
-    0x8E8E7EECu, 0x8E8E7F14u, 0x8E8E7F3Cu, 0x8E8E7F64u, 0x8E8E7F84u, 0x8E8E7FA4u, 0x8E8E97D4u, 0x8E8E9804u,
+#define LF_MR      FW(FWE_SH_MR)
+#define LF_DPPR    FW(FWE_SH_DPPR)
+#define LF_DIRTY   FW(FWE_SH_DIRTY)
+#define LF_COMMIT  FW(FWE_DU_COMMIT)
+static const u8 lf_idx[] = {   /* same words as avlib.c save_idx, in the same order; DPPR is handled apart: only our P1 bit goes back, the other planes' bits are the firmware's */
+    FWE_SH_MR, FWE_SH_MWR, FWE_SH_ALPHAR, FWE_SH_DSXR, FWE_SH_DSYR, FWE_SH_DPXR, FWE_SH_DPYR, FWE_SH_DSA0, FWE_SH_DSA1, FWE_SH_DSA2, FWE_SH_SPXR, FWE_SH_SPYR,
+    FWE_SH_WASPR, FWE_SH_WAMWR, FWE_SH_BTR, FWE_SH_TC1R, FWE_SH_TC2R, FWE_SH_MLR, FWE_SH_MASK, FWE_SH_LAYER0,
 };
-#define LF_NSAVE (sizeof lf_addr / sizeof lf_addr[0])
+#define LF_NSAVE (sizeof lf_idx / sizeof lf_idx[0])
 static u32 lf_saved[LF_NSAVE], lf_saved_p1;
 static inline u32 lf_cli(void) { u32 sr, n; __asm__ volatile("stc sr,%0" : "=r"(sr)); n = sr | 0xF0u; __asm__ volatile("ldc %0,sr" : : "r"(n)); return sr; }
 static inline void lf_sti(u32 sr) { __asm__ volatile("ldc %0,sr" : : "r"(sr)); }
@@ -418,12 +431,13 @@ static inline void lf_commit(void) { R32(LF_DIRTY) |= 3u; ((int (*)(int))LF_COMM
 static int lf_takeover(u32 phys)   /* avlib du_takeover, except it can be taken again without du_restore having run */
 {
     u32 i;
-    for (i = 0; i < LF_NSAVE; i++) lf_saved[i] = R32(lf_addr[i]);
+    for (i = 0; i < LF_NSAVE; i++) lf_saved[i] = R32(FW(lf_idx[i]));
     lf_saved_p1 = R32(LF_DPPR) & 8u;
-    R32(0x8E8E7D14u) = DU_MR_YUY2; R32(0x8E8E7D3Cu) = 800; R32(0x8E8E7D64u) = 0xFF; R32(0x8E8E7D84u) = 800; R32(0x8E8E7DACu) = 480; R32(0x8E8E7DD4u) = 0; R32(0x8E8E7DFCu) = 0;
-    R32(0x8E8E7E24u) = phys; R32(0x8E8E7E4Cu) = phys; R32(0x8E8E7E74u) = phys;
-    R32(0x8E8E7EECu) = 0x3FF0; R32(0x8E8E7F14u) = 0xFFF; R32(0x8E8E7F84u) = 0x7C1F; R32(0x8E8E7FA4u) = 480;
-    R32(LF_DPPR) |= 8u; R32(0x8E8E9804u) = 1; R32(0x8E8E97D4u) = 0;
+    R32(FW(FWE_SH_MR)) = DU_MR_YUY2; R32(FW(FWE_SH_MWR)) = 800; R32(FW(FWE_SH_ALPHAR)) = 0xFF; R32(FW(FWE_SH_DSXR)) = 800; R32(FW(FWE_SH_DSYR)) = 480;
+    R32(FW(FWE_SH_DPXR)) = 0; R32(FW(FWE_SH_DPYR)) = 0;
+    R32(FW(FWE_SH_DSA0)) = phys; R32(FW(FWE_SH_DSA1)) = phys; R32(FW(FWE_SH_DSA2)) = phys;
+    R32(FW(FWE_SH_WASPR)) = 0x3FF0; R32(FW(FWE_SH_WAMWR)) = 0xFFF; R32(FW(FWE_SH_TC2R)) = 0x7C1F; R32(FW(FWE_SH_MLR)) = 480;
+    R32(LF_DPPR) |= 8u; R32(FW(FWE_SH_LAYER0)) = 1; R32(FW(FWE_SH_MASK)) = 0;
     lf_commit();
     return 0;
 }
@@ -432,7 +446,7 @@ static void lf_flip(u32 phys)
 {
     u32 sr = lf_cli();
     if (du_up && !lf_fw_state()) {
-        R32(0x8E8E7E24u) = phys; R32(0x8E8E7E4Cu) = phys; R32(0x8E8E7E74u) = phys;
+        R32(FW(FWE_SH_DSA0)) = phys; R32(FW(FWE_SH_DSA1)) = phys; R32(FW(FWE_SH_DSA2)) = phys;
         R32(0xFFF80000u) |= 0x10000u;
         R32(0xFFF80120u) = phys; R32(0xFFF80124u) = phys; R32(0xFFF80128u) = phys;
         R32(0xFFF80000u) &= ~0x10000u;
@@ -466,7 +480,7 @@ void audio_main(void)
     a_stop = 2;
     ((void (*)(void))FW_EXT_TSK)();
 }
-__asm__(".text\n.align 2\n_audio_entry:\n  mov.l 1f,r15\n  mov.l 2f,r0\n  jmp @r0\n  nop\n  .align 2\n1: .long 0x8F9B6000\n2: .long _audio_main\n");
+__asm__(".text\n.align 2\n_audio_entry:\n  mov.l 1f,r15\n  mov.l 2f,r0\n  jmp @r0\n  nop\n  .align 2\n1: .long " SDL_XSTR(SDL_AU_STACK) "\n2: .long _audio_main\n");
 extern void audio_entry(void);
 
 static void sleep_ms(u32 ms) { u32 t0 = tick(); while (tick() - t0 < ms) dly_tsk(1); }
@@ -506,7 +520,7 @@ static void flip_paced(u32 phys)
 
 /* The firmware takes array 0 back when it leaves the TV screen: it rewrites MR while DSA still points at our YUY2 buffer, which shows as trash until it draws (owner 2026-11-05: about 1 s).
  * So the first sign of that, or of the source changing, gives the plane back at once. No flip after that. If the source is still ours and the TV screen is up 500 ms later (a re-init, not a leave), take it again. */
-#define SCREEN_GROUP (*(volatile unsigned short *)0x8E9E083Cu)
+#define SCREEN_GROUP (*(volatile unsigned short *)FW(FWE_SCR_GROUP))
 #ifdef SD_LEAVEFIX
 static u32 du_lost_t, first_shown_t, g_sess_t0;
 /* Any task. Kind 1, 2: the firmware has moved on, its registers stay as they are, and the last frame stays up until it commits. Kind 0: stock TV state back, as before. */
@@ -517,7 +531,7 @@ static void du_give_back(void)
     du_up = 0; du_lost_t = tick();
     kind = lf_fw_state();
     if (!kind) {
-        for (i = 0; i < LF_NSAVE; i++) R32(lf_addr[i]) = lf_saved[i];
+        for (i = 0; i < LF_NSAVE; i++) R32(FW(lf_idx[i])) = lf_saved[i];
         R32(LF_DPPR) = (R32(LF_DPPR) & ~8u) | lf_saved_p1;
     }
     lf_sti(sr);
@@ -552,7 +566,9 @@ static void du_guard(void)
     }
     {   /* take it again only over the stock TV plane: a TV re-init, not the next screen's UI */
         u32 mr = R32(LF_MR);
-        if ((mr != 0x04004031u && mr != 0x04014031u) || R32(0x8E8E9804u) != 1 || stop_req()) return;
+        /* menus over TV (source key, sound setup) keep the screen word at 09 but release the layer (layer 0, P1 off, MR 04000002):
+         * bench trace 2026-11-10. Only the firmware's own visible TV plane is taken back. */
+        if ((mr != FW(FWE_MR_TV_A) && mr != FW(FWE_MR_TV_B)) || R32(FW(FWE_SH_LAYER0)) != 1 || !(R32(LF_DPPR) & 8u) || stop_req()) return;
     }
 #else
     if (du_up) {
@@ -560,9 +576,15 @@ static void du_guard(void)
         return;
     }
 #endif
-    if (!src_left && iis_st == 4 && SRC_CTX == src_saved && !SRC_OVERLAY && SCREEN_GROUP == 9 && tick() - du_lost_t >= 500) {
-        u32 t = tick();
-        if (t - du_lost_t >= 500) { du_takeover(DSA_PHYS(front)); du_up = 1; ST(S_DU) &= ~0x100u; }
+#ifdef SD_LEAVEFIX
+    /* No 500 ms debounce here: the check above already requires the firmware's own visible stock TV plane, which only a TV (re)init
+     * registers. The wait showed as a ~0.5 s black blink ~1.3 s after connect, when TV startup registers its plane (owner 2026-11-10). */
+#define RETAKE_OK() 1
+#else
+#define RETAKE_OK() (tick() - du_lost_t >= 500)
+#endif
+    if (!src_left && iis_st == 4 && SRC_CTX == src_saved && !SRC_OVERLAY && SCREEN_GROUP == FW(FWE_SCR_TV) && RETAKE_OK()) {
+        du_takeover(DSA_PHYS(front)); du_up = 1; ST(S_DU) &= ~0x100u;
     }
 }
 
@@ -607,8 +629,8 @@ static volatile u32 rd_in, rd_lba, rd_cnt, rd_t0, stuck_seen;
 /* sd_raw_read waits 50 s for a completion that sometimes never comes (bench 2026-11-05: BRE set, ILR set, no end, no error, cause open; it does
  * return -1 and the next read works). Same call it makes (806536C8) with a short timeout: a hang costs one retry, not 50 s of silence.
  * Normal reads stay under 60 ms (30 min soak, holds included). */
-#define FW_SD_RDCORE 0x8067D108u
-#define SD_BUSY(s)   (*(volatile u32 *)((s) == 1 ? 0x8EAAC96Cu : 0x8EAAC970u))
+#define FW_SD_RDCORE FW(FWE_SD_RDCORE)
+#define SD_BUSY(s)   (*(volatile u32 *)((s) == 1 ? FW(FWE_SD_BUSY1) : FW(FWE_SD_BUSY0)))
 #define READ_TO_MS   65   /* normal reads under 31 ms in a 10 min soak; FIFO + ring hold about 90 ms */
 static u32 g_to_test;                                   /* bench: every Nth read gets a 1 ms timeout, to exercise the timeout path */
 #ifdef SD_TRACE
@@ -627,7 +649,7 @@ static int sd_read_to(u32 slot, u32 lba, u32 buf, u32 n)
 #endif
     return ((short)r != 0 || cnt != (int)n) ? -1 : 0;
 }
-#define SD_VARIANT0 0x8EAD1254u                         /* slot 0 clock: byte +2 = 1 -> /4 = 12.5 MHz, bench-proven */
+#define SD_VARIANT0 FW(FWE_SD_VARIANT0)                        /* slot 0 clock: byte +2 = 1 -> /4 = 12.5 MHz, bench-proven */
 #define SDH16(o) (*(volatile unsigned short *)(0xFF90A000u + (o)))
 
 #ifdef SD_FASTSTUCK
@@ -746,7 +768,7 @@ static int timed_read(u32 slot, u32 lba, u32 buf, u32 n)
     if (r) ST(S_RD_ERR)++;
 #ifdef SD_TRACE
     if (r) {                                            /* bench: what a failed read looked like, first 8 */
-        volatile u32 *z = (volatile u32 *)0x8F75B000u;
+        volatile u32 *z = (volatile u32 *)SDL_TR_Z;
         u32 k = z[0]++;
         if (k < 8) {
             z[4 + k * 6] = lba; z[5 + k * 6] = n; z[6 + k * 6] = d;
@@ -762,10 +784,10 @@ static int timed_read(u32 slot, u32 lba, u32 buf, u32 n)
 /* ---------------------------------------------------------------- two tasks (bench 2026-11-05)
  * The CPU idles during SD DMA, and read + decode in one loop did not fit 16.67 ms (map3d 7.6 + 12.6 + 2 ms). Reader task: SD, header,
  * audio and the sink, in a free slot (id 0x2F, prio 0x30, above the decoder) on its own stack. Decoder: task 159, video only. */
-#define RD_TASK     0x2Fu
-#define TCB_OF(id)  (0x8E8D53ACu + (u32)(id) * 0x40u)
-#define FW_STA_TSK  0x804D026Cu
-#define SFRING      0x8F780000u
+#define RD_TASK     FW(FWE_TASK_RD)
+#define TCB_OF(id)  (FW(FWE_TCB_BASE) + (u32)(id) * 0x40u)
+#define FW_STA_TSK  FW(FWE_STA_TSK)
+#define SFRING      ((u32)SDL_SFRING)
 #define NSF         6u
 #ifndef SF_SECT
 #define SF_SECT     170u        /* 170 x 6 ends 8F7FF800, below ASM0. 160 x 6 was the r61 ring */
@@ -783,9 +805,9 @@ static u32 g_nbuf;
 #ifdef SD_TRACE
 /* bench only, not in the flash build: per-iteration traces in the free gap SFRING end..ASM0, frozen shortly after the first expired or CRC-bad event */
 #define TR_N 256u
-#define TR_R ((volatile u32 *)0x8F758000u)
-#define TR_D ((volatile u32 *)0x8F759000u)
-#define TR_H ((volatile u32 *)0x8F75A000u)   /* 0 rn, 1 dn, 2 trig type, 3 trig seq, 4 frozen, 5 ncrc; CRC captures from word 16, 16 words each */
+#define TR_R ((volatile u32 *)SDL_TR_R)
+#define TR_D ((volatile u32 *)SDL_TR_D)
+#define TR_H ((volatile u32 *)SDL_TR_H)   /* 0 rn, 1 dn, 2 trig type, 3 trig seq, 4 frozen, 5 ncrc; CRC captures from word 16, 16 words each */
 static u32 tr_left, tr_pw;
 static void tr_trig(u32 type, u32 seq)
 {
@@ -965,7 +987,7 @@ void reader_main(void)
 }
 
 /* entered by the kernel on the small slot stack: move to our own 64 KiB, between AFIFO and the firmware sink buffers (8F9B6320..) */
-__asm__(".text\n.align 2\n_reader_entry:\n  mov.l 1f,r15\n  mov.l 2f,r0\n  jmp @r0\n  nop\n  .align 2\n1: .long 0x8F9B0000\n2: .long _reader_main\n");
+__asm__(".text\n.align 2\n_reader_entry:\n  mov.l 1f,r15\n  mov.l 2f,r0\n  jmp @r0\n  nop\n  .align 2\n1: .long " SDL_XSTR(SDL_RD_STACK) "\n2: .long _reader_main\n");
 extern void reader_entry(void);
 
 static void decode_slot(const u8 *sf, u32 hf, u32 c_rd, u32 total, u32 seq)
@@ -1071,7 +1093,7 @@ static void decode_slot(const u8 *sf, u32 hf, u32 c_rd, u32 total, u32 seq)
 }
 
 /* One TV visit: open sink, take the display, stream until the time is up, the user leaves the source, or a stop. */
-#define AU_TASK 0x2Eu
+#define AU_TASK FW(FWE_TASK_AU)
 static int start_task(u32 id, void (*entry)(void), u32 *saved)
 {
     u32 tcb = TCB_OF(id);
@@ -1090,7 +1112,7 @@ static u32 session(void)
     rs_step = 65536; rs_ema = 0; rs_int = 0; rs_frac = 0; rate_c0 = 0;
     iis_on = 0; iis_st = 0; src_left = 0;
 #ifdef SD_TRACE
-    { u32 z; for (z = 0; z < 16; z++) TR_H[z] = 0; tr_left = 0; tr_pw = 0; *(volatile u32 *)0x8F75B000u = 0; }
+    { u32 z; for (z = 0; z < 16; z++) TR_H[z] = 0; tr_left = 0; tr_pw = 0; *(volatile u32 *)SDL_TR_Z = 0; }
 #endif
     r_w = r_r = 0; rd_done = 0; rd_err = 0; rd_in = 0; stuck_seen = 0;
     asm_on = 0; fl_have = 0; need_key = g_wrap ? 0 : 1;     /* mid-stream start: wait for a key instead of decoding deltas on black */
@@ -1107,7 +1129,7 @@ static u32 session(void)
         u32 t0;
         ST(S_SINK0) = R32(DMDL_HANDLE);
         ST(S_P904_A) = R32(0xFF909004u);
-        if (iis_req) ((void (*)(void))0x8062D848u)();   /* stock player's once-per-boot enable (FF909004 bit 2); read from code, see AUDIO_ROUTE_RE (c) */
+        if (iis_req) ((void (*)(void))FW(FWE_IIS_EN))();   /* stock player's once-per-boot enable (FF909004 bit 2); read from code, see AUDIO_ROUTE_RE (c) */
         ST(S_P904_B) = R32(0xFF909004u);
         /* Snd_opn fails while the player holds the stream (bench 2026-11-05): --steal closes the player's handle first */
         if (g_steal && (ST(S_SINK0) >> 24) == 2u) {
@@ -1116,7 +1138,12 @@ static u32 session(void)
             dly_tsk(5);
         }
         pblock[0] = (u32)cb; pblock[1] = 0x100; pblock[2] = 9; pblock[3] = 0; pblock[4] = 0; pblock[5] = 1;
-        pblock[6] = 0; pblock[7] = p1c; pblock[8] = 0;
+        /* Public Snd_opn +0x1C enables the SH IIR treble filter, not byte order.
+         * The constructor copies these 9 words to DSP_DEC context +8: public
+         * +0x14 (pblock[5]=1 above) is the worker's +0x1C byte-order flag;
+         * public +0x1C becomes context +0x24, which enables the IIR.
+         * Preserve native BE PCM and the receiver FIR, but keep that IIR off. */
+        pblock[6] = 0; pblock[7] = 0; pblock[8] = 0;
         h = SND_OPN(pblock);
         if (h <= 0) { ST(S_A_HANDLE) = (u32)h; return E_OPN; }
         ST(S_A_HANDLE) = (u32)h;
@@ -1161,7 +1188,7 @@ static u32 session(void)
                     ST(S_SDR4) = ((u32)SDH16(0x2C) << 16) | SDH16(0x2E);   /* ERR_STS1 | ERR_STS2 */
                     ST(S_SDR5) = ((u32)SDH16(0x08) << 16) | SDH16(0x0A);   /* STOP | SECCNT */
                     ST(S_SDR6) = ((u32)SDH16(0x0C) << 16) | SDH16(0x0E);   /* RSP0 | RSP1 */
-                    ST(S_SDR7) = R32(0x8EAD13A0u);   /* driver lock owner words, AUDIO_ROUTE_RE sec 6 */
+                    ST(S_SDR7) = R32(FW(FWE_SD_LOCK0));   /* driver lock owner words, AUDIO_ROUTE_RE sec 6 */
                 }
 #ifdef SD_FASTSTUCK
                 if (!au_up) fs_watch();                /* one caller only: with audio up, the audio task runs it */
@@ -1200,7 +1227,7 @@ close:
     }
     LTS(LT_T_ROUTE);
     if (g_scan) {                                       /* bench: does the FIFO still hold it? finds memory overwritten after the push */
-        volatile u32 *d = (volatile u32 *)0x8F72FFD0u;
+        volatile u32 *d = (volatile u32 *)SDL_SCANW;
         const u32 *f = (const u32 *)AFIFO;
         s32 prev = (s16)(f[0] >> 16);
         for (i = 1; i < AFIFO_FRAMES; i++) {
@@ -1231,15 +1258,47 @@ close:
     return err;
 }
 
+/* Copy the firmware table the loader named in CTL into g_fwt and check it there (magic, version, size, ram map, CRC). tvauto already
+ * checked the same table and its signatures against flash; this guards the hand-off and a host that loads by hand. 0 = ok. */
+static u32 fwt_load(void)
+{
+    const u32 *t = (const u32 *)CTL_W(CTL_FWT);
+    u32 a = (u32)t, i;
+    if (a != ~CTL_W(CTL_FWT + 1)) return 1;
+    if ((a & 3u) || !((a >= 0x80000000u && a < 0x81000000u) || (a >= (u32)SDL_RAM_LO && a + FWT_NWORDS * 4u <= (u32)SDL_RAM_HI))) return 2;
+    for (i = 0; i < FWT_NWORDS; i++) g_fwt[i] = t[i];
+    if (g_fwt[FWT_W_MAGIC] != FWT_MAGIC || g_fwt[FWT_W_VERSION] != FWT_VERSION || g_fwt[FWT_W_NWORDS] != FWT_NWORDS) return 3;
+    if (g_fwt[FWT_W_RAMMAP] != SDL_RAMMAP) return 4;
+    crc32_init();
+    if (crc32_upd(0, (const u8 *)g_fwt, (FWT_NWORDS - 1u) * 4u) != g_fwt[FWT_NWORDS - 1u]) return 5;
+    g_fwt_ok = 1;
+    return 0;
+}
+
+/* crt0 ends here after main (bench path; tvauto calls main itself and ends with its own ext_tsk). Without a table there is no ext_tsk to call. */
+void fwt_exit(void)
+{
+    if (g_fwt_ok) ((void (*)(void))FW_EXT_TSK)();
+    for (;;) __asm__ volatile("sleep");
+}
+
 int main(void)
 {
-    u32 slot, gate, secs, wrap, nbuf, hint, seq, maxsf, err = E_OK, i, t_all = tick(), tv_ctx;
+    u32 slot, gate, secs, wrap, nbuf, hint, seq, maxsf, err = E_OK, i, t_all, tv_ctx;
     (void)secs;
 
+    g_fwt_ok = 0;
+    if ((i = fwt_load()) != 0) {                    /* no tick, no firmware call: status words only */
+        for (seq = 0; seq < 64; seq++) ST(seq) = 0;
+        ST(ST_PROG) = PROG_SDSTREAM; ST(ST_ERR) = E_NOFWT; ST(8) = i; ST(ST_STAGE) = STAGE_ERR; ST(ST_DONE) = DONE_MAGIC | PROG_SDSTREAM;
+        ST(ST_MAGIC) = STAT_MAGIC;
+        return 0;
+    }
+    t_all = tick();
     st_begin(PROG_SDSTREAM);
     if (!ctl_ok()) { st_end(PROG_SDSTREAM, E_NOCTL); return 0; }
     slot = CTL_P(0); gate = CTL_P(1) & 15; g_steal = (CTL_P(1) >> 4) & 1; iis_req = (CTL_P(1) >> 5) & 1; iis_nohop = (CTL_P(1) >> 6) & 1; flags = CTL_P(2); secs = CTL_P(3); wrap = CTL_P(4); p1c = CTL_P(5);
-    lrswap = CTL_P(6) & 255; sink_max = (CTL_P(6) >> 8) & 255; g_tone = (CTL_P(6) >> 16) & 1; g_scan = (CTL_P(6) >> 17) & 1; if (g_scan) { volatile u32 *d = (volatile u32 *)0x8F72FFD0u; for (i = 0; i < 12; i++) d[i] = 0; } blk = CTL_P(7); target = CTL_P(8); nbuf = CTL_P(9); hint = CTL_P(10); seq = CTL_P(11);
+    lrswap = CTL_P(6) & 255; sink_max = (CTL_P(6) >> 8) & 255; g_tone = (CTL_P(6) >> 16) & 1; g_scan = (CTL_P(6) >> 17) & 1; if (g_scan) { volatile u32 *d = (volatile u32 *)SDL_SCANW; for (i = 0; i < 12; i++) d[i] = 0; } blk = CTL_P(7); target = CTL_P(8); nbuf = CTL_P(9); hint = CTL_P(10); seq = CTL_P(11);
     maxsf = CTL_P(12);
     g_to_test = CTL_P(1) >> 8;
     if (!sink_max) sink_max = 3;
@@ -1266,7 +1325,7 @@ int main(void)
     }
     if (flags & F_DECODE) rnv_tables_init();
     g_slot = slot; g_wrap = wrap; g_secs = secs; g_hint = hint; g_seq = seq; g_maxsf = maxsf; g_nbuf = nbuf; g_t_all0 = t_all;
-    tv_ctx = ((flags & F_STANDBY) && !((CTL_P(6) >> 18) & 1)) ? 7u : SRC_CTX;     /* standby = the car: runs from boot, plays only while the TV source is up */
+    tv_ctx = ((flags & F_STANDBY) && !((CTL_P(6) >> 18) & 1)) ? FW(FWE_SRC_TV) : SRC_CTX;     /* standby = the car: runs from boot, plays only while the TV source is up */
     while (1) {
         if (flags & F_STANDBY) {
             /* the source is someone else's until the user comes to TV. Nothing here touches the sink, the display or the SD card. */

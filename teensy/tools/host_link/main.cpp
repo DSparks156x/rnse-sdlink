@@ -6,7 +6,11 @@
 //   NOT_READY/IDLE -> retry after 2 ms, EXPIRED -> jump to the seq in bytes 64..67 (like rnse_proto sdstream.c).
 //   Every served image is checked: decode it, re-encode with sdproto wire4/wire1, must be word-identical
 //   (start word, data, all CRC16 lines, end word, pad).
-// Usage: host_link --ptyfile F --k K --out served.rsav [--bus 4|1] [--start-delay ms] [--stale-ms ms] [--timeout s]
+//   --announce MIN:MAX: before reading, the unit's version handshake (docs/PROTOCOL.md 4.5) as rnse/module/tvauto.c hs_gate does it,
+//   with build F46C419D, fw_id 54B, table 1 and that stream format range; the reads go through the firmware's read_begin and
+//   gen_sector + hs_patch exactly as fxsd.cpp build_img. Prints "HS none|pending|accept|reject"; a reject stays stock (no stream reads),
+//   then counts the SF_BEGINs that still arrive for 1.5 s.
+// Usage: host_link --ptyfile F --k K --out served.rsav [--bus 4|1] [--start-delay ms] [--stale-ms ms] [--timeout s] [--announce MIN:MAX]
 #include <errno.h>
 #include <fcntl.h>
 #include <poll.h>
@@ -83,9 +87,31 @@ static void read_cmd(uint32_t lba, int count, uint8_t *dst) {
   }
 }
 
+// one single-sector read of a non-window LBA, as fxsd.cpp build_img makes it
+static void read_plain(uint32_t lba, uint8_t *dst) {
+  AVS.read_begin(lba);
+  reads++;
+  gen_sector(lba, dst, 0, nullptr);
+  if (lba - AVS_HS_LBA < AVS_HS_SECT) AVS.hs_patch(lba, dst);
+}
+
+// tvauto announce(): 0 none (no ack), 1 pending, 2 accept, 3 reject; *fmt = the Pi's chosen format
+static int announce(int fmt_min, int fmt_max, int *fmt) {
+  uint16_t w[AVS_HS_N] = {(uint16_t)(AVS_HS_W0 | AVS_HS_VER), 0xF46C, 0x419D, (uint16_t)(fmt_min << 8 | fmt_max), 0x0000, 0x054B, 0x0001, 0};
+  uint32_t sum = 0;
+  for (int k = 0; k < AVS_HS_N - 1; k++) sum += w[k];
+  w[AVS_HS_N - 1] = (uint16_t)~sum;
+  uint8_t s[512];
+  for (int k = 0; k < AVS_HS_N; k++) read_plain(AVS_HS_LBA + ((uint32_t)k << 16) + w[k], s);
+  if (be32(s) != AVS_HS_ACK) return 0;
+  for (int k = 0; k < AVS_HS_N; k++) if (be16(s + 4 + 2 * k) != w[k]) return 0;
+  *fmt = s[21];
+  return s[20] == AVS_HS_ACCEPT ? 2 : s[20] == AVS_HS_REJECT ? 3 : 1;
+}
+
 int main(int argc, char **argv) {
   const char *ptyfile = nullptr, *outp = nullptr;
-  int k = 0, start_delay = 0, stale = 0, timeout_s = 120;
+  int k = 0, start_delay = 0, stale = 0, timeout_s = 120, hs_min = 0, hs_max = 0;
   for (int i = 1; i + 1 < argc; i += 2) {
     if (!strcmp(argv[i], "--ptyfile")) ptyfile = argv[i + 1];
     else if (!strcmp(argv[i], "--k")) k = atoi(argv[i + 1]);
@@ -94,6 +120,7 @@ int main(int argc, char **argv) {
     else if (!strcmp(argv[i], "--start-delay")) start_delay = atoi(argv[i + 1]);
     else if (!strcmp(argv[i], "--stale-ms")) stale = atoi(argv[i + 1]);
     else if (!strcmp(argv[i], "--timeout")) timeout_s = atoi(argv[i + 1]);
+    else if (!strcmp(argv[i], "--announce")) sscanf(argv[i + 1], "%d:%d", &hs_min, &hs_max);
   }
   if (!ptyfile || !outp || k < 1) { fprintf(stderr, "usage: host_link --ptyfile F --k K --out F [--bus 4|1] ...\n"); return 2; }
   t0_us = mono_us();
@@ -115,6 +142,30 @@ int main(int argc, char **argv) {
   FILE *out = fopen(outp, "wb");
   uint64_t tstart = mono_us();
   while (mono_us() - tstart < (uint64_t)start_delay * 1000u) service(1);   // RNS-E not reading yet
+  if (hs_max) {                                     // tvauto hs_gate: announce every 250 ms until a verdict, at most 1 s
+    static const char *nm[] = {"none", "pending", "accept", "reject"};
+    int v = 0, fmt = 0;
+    uint64_t th = mono_us();
+    for (;;) {
+      v = announce(hs_min, hs_max, &fmt);
+      if (v != 1 || mono_us() - th >= 1000000u) break;
+      uint64_t tw = mono_us();
+      while (mono_us() - tw < 250000u) service(1);
+    }
+    printf("HS %s fmt %d after %lu ms\n", nm[v], fmt, (unsigned long)((mono_us() - th) / 1000u));
+    fflush(stdout);
+    if (v == 3) {                                   // the unit stays stock: no stream reads; what does the Pi still send?
+      uint32_t b0 = AVS.st.begun;
+      uint64_t tw = mono_us();
+      while (mono_us() - tw < 300000u) service(1);  // superframes already queued before the verdict
+      b0 = AVS.st.begun;
+      tw = mono_us();
+      while (mono_us() - tw < 1500000u) service(1);
+      printf("HS begun_after_reject=%u\n", (unsigned)(AVS.st.begun - b0));
+      fclose(out); close(sfd); close(mfd);
+      return 0;
+    }
+  }
   // ---- mode A reader
   uint32_t seq = 0, hint = 178, done = 0;
   int tries = 0, rc = 0;

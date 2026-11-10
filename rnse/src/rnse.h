@@ -12,6 +12,21 @@ typedef unsigned char u8;
 #define R32(a) (*(volatile u32 *)(a))
 #define R16(a) (*(volatile u16 *)(a))
 
+#ifdef FWTAB
+/* ---- firmware through the table (fwtab.h): the RAM program copies it to g_fwt at start (sdstream.c fwt_load) ---- */
+#include "fwtab.h"
+extern u32 g_fwt[];
+#define FWT_BASE_PTR g_fwt
+#define FW_DLY_TSK   FW(FWE_DLY_TSK)
+#define FW_EXT_TSK   FW(FWE_EXT_TSK)
+#define FW_SND_OPN   FW(FWE_SND_OPN)
+#define FW_SND_DYD   FW(FWE_SND_DYD)
+#define FW_SND_STP   FW(FWE_SND_STP)
+#define FW_SND_CLS   FW(FWE_SND_CLS)
+#define FW_SD_READ   FW(FWE_SD_READ)
+#define TICK_MS      FW(FWE_TICK_MS)
+#define DMDL_HANDLE  FW(FWE_DMDL_HANDLE)
+#else
 /* ---- firmware (OSM r56b/r57; identical bytes at the r19 addresses, refind.py) ---- */
 #define FW_DLY_TSK   0x804D04D8u   /* int dly_tsk(ms)  yields */
 #define FW_EXT_TSK   0x804D027Cu   /* void ext_tsk(void) */
@@ -21,23 +36,25 @@ typedef unsigned char u8;
 #define FW_SND_CLS   0x8062D742u   /* int Snd_cls(h) */
 #define FW_SD_READ   0x80653598u   /* int sd_raw_read(u16 slot, s32 lba, void *buf, s32 nsect): 0 ok, -1 error */
 
+#define TICK_MS      0x8E8DA8B0u   /* kernel 1 ms tick counter (u32) */
+#define DMDL_HANDLE  0x8FCE6294u   /* MP3 player's sink handle; 0 = PCM sink free */
+#endif
 #define dly_tsk(ms)  ((int (*)(int))FW_DLY_TSK)(ms)
 
 /* ---- RAM / MMIO ---- */
-#define TICK_MS      0x8E8DA8B0u   /* kernel 1 ms tick counter (u32) */
 #define TMU_TCNT0    0xFFD8000Cu   /* counts down 12487..0 at Pck/4 = 12.4875 MHz, one period per tick */
 #define TMU_PER      12488u
-#define DMDL_HANDLE  0x8FCE6294u   /* MP3 player's sink handle; 0 = PCM sink free */
 #define SSI_CR       0xFF984000u
 #define SSI_SR       0xFF984004u
 #define SSI_CLKW     0xFF972000u
 
 /* ---- our RAM region (inside the doom_ram_v1 free block 0ED20000-0FAC0000, outside Doom's 0EE00000-0F600000,
  *      outside the VIN redirect buffers 0F000000-0F4B9000, below OSM buffers 0FACA800) ---- */
-#define CTL_BASE     0x8F720000u   /* host-written parameters */
-#define STAT_BASE    0x8F720100u   /* program status, read by the host with B1 */
-#define TONE_BUF     0x8F730000u   /* 4 x 16 KiB PCM block buffers (max 4096 frames each) */
-#define SD_BUF       0x8F800000u   /* 2 MiB SD read buffer (4096 sectors), 32-byte aligned -> zero-copy DMA */
+#include "sdl_ram.h"
+#define CTL_BASE     ((u32)SDL_CTL(0))       /* host-written parameters */
+#define STAT_BASE    ((u32)SDL_CTL(0x100))   /* program status, read by the host with B1 */
+#define TONE_BUF     ((u32)SDL_CTL(0x10000)) /* 4 x 16 KiB PCM block buffers (max 4096 frames each) */
+#define SD_BUF       ((u32)SDL_ASM0)         /* 2 MiB SD read buffer (4096 sectors; bench probes only), 32-byte aligned -> zero-copy DMA */
 #define P2(a)        (((u32)(a) & 0x1FFFFFFFu) | 0xA0000000u)
 
 #define CTL_MAGIC    0x43544C31u   /* 'CTL1' */

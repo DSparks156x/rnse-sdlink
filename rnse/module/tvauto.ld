@@ -1,4 +1,4 @@
-/* r61 SDST module: everything read-only at BASE (flash XIP 80C00080, or RAM for the bench harness). No writable sections:
+/* SDLink v2 SDST module (same as r61): everything read-only at BASE (flash XIP 80D60080 = sector 107, see docs/FIRMWARE_CONTRACT.md). No writable sections:
  * state is at fixed RAM addresses (tvauto.c TVA_BASE). */
 ENTRY(_tva_hdr)
 SECTIONS {

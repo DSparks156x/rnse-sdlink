@@ -30,6 +30,7 @@ extern void avs_test_before_lock(void);
 #endif
 
 AvStream AVS;
+#define HS_BARRIER() __asm__ volatile("" ::: "memory")   // handshake seqlock: keep the copies between the hs_gen loads/stores
 
 static const uint8_t MAGIC[4] = {'T', 'L', 'N', 'K'};
 static inline uint32_t le32(const uint8_t *p) { return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24); }
@@ -77,6 +78,8 @@ void AvStream::init(AvsSector *const *b, const uint16_t *bn, int nb, now_fn nowf
   read_gen = 0; read_win = -1; my_gen = 0xFFFFFFFFu; holding = 0; sticky_win = -1; degraded = 0; syn_valid = 0;
   srv_head = srv_tail = 0; last_status_us = 0; last_sent_free = 0xFFFFFFFFu; last_sent_slots = 0xFFFFFFFFu; tx_seq = 0;
   card_state = 0; bus_width = 1; mode = 0; crc7_rejects = 0;
+  hs_n = 0; hs_gen = 0; hs_count = 0; hs_t = 0; hs_ack_lba = 0; hs_have = 0; hs_verdict = 0; hs_sent_count = 0; hs_sent_link = 0;
+  memset(hs_w, 0, sizeof hs_w); memset(hs_ann, 0, sizeof hs_ann);
   uint8_t z[512];
   memset(z, 0, sizeof z);
   zero_n4 = (uint16_t)wire4(z, 512, zero_w4);
@@ -196,6 +199,8 @@ void AvStream::reset_link(void) {
   syn_valid = 0;
   AVS_UNLOCK();
   link_active = 0;
+  hs_verdict = 0;          // that Pi's verdict goes with it; the announcement stays and goes to the next sender
+  hs_sent_link = 0;
   // The sender may have died inside a message. A parser left mid-WIRE would swallow the next sender's CONFIGs as sector
   // data, up to 100 s at the 200 ms resend. Hunt for the magic again and give back the sector being copied.
   if (ps == 4 && cur_sec >= 0) free_sector((uint16_t)cur_sec);
@@ -367,6 +372,18 @@ void AvStream::on_small(void) {
         if (mlen >= 10 && q[9]) cfg.whole_sf = q[9] == 2;   // 0 = leave as it is (every older sender), 1 = off, 2 = on
       }
       break;
+    case TL_HS_VERDICT:     // AvsHsVerdict: kept only if it answers the newest announcement
+      if (mlen >= 8 && hs_have) {
+        uint16_t ann[AVS_HS_N];
+        uint32_t g = hs_gen;
+        HS_BARRIER();
+        memcpy(ann, hs_ann, sizeof ann);
+        HS_BARRIER();
+        if ((g & 1) || g != hs_gen) break;           // the IRQ is mid-update: the Pi resends on the next INFO
+        if (le32(q) == ((uint32_t)ann[1] << 16 | ann[2]) && le16(q + 4) == ann[7] && q[6] <= AVS_HS_REJECT)
+          hs_verdict = (uint32_t)ann[7] << 16 | (uint32_t)q[7] << 8 | q[6];
+      }
+      break;
     case TL_FLUSH:
       if (mlen >= 4) {
         uint32_t f = le32(q);
@@ -388,6 +405,74 @@ void AvStream::read_begin(uint32_t lba) {
   uint32_t rel = lba - AVS_WIN_LBA;
   read_win = rel < AVS_WIN_SECT ? (int)(rel >> 8) : -1;
   read_gen++;
+  if (lba - AVS_HS_LBA < AVS_HS_SECT) hs_read(lba);
+}
+
+// ---------------------------------------------------------------- version handshake (IRQ side, docs/PROTOCOL.md 4.5)
+// Reads must come in order 0..7; other LBAs in between (FS, probe) do not disturb it, an out-of-order handshake read restarts it.
+void AvStream::hs_read(uint32_t lba) {
+  uint32_t rel = lba - AVS_HS_LBA, i = rel >> 16, v = rel & 0xFFFFu;
+  if (i == 0) {
+    hs_n = (v & 0xFF00u) == AVS_HS_W0 ? 1 : 0;
+    hs_w[0] = (uint16_t)v;
+    return;
+  }
+  if (i != hs_n) { hs_n = 0; return; }
+  hs_w[i] = (uint16_t)v;
+  hs_n++;
+  if (hs_n < AVS_HS_N) return;
+  hs_n = 0;
+  uint32_t sum = 0;
+  for (int k = 0; k < AVS_HS_N - 1; k++) sum += hs_w[k];
+  if (((~sum) & 0xFFFFu) != hs_w[AVS_HS_N - 1]) return;
+  hs_gen++;                                          // odd: main loop readers retry
+  HS_BARRIER();
+  memcpy(hs_ann, hs_w, sizeof hs_ann);
+  hs_count++; hs_t = now ? now() : 0; hs_ack_lba = lba; hs_have = 1;
+  HS_BARRIER();
+  hs_gen++;
+}
+
+int AvStream::hs_patch(uint32_t lba, uint8_t *sec) {
+  if (!hs_have || lba != hs_ack_lba || hs_n != 0) return 0;
+  uint32_t v = hs_verdict;
+  memset(sec, 0, 512);
+  wbe32(sec, AVS_HS_ACK);
+  for (int k = 0; k < AVS_HS_N; k++) wbe16(sec + 4 + 2 * k, hs_ann[k]);
+  if ((v >> 16) == hs_ann[AVS_HS_N - 1]) { sec[20] = (uint8_t)v; sec[21] = (uint8_t)(v >> 8); }   // else pending, no format
+  wbe32(sec + 24, hs_count);
+  return 1;
+}
+
+int AvStream::hs_info(AvsRnseInfo *o) const {
+  uint16_t a[AVS_HS_N];
+  uint32_t g, c, t;
+  do {
+    g = hs_gen;
+    HS_BARRIER();
+    if (!hs_have) return 0;
+    memcpy(a, hs_ann, sizeof a); c = hs_count; t = hs_t;
+    HS_BARRIER();
+  } while ((g & 1) || g != hs_gen);
+  memset(o, 0, sizeof *o);
+  o->ver = 1; o->size = sizeof *o;
+  o->build_id = (uint32_t)a[1] << 16 | a[2];
+  o->fmt = (uint8_t)a[3]; o->fmt_min = (uint8_t)(a[3] >> 8); o->hs_ver = (uint8_t)a[0];
+  o->fw_id = (uint32_t)a[4] << 16 | a[5];
+  o->table_ver = a[6]; o->check = a[7];
+  o->count = c;
+  o->age_ms = now ? (now() - t) / 1000u : 0;
+  return 1;
+}
+
+// main loop: every new announcement goes to the Pi, and the newest one again to every new sender (link_active edge)
+void AvStream::hs_poll(uint32_t t) {
+  (void)t;
+  AvsRnseInfo r;
+  if (!hs_info(&r)) return;
+  if (hs_sent_link && r.count == hs_sent_count) return;
+  send(TL_RNSE_INFO, &r, sizeof r);
+  hs_sent_count = r.count; hs_sent_link = 1;
 }
 
 void AvStream::synth(uint8_t kind, uint32_t seq, uint32_t arg, int bus4, uint32_t *out, uint16_t *n) {
@@ -530,6 +615,7 @@ void AvStream::poll(void) {
     srv_tail = (uint8_t)((srv_tail + 1) & 15);
     send(TL_SERVED, p, 8);
   }
+  hs_poll(t);
   uint32_t period = 1000000u / (cfg.status_hz ? cfg.status_hz : 20);
   uint32_t fs = (uint32_t)(AVS_NSLOT - used_slots());
   if (t - last_status_us >= period ||
@@ -687,9 +773,63 @@ int avs_selftest(char *msg, int ml) {
   a.read_begin(AVS_WIN_LBA + 11 * 256 + 9);
   t_sector(e, 11, 9);
   if (t_get(a, AVS_WIN_LBA + 11 * 256 + 9, 1, b) != AVS_READY || memcmp(b, e, 512)) T_FAIL("FAIL overrun serve");
+  // version handshake (PROTOCOL 4.5): build F46C419D, fmt 1 (min 1), fw_id 0x54B, table 1
+  {
+    uint16_t w[AVS_HS_N] = {(uint16_t)(AVS_HS_W0 | AVS_HS_VER), 0xF46C, 0x419D, 0x0101, 0x0000, 0x054B, 0x0001, 0};
+    uint32_t sum = 0;
+    for (int k = 0; k < AVS_HS_N - 1; k++) sum += w[k];
+    w[7] = (uint16_t)~sum;
+    uint32_t L7 = AVS_HS_LBA + (7u << 16) + w[7];
+    AvsRnseInfo ri;
+    if (a.hs_info(&ri) || a.hs_patch(L7, b)) T_FAIL("FAIL hs before any announcement");
+    for (int k = 0; k < AVS_HS_N; k++) {
+      a.read_begin(AVS_HS_LBA + ((uint32_t)k << 16) + w[k]);
+      if (k == 3) a.read_begin(AVS_WIN_LBA);            // a probe / FS read in between does not disturb it
+    }
+    if (!a.hs_info(&ri) || ri.build_id != 0xF46C419Du || ri.fmt != 1 || ri.fmt_min != 1 || ri.hs_ver != 1 || ri.fw_id != 0x54Bu ||
+        ri.table_ver != 1 || ri.check != w[7] || ri.count != 1 || ri.size != 32 || sizeof(AvsRnseInfo) != 32)
+      T_FAIL("FAIL hs decode");
+    memset(b, 0xEE, sizeof b);
+    if (!a.hs_patch(L7, b) || be32r(b) != AVS_HS_ACK || b[20] != AVS_HS_PENDING || b[21] || be32r(b + 24) != 1) T_FAIL("FAIL hs ack");
+    for (int k = 0; k < AVS_HS_N; k++) if (((b[4 + 2 * k] << 8) | b[5 + 2 * k]) != w[k]) T_FAIL("FAIL hs ack echo %d", k);
+    if (a.hs_patch(L7 - 1, b) || a.hs_patch(AVS_HS_LBA, b)) T_FAIL("FAIL hs patch of another LBA");
+    t_txn = 0;
+    a.poll();
+    int seen = 0;
+    for (int i = 0; i + 16 <= t_txn; i += 16 + (int)le32(t_tx + i + 8))
+      if (le16(t_tx + i + 4) == TL_RNSE_INFO && le32(t_tx + i + 8) == 32 && !memcmp(t_tx + i + 16, &ri, 8)) seen++;
+    if (seen != 1) T_FAIL("FAIL hs INFO to the Pi (%d)", seen);
+    t_txn = 0; a.poll();
+    for (int i = 0; i + 16 <= t_txn; i += 16 + (int)le32(t_tx + i + 8)) if (le16(t_tx + i + 4) == TL_RNSE_INFO) T_FAIL("FAIL hs INFO resent");
+    uint8_t vp[8];
+    wle32(vp, 0xF46C419Eu); wle16(vp + 4, w[7]); vp[6] = AVS_HS_ACCEPT; vp[7] = 1;      // another build: ignored
+    t_feed(a, t_mk(TL_HS_VERDICT, vp, 8), 3);
+    if (a.hs_patch(L7, b) != 1 || b[20] != AVS_HS_PENDING) T_FAIL("FAIL hs verdict for another build");
+    wle32(vp, 0xF46C419Du);
+    t_feed(a, t_mk(TL_HS_VERDICT, vp, 8), 5);
+    if (a.hs_patch(L7, b) != 1 || b[20] != AVS_HS_ACCEPT || b[21] != 1) T_FAIL("FAIL hs accept");
+    vp[6] = AVS_HS_REJECT; vp[7] = 0;
+    t_feed(a, t_mk(TL_HS_VERDICT, vp, 8), 8);
+    if (a.hs_patch(L7, b) != 1 || b[20] != AVS_HS_REJECT || b[21] != 0) T_FAIL("FAIL hs reject");
+    // a bad check word, an out-of-order sequence and a missing start decode nothing
+    for (int k = 0; k < AVS_HS_N; k++) a.read_begin(AVS_HS_LBA + ((uint32_t)k << 16) + (k == 7 ? (uint16_t)(w[7] ^ 1) : w[k]));
+    for (int k = 0; k < AVS_HS_N; k++) a.read_begin(AVS_HS_LBA + ((uint32_t)(k == 2 ? 3 : k) << 16) + w[k]);
+    for (int k = 1; k < AVS_HS_N; k++) a.read_begin(AVS_HS_LBA + ((uint32_t)k << 16) + w[k]);
+    if (!a.hs_info(&ri) || ri.count != 1) T_FAIL("FAIL hs accepted a bad announcement (count %u)", (unsigned)ri.count);
+    // the same announcement again: same verdict, count 2, INFO again; a new sender gets it too, without the old verdict
+    for (int k = 0; k < AVS_HS_N; k++) a.read_begin(AVS_HS_LBA + ((uint32_t)k << 16) + w[k]);
+    if (a.hs_patch(L7, b) != 1 || b[20] != AVS_HS_REJECT || be32r(b + 24) != 2) T_FAIL("FAIL hs repeat");
+    a.reset_link();
+    if (a.hs_patch(L7, b) != 1 || b[20] != AVS_HS_PENDING) T_FAIL("FAIL hs verdict kept over a link reset");
+    { uint8_t cp[16]; memset(cp, 0, sizeof cp); t_feed(a, t_mk(TL_CONFIG, cp, 16), 16); }
+    t_txn = 0; a.poll();
+    seen = 0;
+    for (int i = 0; i + 16 <= t_txn; i += 16 + (int)le32(t_tx + i + 8)) if (le16(t_tx + i + 4) == TL_RNSE_INFO) seen++;
+    if (seen != 1) T_FAIL("FAIL hs INFO to a new sender (%d)", seen);
+  }
   free(pool);
   snprintf(msg, (size_t)ml, "PASS console,serve,beyond,1bit-convert,future-hold,NOT_READY,EXPIRED,cut-through,"
-           "cut-timeout,reclaim,STATUS,IDLE,FLUSH,overrun");
+           "cut-timeout,reclaim,STATUS,IDLE,FLUSH,overrun,handshake");
   return 0;
 #undef T_FAIL
 }

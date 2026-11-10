@@ -18,17 +18,17 @@
 #define AVSD_H
 #include "rnse.h"
 
-#define FB0          0x8F4C0000u
-#define FB1          0x8F57B800u
-#define FB2          0x8F637000u
+#define FB0          ((u32)SDL_FB_BASE)
+#define FB1          ((u32)SDL_FB_BASE + 0xBB800u)
+#define FB2          ((u32)SDL_FB_BASE + 0x177000u)
 #define FB_BYTES     768000u
-#define RES_BASE     0x8F721000u
-#define RES_END      0x8F730000u
-#define DEC_STREAM   0x8F780000u
+#define RES_BASE     ((u32)SDL_CTL(0x1000))
+#define RES_END      ((u32)SDL_CTL(0x10000))
+#define DEC_STREAM   ((u32)SDL_SFRING)
 #define DEC_STREAM_MAX 0x280000u
-#define SF_BUF       0x8F800000u
+#define SF_BUF       ((u32)SDL_ASM0)
 #define SF_BUF_BYTES 0x40000u
-#define AFIFO        0x8F980000u   /* ends 8F9A0000. Firmware sink: temp+byte FIFO 8F9B6320..8F9DA320 (read at 8EA19824), ring 8F9DA320.. : stay out, it silently overwrote our FIFO tail and stacks */
+#define AFIFO        ((u32)SDL_AFIFO)   /* ends 8F9A0000. Firmware sink: temp+byte FIFO 8F9B6320..8F9DA320 (read at 8EA19824), ring 8F9DA320.. : stay out, it silently overwrote our FIFO tail and stacks */
 #define AFIFO_FRAMES 32768u
 
 #define CD_GPIO      0xFF93E00Cu

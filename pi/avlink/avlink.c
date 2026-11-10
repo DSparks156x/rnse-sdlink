@@ -12,6 +12,7 @@
  * superframes as fast as credits allow, header values identical to rnse_proto/sdgen.py for the same input). */
 #define _GNU_SOURCE
 #include <errno.h>
+#include <stddef.h>
 #include <fcntl.h>
 #include <poll.h>
 #include <signal.h>
@@ -25,6 +26,7 @@
 #include "audio.h"
 #include "crc.h"
 #include "link.h"
+#include "rnse_ver.h"
 #include "sf.h"
 #include "wire.h"
 
@@ -62,12 +64,13 @@
 
 /* ------------------------------------------------------------------ options */
 static struct {
-    const char *dev, *video, *audio, *yuvcrc, *dump_sf, *dump_wire, *keyctl;
+    const char *dev, *video, *audio, *yuvcrc, *dump_sf, *dump_wire, *keyctl, *rnse_file;
+    int fmt_min, fmt_max;     /* stream formats this chain sends (rnse_ver.h AVL_FMT_*; --fmts for tests) */
     double gain_db;
     int audio_be, no_audio, maxvid, k, eos, wire, chunk, console, stats_s, nocredits, maxq, quiet;
     double fps, linkcap;
     uint32_t seq0;
-} O = {.maxvid = 248, .wire = 4, .chunk = 32, .fps = 60.0, .maxq = 3};
+} O = {.maxvid = 248, .wire = 4, .chunk = 32, .fps = 60.0, .maxq = 3, .fmt_min = AVL_FMT_MIN, .fmt_max = AVL_FMT_MAX};
 
 static uint64_t now_us(void)
 {
@@ -515,6 +518,38 @@ static void video_discard(void)
     g_discards++;
 }
 
+/* The RNS-E module's version announcement (rnse_ver.h, docs/PROTOCOL.md 4.5): log it, answer the verdict, write --rnse-file.
+ * No common stream format: no superframes from here on (the unit stays stock), until an announcement with one arrives. */
+static rnse_ver_t g_ver;
+static uint64_t g_rnse_seen;
+static int g_ver_none_logged, g_hs_reject;
+static uint32_t g_hs_blocked;
+static void rnse_report(void)
+{
+    char line[256];
+    rnse_ver_line(&g_ver, O.fmt_min, O.fmt_max, line, sizeof line);
+    fprintf(stderr, "avlink: %s\n", line);
+    if (O.rnse_file && rnse_ver_write(O.rnse_file, &g_ver)) fprintf(stderr, "avlink: %s: %s\n", O.rnse_file, strerror(errno));
+}
+static void rnse_update(void)
+{
+    if (g_link.n_rnse == g_rnse_seen) {
+        if (!g_ver.announced && !g_ver_none_logged && g_link.n_served) { g_ver_none_logged = 1; rnse_report(); }   /* the unit reads, unannounced */
+        return;
+    }
+    g_rnse_seen = g_link.n_rnse;
+    rnse_ver_t nv;
+    rnse_ver_set(&nv, &g_link.rnse, O.fmt_min, O.fmt_max);
+    int changed = !g_ver.announced || nv.fmt != g_ver.fmt || memcmp(&nv.info, &g_ver.info, offsetof(tl_rnse_info, count));
+    g_ver = nv;
+    tl_hs_verdict vd;
+    rnse_ver_verdict(&g_ver, &vd);
+    memcpy(link_msg(&g_link, TL_HS_VERDICT, sizeof vd), &vd, sizeof vd);   /* every time: the Teensy may have lost it (new sender) */
+    if (changed) rnse_report();
+    if (!g_ver.fmt && !g_hs_reject) { g_hs_reject = 1; if (g_can_discard) video_discard(); }
+    else if (g_ver.fmt) g_hs_reject = 0;
+}
+
 /* Who is reading: SERVED (new superframe read) and every counter a read of the window moves. Lifetime counters, so the first STATUS is only a baseline. */
 static void reader_update(uint64_t t)
 {
@@ -562,13 +597,15 @@ static void print_stats(const char *tag)
     fprintf(stderr, "%s sf built=%u sent=%u repeat=%u late=%u frames=%u drop=%u audio_in=%llu silence=%llu adrop=%llu raw=%llu adj=%d "
             "credit_waits=%u keyreq=%u | teensy status=%llu free=%u/%u slots=%u newest=%u served=%u srv_sect=%u holds=%u "
             "timeouts=%u notready=%u expired=%u idle=%u evicted=%u conv=%u rxerr=%u bus=%u junk=%llu "
-            "| rd_stalled=%d stalls=%u discards=%u vdiscarded=%u waitkey=%d window_waits=%u away_ticks=%u cap_kb=%u backoffs=%u catchups=%u\n",
+            "| rd_stalled=%d stalls=%u discards=%u vdiscarded=%u waitkey=%d window_waits=%u away_ticks=%u cap_kb=%u backoffs=%u catchups=%u "
+            "| rnse_build=%08X rnse_fmt=%d stream_fmt=%d hs_blocked=%u\n",
             tag, g_built, g_sent_sf, g_repeat_sf, g_late_ticks, g_frames_in, g_frames_dropped,
             (unsigned long long)g_aud.frames_in, (unsigned long long)g_aud.frames_silence, (unsigned long long)g_aud.frames_dropped, (unsigned long long)g_aud.raw_bytes / 4, (int)g_tick_adj, g_credit_waits, g_key_reqs,
             (unsigned long long)g_link.n_status, s->free_sectors, s->pool_sectors, s->free_slots, s->newest_seq,
             s->served_seq, s->sectors_served, s->holds, s->hold_timeouts, s->notready, s->expired, s->idle, s->evicted,
             s->converted, s->rx_errors, s->bus_width, (unsigned long long)g_link.rx_junk,
-            g_rd.stalled, g_stalls, g_discards, g_vdiscarded, g_wait_key, g_window_waits, g_away_ticks, (unsigned)(g_cap_now / 1000), g_backoffs, g_catchups);
+            g_rd.stalled, g_stalls, g_discards, g_vdiscarded, g_wait_key, g_window_waits, g_away_ticks, (unsigned)(g_cap_now / 1000), g_backoffs, g_catchups,
+            (unsigned)g_ver.info.build_id, g_ver.announced ? g_ver.info.fmt : 0, g_ver.fmt, g_hs_blocked);
 }
 
 /* ------------------------------------------------------------------ --wire-test: wire images of a raw file */
@@ -608,7 +645,9 @@ static void usage(void)
         "  --linkcap B/s      the encoder's --linkcap: with --keyctl, lower it live while the reader lags, raise it back after. 0 (default): never touch it\n"
         "  --whole-sf 1|0    Teensy holds only before sector 0, until the superframe is complete; default: leave the Teensy's setting (off after boot).\n"
         "                     Live also: printf WSF1 > /tmp/avlink_sdctl, WSF0 to turn it off\n"
-        "  --console          copy Teensy console text to stderr      --stats N  stats line every N s   -q\n");
+        "  --rnse-file F      write the RNS-E module's version announcement and the chosen stream format to F (NAME=value lines)\n"
+        "  --fmts MIN:MAX     stream formats this chain sends (%d:%d); a module that plays none of them gets no stream\n"
+        "  --console          copy Teensy console text to stderr      --stats N  stats line every N s   -q\n", AVL_FMT_MIN, AVL_FMT_MAX);
 }
 
 int main(int argc, char **argv)
@@ -640,11 +679,14 @@ int main(int argc, char **argv)
         else if (!strcmp(a, "--linkcap")) O.linkcap = atof(ARG);
         else if (!strcmp(a, "--whole-sf")) g_whole_sf = atoi(ARG) ? 2 : 1;
         else if (!strcmp(a, "--console")) O.console = 1;
+        else if (!strcmp(a, "--rnse-file")) O.rnse_file = ARG;
+        else if (!strcmp(a, "--fmts")) { const char *f = ARG; if (sscanf(f, "%d:%d", &O.fmt_min, &O.fmt_max) != 2) { usage(); return 2; } }
         else if (!strcmp(a, "--stats")) O.stats_s = atoi(ARG);
         else if (!strcmp(a, "-q")) O.quiet = 1;
         else { usage(); return 2; }
     }
     if (O.wire != 4 && O.wire != 1) { usage(); return 2; }
+    if (O.fmt_min < 1 || O.fmt_max < O.fmt_min || O.fmt_max > 255) { usage(); return 2; }
     if (wt_in) return wire_test(wt_in, wt_out);
     if (O.chunk < 1 || O.chunk > 64 || O.maxvid < 1 || O.fps < 1) { usage(); return 2; }
     uint32_t ab = O.no_audio ? 0 : (uint32_t)audio_frames_per_sf() * 4;
@@ -666,6 +708,8 @@ int main(int argc, char **argv)
         g_link.console = O.console;
         g_have_link = 1;
         send_config();
+        rnse_ver_none(&g_ver);                     /* until the unit announces itself: today's format */
+        if (O.rnse_file && rnse_ver_write(O.rnse_file, &g_ver)) fprintf(stderr, "avlink: %s: %s\n", O.rnse_file, strerror(errno));
     }
     if (O.keyctl && (g_keyfd = open(O.keyctl, O_RDWR | O_NONBLOCK)) < 0) { perror(O.keyctl); return 1; }
     signal(SIGINT, on_sig); signal(SIGTERM, on_sig); signal(SIGPIPE, SIG_IGN);
@@ -692,6 +736,9 @@ int main(int argc, char **argv)
                         (g_vid.fd >= 0 || g_aud.fd >= 0);
             if (ended) {
                 if (!g_have_link || (!tq_n && !link_pending(&g_link))) break;
+            } else if (g_hs_reject) {
+                g_hs_blocked++;                    /* the RNS-E module plays no format we send: nothing goes out, the input is dropped */
+                if (g_can_discard) video_drop_input();
             } else if (g_have_link && tq_n >= O.maxq) {
                 g_late_ticks++;                    /* USB/credits behind: don't consume a seq, encoder backs up */
             } else if (g_can_discard && g_rd.stalled && !g_stop_tlv && t - g_rd.t_act > RD_POLLING_US && t - away_t < AWAY_PERIOD_US) {
@@ -712,6 +759,7 @@ int main(int argc, char **argv)
             else if (t - last_status_t > 300000u && t - last_cfg_t > 200000u) { send_config(); last_cfg_t = t; }
             if (live) { reader_update(t); backoff_update(t); }
             key_feedback(t);
+            rnse_update();
             sdctl_poll();
             if (g_img_wait) img_t = t;             /* a bootstrap image is read once, later: it must outlast the stream around it */
             if (live && !!g_img_wait != g_img_stale && (g_img_wait || t - img_t > IMG_HOLD_US)) { g_img_stale = !!g_img_wait; send_config(); }
@@ -722,7 +770,7 @@ int main(int argc, char **argv)
         /* 3. wait for input / output / tick */
         struct pollfd p[3]; int np = 0;
         if (g_have_link) { p[np].fd = g_link.fd; p[np].events = POLLIN | (link_pending(&g_link) ? POLLOUT : 0); np++; }
-        if (live && g_vid.nonblock && (vsrc_wants_input(&g_vid) || (g_vid.fd >= 0 && !g_vid.eof && g_can_discard && (g_wait_key || g_rd.stalled)))) { p[np].fd = g_vid.fd; p[np].events = POLLIN; np++; }
+        if (live && g_vid.nonblock && (vsrc_wants_input(&g_vid) || (g_vid.fd >= 0 && !g_vid.eof && g_can_discard && (g_wait_key || g_rd.stalled || g_hs_reject)))) { p[np].fd = g_vid.fd; p[np].events = POLLIN; np++; }
         if (live && audio_poll_fd(&g_aud) >= 0) { p[np].fd = g_aud.fd; p[np].events = POLLIN; np++; }
         int64_t wait_us = 5000;                 /* to the microsecond: rounding down to whole ms made poll(0) spin through the last ms of every tick */
         if (live) { wait_us = (int64_t)(next_tick - now_us()); if (wait_us < 0) wait_us = 0; if (wait_us > 5000) wait_us = 5000; }

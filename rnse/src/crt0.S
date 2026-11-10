@@ -20,4 +20,8 @@ _start:
 L_bss_s: .long __bss_start
 L_bss_e: .long __bss_end
 L_main:  .long _main
+#ifdef FWTAB
+L_ext:   .long _fwt_exit           /* ext_tsk through the table (sdstream.c) */
+#else
 L_ext:   .long 0x804D027C
+#endif

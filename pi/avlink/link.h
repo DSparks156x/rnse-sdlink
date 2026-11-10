@@ -25,6 +25,8 @@ typedef struct {
     int credit_error;            /* sticky EPROTO: close/reopen; never rebaseline a live session */
     uint64_t n_status, n_served, bytes_out, rx_junk;
     uint32_t last_served_seq, last_served_t;
+    tl_rnse_info rnse;           /* newest RNSE_INFO (valid if n_rnse) */
+    uint64_t n_rnse;
 } link_t;
 
 int link_open(link_t *l, const char *path);      /* tty -> raw 8N1, nonblocking */

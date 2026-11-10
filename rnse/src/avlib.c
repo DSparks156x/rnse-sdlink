@@ -57,40 +57,40 @@ u32 crc32_upd(u32 crc, const u8 *p, u32 n)
     return ~c;
 }
 
-/* ---------------------------------------------------------------- DU (addresses = doom/port/rnse_hw.h) */
-#define SH_MR      0x8E8E7D14u
-#define SH_MWR     0x8E8E7D3Cu
-#define SH_ALPHAR  0x8E8E7D64u
-#define SH_DSXR    0x8E8E7D84u
-#define SH_DSYR    0x8E8E7DACu
-#define SH_DPXR    0x8E8E7DD4u
-#define SH_DPYR    0x8E8E7DFCu
-#define SH_DSA0    0x8E8E7E24u
-#define SH_DSA1    0x8E8E7E4Cu
-#define SH_DSA2    0x8E8E7E74u
-#define SH_SPXR    0x8E8E7E9Cu
-#define SH_SPYR    0x8E8E7EC4u
-#define SH_WASPR   0x8E8E7EECu
-#define SH_WAMWR   0x8E8E7F14u
-#define SH_BTR     0x8E8E7F3Cu
-#define SH_TC1R    0x8E8E7F64u
-#define SH_TC2R    0x8E8E7F84u
-#define SH_MLR     0x8E8E7FA4u
-#define SH_DPPR    0x8E8E7FCCu
-#define MASK_MODE  0x8E8E97D4u
-#define DIRTY      0x8E8E97D8u
-#define LAYER0     0x8E8E9804u
-#define COMMIT_FN  0x80520908u
+/* ---------------------------------------------------------------- DU (firmware shadow words through the table, fwtab.h; values = doom/port/rnse_hw.h) */
+#ifndef FWTAB
+#error "avlib.c is table-only now (build -DFWTAB); the literal r57 addresses are in avlib.c.before_fwtab"
+#endif
+#define SH_MR      FW(FWE_SH_MR)
+#define SH_MWR     FW(FWE_SH_MWR)
+#define SH_ALPHAR  FW(FWE_SH_ALPHAR)
+#define SH_DSXR    FW(FWE_SH_DSXR)
+#define SH_DSYR    FW(FWE_SH_DSYR)
+#define SH_DPXR    FW(FWE_SH_DPXR)
+#define SH_DPYR    FW(FWE_SH_DPYR)
+#define SH_DSA0    FW(FWE_SH_DSA0)
+#define SH_DSA1    FW(FWE_SH_DSA1)
+#define SH_DSA2    FW(FWE_SH_DSA2)
+#define SH_WASPR   FW(FWE_SH_WASPR)
+#define SH_WAMWR   FW(FWE_SH_WAMWR)
+#define SH_TC2R    FW(FWE_SH_TC2R)
+#define SH_MLR     FW(FWE_SH_MLR)
+#define SH_DPPR    FW(FWE_SH_DPPR)
+#define MASK_MODE  FW(FWE_SH_MASK)
+#define DIRTY      FW(FWE_SH_DIRTY)
+#define LAYER0     FW(FWE_SH_LAYER0)
+#define COMMIT_FN  FW(FWE_DU_COMMIT)
 #define DU_DSYSR   0xFFF80000u
 #define DU_DSSR    0xFFF80008u
 #define DSYSR_HOLD 0x00010000u
 #define DU_P1_DSA0 0xFFF80120u
 
-static const u32 save_addr[] = {
-    SH_MR, SH_MWR, SH_ALPHAR, SH_DSXR, SH_DSYR, SH_DPXR, SH_DPYR, SH_DSA0, SH_DSA1, SH_DSA2, SH_SPXR, SH_SPYR,
-    SH_WASPR, SH_WAMWR, SH_BTR, SH_TC1R, SH_TC2R, SH_MLR, SH_DPPR, MASK_MODE, LAYER0,
+static const u8 save_idx[] = {
+    FWE_SH_MR, FWE_SH_MWR, FWE_SH_ALPHAR, FWE_SH_DSXR, FWE_SH_DSYR, FWE_SH_DPXR, FWE_SH_DPYR, FWE_SH_DSA0, FWE_SH_DSA1, FWE_SH_DSA2,
+    FWE_SH_SPXR, FWE_SH_SPYR, FWE_SH_WASPR, FWE_SH_WAMWR, FWE_SH_BTR, FWE_SH_TC1R, FWE_SH_TC2R, FWE_SH_MLR, FWE_SH_DPPR, FWE_SH_MASK,
+    FWE_SH_LAYER0,
 };
-#define NSAVE (sizeof save_addr / sizeof save_addr[0])
+#define NSAVE (sizeof save_idx / sizeof save_idx[0])
 static u32 saved[NSAVE];
 static int du_on;
 
@@ -104,7 +104,7 @@ int du_takeover(u32 phys)
 {
     u32 i;
     if (du_on) return 1;
-    for (i = 0; i < NSAVE; i++) saved[i] = R32(save_addr[i]);
+    for (i = 0; i < NSAVE; i++) saved[i] = R32(FW(save_idx[i]));
     R32(SH_MR) = DU_MR_YUY2;
     R32(SH_MWR) = 800;
     R32(SH_ALPHAR) = 0xFF;
@@ -139,7 +139,7 @@ void du_restore(void)
     u32 i;
     if (!du_on) return;
     du_on = 0;
-    for (i = 0; i < NSAVE; i++) R32(save_addr[i]) = saved[i];
+    for (i = 0; i < NSAVE; i++) R32(FW(save_idx[i])) = saved[i];
     commit(3);
 }
 

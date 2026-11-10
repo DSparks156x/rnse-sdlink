@@ -13,7 +13,7 @@ rewritten or removed rather than relicensed. Items below are still open.
 | `teensy/sdemu/tonemp3.h` | 60 s generated test tone (ffmpeg + libmp3lame), 960 KB array. Own signal; could be generated at build time instead. |
 | `rnse/can/*` | The author's own earlier CAN tools; depend on `gs_usb`, `pyusb`, `libusb-package` (from PyPI, not copied). |
 | `rnse/src/*`, `rnse/layout.py`, `rnse/benchd.py`, `rnse/sdstream.py`, `rnse/sdbench.py`, `rnse/sdtime.py`, `rnse/can/*` | Contain addresses, offsets, byte patterns and calling conventions recovered by RE of Audi/Harman RNS-E firmware. No vendor code or binaries are included. Owner to decide on publication. |
-| `rnse/hook/*`, `rnse/src/sdboot.c` | Same RE content as above: firmware addresses and a hook into the ACON task. Source only; `sdboot.c` is RAM-only, the hook is flash-resident. |
+| `rnse/module/*`, `rnse/src/sdboot.c`, `rnse/src/fwtab.h` | The flash module takes every firmware address from the per-firmware table (no firmware address in its code); `fwtab.h` names what the table holds. `sdboot.c` (RAM-only bench loader) still has literal addresses. The firmware-side hook, table values and patching tools are not in this repo. |
 | `rnse/src/rnv2ref.c`, `rnv2_tables.h`, `pienc/ref/*` | Reference RNV2 decoder and tables (the author's own codec). |
 
 Knowledge notes derived from the QNX `lanbic` sources are deliberately not in this repo.

@@ -18,7 +18,7 @@ Hudiy/AA --(wlr export-dmabuf)--> pi/wlcap --raw--> pienc/rnv3enc --RNV3--> pi/a
   pw-record of the Hudiy sink (48 kHz s16) ---------------------------------^                    | emulated SD card
                                                                                                   v
         rnse/src/sdstream.c on the RNS-E: SD read, RNV2 decode, display flip, audio sink
-        (started on TV entry by rnse/hook, or loaded into RAM by rnse/benchd.py)
+        (flash module rnse/module, sector 107: started on TV entry; or loaded into RAM by rnse/benchd.py)
 ```
 - `pi/wlcap`: screen capture with damage tracking, newest-frame-wins.
 - `pienc`: RNV3 video encoder, the working tree's `enc3` and what the Pi runs. Installed as `rnv3enc` (`docs/DEPLOYMENT.md` has the deployment and settings) (NEON on the Pi, scalar and emulated NEON on x86), rate-limited to the SD bus budget (`--linkcap`),
@@ -31,7 +31,8 @@ Hudiy/AA --(wlr export-dmabuf)--> pi/wlcap --raw--> pienc/rnv3enc --RNV3--> pi/a
 - `pi/scripts`: diagnostics that need no head unit: `bench_audio.sh` (whole chain into /dev/null), `audio_diag.sh`, `tap_rate.py`, `xrun_delta.sh`.
 - `teensy/sdemu`: SD card emulation firmware (SD protocol, FAT16 volume, live superframe store, optional touch HID).
 - `rnse`: the RNS-E program (`src/`, built with an `sh-elf` cross toolchain), the PC-side bench host (`benchd.py`, `rnse_bench.py`,
-  `sdstream.py`, `sdfast.py`) and `rnse/hook` (source of the flash-resident TV-entry starter, see `docs/HOOK.md`).
+  `sdstream.py`, `sdfast.py`) and `rnse/module` (the flash module: TV-entry starter + sdstream, built into `sector_107.bin`;
+  firmware contract in `docs/FIRMWARE_CONTRACT.md`, Pi-side update in `docs/PI_UPDATER.md`).
 - `docs/PROTOCOL.md`: the superframe / wire / USB protocol specification. Comments in the code that say `rnse_proto` mean `rnse/`.
 
 ## Build
@@ -41,7 +42,8 @@ Hudiy/AA --(wlr export-dmabuf)--> pi/wlcap --raw--> pienc/rnv3enc --RNV3--> pi/a
 | RNS-E programs | `cd rnse && mkdir -p out && bash build.sh` | `sh-elf-gcc` (SH-4, big-endian, `-m4-single`) at `~/sh-elf/bin/sh-elf-*`; output in `rnse/out/` (`sdstream.bin`, `sdboot.bin`, ...) |
 | Pi binaries | `make` at the top: `bin/rnv3enc`, `bin/avlink`, `bin/wlcap` (`make test` runs the encoder self-checks) | gcc on the Pi 5; `WAYLAND_DISPLAY` and `XDG_RUNTIME_DIR` at run time for wlcap |
 | Encoder only | `cd pienc && make` (`make test` for the self-checks) | gcc; NEON is used on aarch64, emulated NEON checks run on x86 |
-| Hook (`rnse/hook`) | not buildable here | linked into a firmware image by private tools |
+| RNS-E flash module | `bash rnse/module/build.sh` (WSL on Windows) -> `rnse/out/sector_107.bin` + `.sha256` + `module.json` | sh-elf toolchain as above, python3 |
+| Firmware side (hook + table) | not here | made per firmware by private tools, see `docs/FIRMWARE_CONTRACT.md` |
 
 ### Checks that run offline (Windows Python plus WSL gcc, no hardware)
 - `python -I pi/avlink/test/run_tests.py --skip-e2e --live-quick --out <dir>`: credit/flow-control unit tests, the Teensy
@@ -49,6 +51,8 @@ Hudiy/AA --(wlr export-dmabuf)--> pi/wlcap --raw--> pienc/rnv3enc --RNV3--> pi/a
   scenarios (reader away and back, overload). Stages 2 and 3 (superframes against `sdgen.py`, end to end with a simulated reader)
   need the reference generator and source clips that are not in this repo, so they are skipped.
   The host self-test reports one known difference, `sec_4064`, which predates the current work.
+  It also runs the version-handshake checks: `test_rnsever` (Pi-side parsing and format choice) and `test_handshake.py` (avlink, the
+  Teensy host build and a model of the unit's announcement: accept, reject, nothing announced).
 - `cd pienc && make test`: kernel and closed-loop checks (encoder against the reference decoder).
 - `cd teensy/tools/host_link && make`: host build of the Teensy stream code.
 
@@ -62,12 +66,17 @@ Hudiy/AA --(wlr export-dmabuf)--> pi/wlcap --raw--> pienc/rnv3enc --RNV3--> pi/a
 4. Python deps for the CAN side: `python-can`/`gs_usb`, `pyusb`, `libusb-package` (64-bit Python). `rnse/can/` holds the
    small CAN memory-read/write transport used by `rnse_bench.py`.
 
-Nothing in this repo writes the RNS-E flash. The hook that starts the stream from flash is included as source only
-(`docs/HOOK.md`); getting it onto a unit takes tools that are not here.
+Version handshake: when the module starts a run it announces its build id, the stream formats its decoder plays and the firmware
+table's fw_id/version in the LBAs of its probe reads (`docs/PROTOCOL.md` 4.5). avlink logs it, writes `rnse.txt` in the chain directory
+and sends nothing to a module that plays none of its formats (the unit then stays stock). Older Teensy firmware or an older module:
+nothing is announced, and the chain streams today's format as before. A module and a Teensy without it work with each other unchanged.
+
+Nothing in this repo writes the RNS-E flash. `rnse/module/build.sh` builds the sector image; `docs/PI_UPDATER.md` describes how a
+Pi release writes it. The firmware-side hook and table come with a matching firmware build (`docs/FIRMWARE_CONTRACT.md`).
 
 ### Check the installed RNS-E decoder
 
-Read the CRC32 of flash sector 96 to identify the installed SDLink decoder image:
+Read the CRC32 of flash sector 107 (the SDLink module; units from before the move used sector 96) to identify the installed image:
 
 ```bash
 # Pi, with can0 already configured and up
@@ -79,7 +88,7 @@ python -I rnse/can/decoder_check.py --transport cowcan
 
 Run from this repository's root, with the head unit awake and its B1 memory-read service available.
 Stop other CAN diagnostic tools using the same request/reply IDs before checking. The command reads all
-128 KiB at `0x80C00000` through B1 and calculates CRC32 on the host; it does not write flash or RAM or restart
+128 KiB at `0x80D60000` through B1 and calculates CRC32 on the host; it does not write flash or RAM or restart
 the unit. It takes longer than Hudiy's on-unit CRC stub because it transfers the whole sector.
 `--json` provides a machine-readable result for front ends. Exit codes: `0` = read succeeded,
 `2` = read or argument error, `130` = interrupted. A failed or incomplete read produces no valid CRC.

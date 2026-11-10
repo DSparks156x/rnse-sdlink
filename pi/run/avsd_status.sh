@@ -5,6 +5,7 @@ L=$XDG_RUNTIME_DIR/avsd
 echo "== service";   systemctl --user --no-pager -n 0 status avsd-chain.service | sed -n 1,4p
 echo "== chain log"; journalctl -b _SYSTEMD_USER_UNIT=avsd-chain.service -n 8 --no-pager -o cat
 echo "== avlink";    tail -n 2 "$L/live.log" 2>/dev/null | cut -c1-220
+echo "== rnse";      grep -v '^#' "$L/rnse.txt" 2>/dev/null | paste -sd' '   # the RNS-E module's version announcement (avlink --rnse-file)
 echo "== capture";   tail -n 1 "$L/cap.log" 2>/dev/null | cut -c1-160
 echo "== priority";  cat "$L/rt.log" 2>/dev/null | tail -n 3
 echo "== governor";  cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor

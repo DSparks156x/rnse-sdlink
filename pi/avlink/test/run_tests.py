@@ -6,7 +6,8 @@ r"""run_tests.py -- avlink checks on the PC (Windows Python + WSL gcc). No hardw
   2. sdgen    avlink --k K --dump-sf == rnse_proto/sdgen.py superframes() for the same input, byte for byte
               (highway110_night K=48 one superframe per frame; turn_night K=48 --maxvid 60 = TLV 0x11 fragments;
               --raw adds rawtest4 K=30 = 770 KB frames over 7 superframes)
-  0. units    test_credits, test_nocredits, test_stall, test_discard; ownership: teensy/tools/test_avstream_ownership.cpp (ASan/UBSan);
+  0. units    test_credits, test_nocredits, test_stall, test_discard, test_rnsever (version announcement, Pi side);
+              test_handshake.py (announcement end to end: avlink -> pty -> host_link unit model, accept / reject / none); ownership: teensy/tools/test_avstream_ownership.cpp (ASan/UBSan);
               host selftest of the firmware's sdproto/avstream against tools/sdemu_ref.py (sec_4064 differs since before batch 1)
   3. e2e      avlink -> pty (fake /dev/ttyACM0) -> Teensy host build (sdemu avstream.cpp + sdproto.cpp, the same
               files the firmware uses) -> simulated RNS-E mode A reader (SPEC 2.A.4) -> served superframes
@@ -58,6 +59,7 @@ def build(e2e):
     lib = 'sf.c wire.c crc.c audio.c link.c'
     wsl('cd %s && cc -O2 -g -std=c11 -Wall -Wextra -Wno-unused-parameter avlink.c %s -o %s/avlink 2>&1' % (q(AVL), lib, o))
     wsl('cd %s && cc -std=c11 -Wall -Wextra -Werror -O2 test/test_credits.c link.c -o %s/credit-test' % (q(AVL), o))
+    wsl('cd %s && cc -std=c11 -Wall -Wextra -Werror -O2 test/test_rnsever.c link.c -o %s/rnsever-test' % (q(AVL), o))
     for t in ('nocredits', 'discard'):
         wsl('cd %s && cc -std=c11 -Wall -Wextra -Werror -O2 test/test_%s.c %s -o %s/%s-test' % (q(AVL), t, lib, o, t))
     wsl('cd %s && cc -O2 -std=c11 -w -Dmain=avlink_main -c avlink.c -o %s/avlink_t.o && cc -O2 -std=c11 -w test/test_stall.c %s/avlink_t.o %s -I. -o %s/stall-test' % (q(AVL), o, o, lib, o))
@@ -290,7 +292,8 @@ def main():
     build(not a.skip_e2e)
     res = {}
     print('[0] credit origins and fail-closed transport')
-    for name, exe in (('credits', 'credit-test'), ('nocredits', 'nocredits-test'), ('discard', 'discard-test'), ('stall', 'stall-test')):
+    for name, exe in (('credits', 'credit-test'), ('nocredits', 'nocredits-test'), ('discard', 'discard-test'), ('stall', 'stall-test'),
+                      ('rnsever', 'rnsever-test')):
         r = wsl('%s/%s' % (q(OUT), exe), check=False)
         print(' ', r.stdout.strip().splitlines()[-1] if r.stdout.strip() else r.stderr[-400:])
         res[name] = r.returncode == 0
@@ -298,6 +301,10 @@ def main():
     print(' ', r.stdout.strip() if r.returncode == 0 else r.stderr[-800:])
     res['ownership'] = r.returncode == 0
     res['selftest'] = test_selftest()
+    print('[0h] version handshake end to end: avlink -> pty -> host_link unit model (test_handshake.py)')
+    r = wsl('python3 %s/test/test_handshake.py --out %s/handshake' % (q(AVL), q(OUT)), timeout=300, check=False)
+    print('\n'.join('  ' + l for l in r.stdout.rstrip().splitlines()[-14:]) if r.stdout.strip() else r.stderr[-800:])
+    res['handshake'] = r.returncode == 0
     print('[1] wire images vs sd_wire.py')
     res['wire'] = test_wire()
     cases = CASES + ([('rawtest4', 30, 248, 'raw')] if a.raw else [])

@@ -26,10 +26,23 @@
 #define AVS_IMG_WORDS   132          // 4-bit image; 1-bit images (130 words) use the same pool entry
 #define AVS_MAX_HOLD_MS 50           // SPEC 3.4 hard rule: a start-bit hold never exceeds 50 ms
 
+// Version handshake (docs/PROTOCOL.md 4.5) = rnse/src/sdl_ver.h SDL_HS_*: the unit's tvauto reads LBA AVS_HS_LBA + (i << 16) + w[i],
+// i = 0..7, w = 16-bit words {0x5D00|ver, build hi, build lo, fmt_min << 8 | fmt, fw_id hi, fw_id lo, table ver, ~sum(w0..w6)}.
+// Read 7 of a valid announcement is answered with the ack sector (hs_patch); every other LBA keeps its usual content.
+#define AVS_HS_LBA      0x80000u
+#define AVS_HS_SECT     0x80000u
+#define AVS_HS_N        8
+#define AVS_HS_W0       0x5D00u
+#define AVS_HS_VER      1u
+#define AVS_HS_ACK      0x53444841u  // 'SDHA'
+enum { AVS_HS_PENDING = 0, AVS_HS_ACCEPT = 1, AVS_HS_REJECT = 2 };
+
 #define TL_MAGIC 0x4B4E4C54u
 enum {
   TL_SF_BEGIN = 0x01, TL_WIRE = 0x02, TL_SF_END = 0x03, TL_META = 0x04, TL_CONFIG = 0x05, TL_DOWNLINK = 0x06,
-  TL_FLUSH = 0x07, TL_HOST_WRITE = 0x81, TL_UPLINK = 0x82, TL_STATUS = 0x83, TL_CMDLOG = 0x84, TL_SERVED = 0x85
+  TL_FLUSH = 0x07, TL_HOST_WRITE = 0x81, TL_UPLINK = 0x82, TL_STATUS = 0x83, TL_CMDLOG = 0x84, TL_SERVED = 0x85,
+  TL_HS_VERDICT = 0x08,   // Pi->T: AvsHsVerdict (an older Teensy ignores the type)
+  TL_RNSE_INFO = 0x86     // T->Pi: AvsRnseInfo, the unit's announcement (an older avlink ignores the type)
 };
 enum { SFF_KEY = 1, SFF_REPEAT = 2, SFF_IDLE = 4, SFF_DISCONT = 8, SFF_ADISCONT = 16, SFF_SYNTH = 32,
        SFF_NOTREADY = 64, SFF_EXPIRED = 128, SFF_EOS = 256 };
@@ -44,6 +57,22 @@ struct AvsStatus {                   // = tl_status in pi/avlink/tlink.h (80 B, 
   uint32_t write_crc_errors;
   uint8_t card_state, bus_width, mode, flags;
   uint32_t pool_sectors;
+};
+
+struct AvsRnseInfo {                 // = tl_rnse_info in pi/avlink/tlink.h (32 B, little-endian)
+  uint16_t ver, size;                // 1, 32
+  uint32_t build_id;                 // module build id (sector 107 +0x94)
+  uint8_t fmt, fmt_min, hs_ver, rsv0;   // stream formats the decoder plays (sdl_ver.h), announcement layout version
+  uint32_t fw_id;                    // firmware table word 3
+  uint16_t table_ver, check;         // firmware table word 1 (low 16), announcement word 7
+  uint32_t count;                    // complete announcements decoded since Teensy boot
+  uint32_t age_ms;                   // since the newest one
+  uint32_t rsv1;
+};
+struct AvsHsVerdict {                // = tl_hs_verdict (8 B): applies only to the announcement with that build id and check
+  uint32_t build_id;
+  uint16_t check;
+  uint8_t verdict, fmt;              // AVS_HS_*, chosen stream format (0 = none)
 };
 
 // whole_sf: 1 = hold only before sector 0, until the whole superframe has arrived, so a read has no mid-read holds. Off by default.
@@ -73,6 +102,11 @@ class AvStream {
   int get(uint32_t lba, int bus4, uint32_t *out, uint16_t *nwords);
   void read_begin(uint32_t lba);    // command start LBA; resets hold state and anchors split-read/retry pin
   void info(uint8_t *p, int n);    // big-endian summary for the 0x40000 info sector (n >= 40)
+  // version handshake (IRQ side): read_begin() decodes the LBAs; hs_patch() replaces the sector of read 7 with the ack.
+  // Returns 1 if it wrote the ack into sec (512 B), 0 = leave the usual content.
+  int hs_patch(uint32_t lba, uint8_t *sec);
+  int hs_info(AvsRnseInfo *o) const;   // main loop: the newest announcement; 0 = none yet
+  uint32_t hs_verdict_word(void) const { return hs_verdict; }
 
   // card-side values reported in STATUS (set by the sketch)
   uint8_t card_state, bus_width, mode;
@@ -135,6 +169,14 @@ class AvStream {
   void send(uint16_t type, const void *pl, uint32_t len);
   void send_status(uint32_t t);
   uint32_t tx_seq;
+  // version handshake
+  uint16_t hs_w[AVS_HS_N]; uint8_t hs_n;                     // IRQ: announcement being decoded
+  volatile uint32_t hs_gen;                                    // seqlock: odd while the IRQ updates the fields below
+  uint16_t hs_ann[AVS_HS_N]; uint32_t hs_count, hs_t, hs_ack_lba; uint8_t hs_have;
+  volatile uint32_t hs_verdict;                                // check << 16 | fmt << 8 | verdict, one store (main) / one load (IRQ)
+  uint32_t hs_sent_count; uint8_t hs_sent_link;                // main: what went to the Pi
+  void hs_read(uint32_t lba);
+  void hs_poll(uint32_t t);
 };
 
 extern AvStream AVS;                 // the firmware's instance (fxsd.cpp / sdemu.ino)

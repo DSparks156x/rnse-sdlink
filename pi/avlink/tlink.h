@@ -20,8 +20,17 @@ enum {
     TL_UPLINK = 0x82,
     TL_STATUS = 0x83,    /* see tl_status */
     TL_CMDLOG = 0x84,
-    TL_SERVED = 0x85     /* u32 sf_seq, u32 t_us of its header sector */
+    TL_SERVED = 0x85,    /* u32 sf_seq, u32 t_us of its header sector */
+    TL_HS_VERDICT = 0x08,  /* Pi->T: tl_hs_verdict (an older Teensy ignores it) */
+    TL_RNSE_INFO = 0x86    /* T->Pi: tl_rnse_info, the unit's version announcement (docs/PROTOCOL.md 4.5) */
 };
+
+/* Version handshake = rnse/src/sdl_ver.h SDL_HS_* = teensy/sdemu/avstream.h AVS_HS_* */
+#define TL_HS_LBA     0x80000u
+#define TL_HS_VER     1u
+#define TL_HS_PENDING 0
+#define TL_HS_ACCEPT  1
+#define TL_HS_REJECT  2
 
 /* CONFIG payload (all optional: 0 = keep the Teensy's current value) */
 typedef struct {
@@ -57,5 +66,27 @@ typedef struct {
     uint8_t card_state, bus_width, mode, flags;
     uint32_t pool_sectors;    /* pool size */
 } tl_status;                  /* 80 B */
+
+/* RNSE_INFO payload, Teensy -> Pi: the newest announcement the Teensy decoded. Sent on every new one and to every new sender. */
+typedef struct {
+    uint16_t ver, size;       /* 1, 32 */
+    uint32_t build_id;        /* module build id (sector 107 +0x94) */
+    uint8_t fmt, fmt_min;     /* stream formats the unit's decoder plays: fmt_min..fmt (rnse/src/sdl_ver.h) */
+    uint8_t hs_ver, rsv0;     /* announcement word 0 (0x5D00 | layout version), low byte */
+    uint32_t fw_id;           /* firmware table word 3 */
+    uint16_t table_ver;       /* firmware table word 1 */
+    uint16_t check;           /* announcement word 7: identifies the announcement in a verdict */
+    uint32_t count;           /* announcements decoded since the Teensy booted */
+    uint32_t age_ms;          /* age of the newest one when sent */
+    uint32_t rsv1;
+} tl_rnse_info;               /* 32 B */
+
+/* HS_VERDICT payload, Pi -> Teensy: answered to the unit in the ack sector of its next announcement */
+typedef struct {
+    uint32_t build_id;
+    uint16_t check;
+    uint8_t verdict;          /* TL_HS_ACCEPT / TL_HS_REJECT */
+    uint8_t fmt;              /* the stream format the Pi sends, 0 = none */
+} tl_hs_verdict;              /* 8 B */
 
 #endif
