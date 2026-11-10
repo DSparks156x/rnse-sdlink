@@ -39,6 +39,16 @@ avlink --video - --audio pcm.fifo --dev <by-id> --keyctl key.fifo --maxvid 161 -
 
 ## Compatibility rule
 
+The current public checkout can read the installed sector 96 CRC with
+`python3 rnse/can/decoder_check.py --interface can0` (Pi), or
+`python -I rnse/can/decoder_check.py --transport cowcan` (PC). It displays the installed CRC;
+add `--json` for a front end.
+This is a read-only whole-sector B1 read, not the private `tools/sd_flash.py check` referenced in
+the historical procedure below; that flash tool is not included here. See the root README for usage.
+An unknown CRC means an unrecognized sector image, not necessarily an incompatible decoder.
+The full-sector CRC includes unused tail bytes, so releases installed through different paths may
+need more than one accepted CRC (as with r64 above).
+
 | Decoder on the unit | Encoder stream | Result |
 |---|---|---|
 | New (`0696DDE4`) | R3 or `--r3 0` R2 | Works |

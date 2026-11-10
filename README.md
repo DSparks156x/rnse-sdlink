@@ -65,6 +65,29 @@ Hudiy/AA --(wlr export-dmabuf)--> pi/wlcap --raw--> pienc/rnv3enc --RNV3--> pi/a
 Nothing in this repo writes the RNS-E flash. The hook that starts the stream from flash is included as source only
 (`docs/HOOK.md`); getting it onto a unit takes tools that are not here.
 
+### Check the installed RNS-E decoder
+
+Read the CRC32 of flash sector 96 to identify the installed SDLink decoder image:
+
+```bash
+# Pi, with can0 already configured and up
+python3 rnse/can/decoder_check.py --interface can0
+
+# Windows / CowCAN (same USB dependencies as the bench tools)
+python -I rnse/can/decoder_check.py --transport cowcan
+```
+
+Run from this repository's root, with the head unit awake and its B1 memory-read service available.
+Stop other CAN diagnostic tools using the same request/reply IDs before checking. The command reads all
+128 KiB at `0x80C00000` through B1 and calculates CRC32 on the host; it does not write flash or RAM or restart
+the unit. It takes longer than Hudiy's on-unit CRC stub because it transfers the whole sector.
+`--json` provides a machine-readable result for front ends. Exit codes: `0` = read succeeded,
+`2` = read or argument error, `130` = interrupted. A failed or incomplete read produces no valid CRC.
+
+Use the CRC as a full-sector image identity, not a semantic version number. Even identical decoder code can
+have different sector CRCs if unused tail bytes differ (the r64 disc and CAN installations in
+`docs/DEPLOYMENT.md` are one example).
+
 ## Not included, on purpose
 Firmware dumps and extracted OSM/vendor data, disc images, run logs and captured data, build outputs, flash-staging and
 image-build tools, Doom, research scripts (encoder evaluation, firmware RE helpers), and the source clips used by the
