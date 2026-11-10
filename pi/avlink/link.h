@@ -27,6 +27,9 @@ typedef struct {
     uint32_t last_served_seq, last_served_t;
     tl_rnse_info rnse;           /* newest RNSE_INFO (valid if n_rnse) */
     uint64_t n_rnse;
+    char cline[160]; size_t clen;            /* console text line being collected */
+    char teensy_ver[64];         /* the Teensy's FW_VERSION, from its VER / BOOT / HELP console line ("" until seen) */
+    uint64_t n_teensy_ver;
 } link_t;
 
 int link_open(link_t *l, const char *path);      /* tty -> raw 8N1, nonblocking */
@@ -38,5 +41,9 @@ size_t link_pending(const link_t *l);            /* output bytes not written yet
 int link_write(link_t *l);                       /* write what the fd takes; -1 on error */
 int link_read(link_t *l);                        /* read + parse; -1 on hangup or invalid credit state (EPROTO) */
 int link_drain(link_t *l, int timeout_ms);       /* block until all output is written */
+void link_raw(link_t *l, const void *p, size_t n);   /* append console bytes (not a TLNK message), e.g. "
+ver
+" */
+int link_console_line(link_t *l, const char *line);  /* parse one console line; 1 = it carried the firmware version */
 
 #endif

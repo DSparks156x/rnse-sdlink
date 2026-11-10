@@ -20,7 +20,8 @@ HERE = Path(__file__).resolve().parent            # rnse/module
 RNSE = HERE.parent
 OUT = RNSE / 'out'
 MOD = OUT / 'module'
-X = os.path.expanduser('~/sh-elf/bin/sh-elf-')
+X = os.environ.get('SH_ELF') or os.path.expanduser('~/sh-elf/bin/sh-elf-')   # toolchain prefix; CI: tools/build-sh-elf.sh
+HISTORY = HERE / 'history.txt'
 
 SECTOR = 107
 DEST = SECTOR * 0x20000                           # 0x00D60000
@@ -83,6 +84,21 @@ def header_text(build_id):
     return t + bytes(0x70 - len(t))
 
 
+def history(build):
+    """Build ids oldest first, ending with this one (module.json 'history'). Build ids are hashes with no order of their own, so
+    an updater orders an installed module against the bundled one by this list. A build not listed yet is appended to
+    module/history.txt: commit that line with the sources it was built from."""
+    ids = []
+    if HISTORY.exists():
+        ids = [ln.split()[0].upper() for ln in HISTORY.read_text().splitlines() if ln.strip() and not ln.startswith('#')]
+    if build not in ids:
+        import datetime
+        with HISTORY.open('a', newline='\n') as f:
+            f.write('%s %s\n' % (build, datetime.date.today().isoformat()))
+        ids.append(build)
+    return ids
+
+
 def main():
     img_p, sym_p = OUT / 'sdstream.bin', OUT / 'sdstream.sym'
     if not img_p.exists() or not sym_p.exists():
@@ -142,7 +158,8 @@ def main():
                 sdstream=dict(sha256=hashlib.sha256(img).hexdigest(), bytes=len(img), base='%08X' % s['_start'],
                               main='%08X' % s['_main'], bss=['%08X' % s['__bss_start'], '%08X' % s['__bss_end']]),
                 ctl_words=['%08X' % w for w in CTL_WORDS], ctl_flags=CTL_FLAGS, use_screen=USE_SCREEN, standby=STANDBY,
-                tva_symbols={k: '%08X' % v for k, v in ss.items() if k.startswith('_tva')})
+                tva_symbols={k: '%08X' % v for k, v in ss.items() if k.startswith('_tva')},
+                history=history('%08X' % build_id))
     (OUT / 'module.json').write_text(json.dumps(info, indent=2) + '\n')
     print('sector_107.bin  %s  build %08X  fmt %d (min %d)  payload %d B  sum %08X' % (h, build_id, fmt, fmt_min, len(payload), wsum(payload)))
 

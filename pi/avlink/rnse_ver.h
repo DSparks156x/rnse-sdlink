@@ -65,8 +65,8 @@ static int rnse_ver_line(const rnse_ver_t *v, int pmin, int pmax, char *b, size_
     return snprintf(b, n, "RNS-E module too %s: %s; this chain sends fmt %d-%d: not streaming", v->info.fmt < pmin ? "old" : "new", id, pmin, pmax);
 }
 
-/* shell-sourceable state, written atomically (tmp + rename). 0 = written. */
-static int rnse_ver_write(const char *path, const rnse_ver_t *v)
+/* shell-sourceable state, written atomically (tmp + rename). 0 = written. teensy: its FW_VERSION, NULL or "" = not seen yet. */
+static int rnse_ver_write(const char *path, const rnse_ver_t *v, const char *teensy)
 {
     char tmp[512];
     if (!path || snprintf(tmp, sizeof tmp, "%s.tmp", path) >= (int)sizeof tmp) return -1;
@@ -79,6 +79,11 @@ static int rnse_ver_write(const char *path, const rnse_ver_t *v)
         fprintf(f, "RNSE_BUILD=%08X\nRNSE_FMT=%u\nRNSE_FMT_MIN=%u\nRNSE_FW_ID=%X\nRNSE_TABLE=%u\nRNSE_HS=%u\n",
                 (unsigned)r->build_id, r->fmt, r->fmt_min, (unsigned)r->fw_id, r->table_ver, r->hs_ver);
     fprintf(f, "STREAM_FMT=%d\n", v->fmt);
+    if (teensy && *teensy) {                       /* single-quoted for the shell: drop any quote and control character */
+        fputs("TEENSY_VERSION='", f);
+        for (const char *c = teensy; *c; c++) if (*c != '\'' && (unsigned char)*c >= 0x20) fputc(*c, f);
+        fputs("'\n", f);
+    }
     if (fclose(f)) return -1;
     return rename(tmp, path);
 }

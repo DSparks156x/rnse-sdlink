@@ -117,15 +117,27 @@ int main(void)
     rnse_ver_none(&v);
     rnse_ver_line(&v, 1, 1, line, sizeof line);
     CHECK(strstr(line, "no version announced") && v.fmt == AVL_FMT_DEFAULT, "nothing announced: today's format, logged");
-    CHECK(rnse_ver_write(path, &v) == 0 && file_has(path, "RNSE_ANNOUNCED=0\n") && file_has(path, "STREAM_FMT=1\n") &&
-          !file_has(path, "RNSE_BUILD="), "file without an announcement");
+    CHECK(rnse_ver_write(path, &v, NULL) == 0 && file_has(path, "RNSE_ANNOUNCED=0\n") && file_has(path, "STREAM_FMT=1\n") &&
+          !file_has(path, "RNSE_BUILD=") && !file_has(path, "TEENSY_VERSION="), "file without an announcement");
     rnse_ver_set(&v, &r, 1, 1);
-    CHECK(rnse_ver_write(path, &v) == 0 && file_has(path, "RNSE_ANNOUNCED=1\n") && file_has(path, "RNSE_BUILD=F46C419D\n") &&
+    CHECK(rnse_ver_write(path, &v, "") == 0 && file_has(path, "RNSE_ANNOUNCED=1\n") && file_has(path, "RNSE_BUILD=F46C419D\n") &&
           file_has(path, "RNSE_FMT=1\n") && file_has(path, "RNSE_FW_ID=54B\n") && file_has(path, "RNSE_TABLE=1\n") &&
-          file_has(path, "STREAM_FMT=1\n"), "file with an announcement");
+          file_has(path, "STREAM_FMT=1\n") && !file_has(path, "TEENSY_VERSION="), "file with an announcement");
     rnse_ver_set(&v, &r, 2, 2);
-    CHECK(rnse_ver_write(path, &v) == 0 && file_has(path, "STREAM_FMT=0\n"), "file after a reject: STREAM_FMT=0");
+    CHECK(rnse_ver_write(path, &v, NULL) == 0 && file_has(path, "STREAM_FMT=0\n"), "file after a reject: STREAM_FMT=0");
+    CHECK(rnse_ver_write(path, &v, "sdemu 0.5 (2026-11-10, it's)") == 0 &&
+          file_has(path, "TEENSY_VERSION='sdemu 0.5 (2026-11-10, its)'\n"), "Teensy version, single-quoted, quote dropped");
     unlink(path); rmdir(dir);
+
+    /* 5. the Teensy's version from its console lines */
+    static link_t lk;
+    CHECK(!link_console_line(&lk, "LINK active=1 msgs=3") && !lk.teensy_ver[0], "other console lines carry no version");
+    CHECK(link_console_line(&lk, "VER sdemu 0.5 (2026-11-10, touch) flexio2_param=00000000 f_cpu=600000000\r") &&
+          !strcmp(lk.teensy_ver, "sdemu 0.5 (2026-11-10, touch)") && lk.n_teensy_ver == 1, "VER line: the version, up to its params");
+    CHECK(link_console_line(&lk, "BOOT sdemu 0.5 (2026-11-10, touch)") && lk.n_teensy_ver == 1, "same version again: no change counted");
+    CHECK(link_console_line(&lk, "HELP sdemu 0.6 (2026-12-01)") && !strcmp(lk.teensy_ver, "sdemu 0.6 (2026-12-01)") &&
+          lk.n_teensy_ver == 2, "HELP line: a new version is counted");
+    CHECK(!link_console_line(&lk, "VER garbage") && lk.n_teensy_ver == 2, "a VER line that is not sdemu is ignored");
 
     printf("%s: rnse version handshake (Pi side), %d failure(s)\n", fails ? "FAIL" : "PASS", fails);
     return fails ? 1 : 0;

@@ -44,14 +44,56 @@ void link_close(link_t *l)
     l->out = l->in = NULL;
 }
 
-uint8_t *link_msg(link_t *l, uint16_t type, uint32_t len)
+static void out_room(link_t *l, size_t n)
 {
     if (l->opos && l->opos == l->olen) l->opos = l->olen = 0;
-    if (l->olen + TL_HDR + len > l->ocap) {             /* compact, then grow */
+    if (l->olen + n > l->ocap) {                        /* compact, then grow */
         memmove(l->out, l->out + l->opos, l->olen - l->opos);
         l->olen -= l->opos; l->opos = 0;
-        while (l->olen + TL_HDR + len > l->ocap) { l->ocap *= 2; l->out = realloc(l->out, l->ocap); }
+        while (l->olen + n > l->ocap) { l->ocap *= 2; l->out = realloc(l->out, l->ocap); }
     }
+}
+
+void link_raw(link_t *l, const void *p, size_t n)
+{
+    out_room(l, n);
+    memcpy(l->out + l->olen, p, n);
+    l->olen += n;
+}
+
+/* "VER sdemu 0.5 (...) flexio2_param=..." (answer to 'ver'), "BOOT sdemu 0.5 (...)", "HELP sdemu 0.5 (...)", "ST begin sdemu ..." */
+int link_console_line(link_t *l, const char *s)
+{
+    static const char *const pre[] = {"VER ", "BOOT ", "HELP ", "ST begin "};
+    for (size_t k = 0; k < sizeof pre / sizeof pre[0]; k++) {
+        size_t n = strlen(pre[k]);
+        if (strncmp(s, pre[k], n)) continue;
+        s += n;
+        const char *e = strstr(s, " flexio2_param=");
+        size_t len = e ? (size_t)(e - s) : strlen(s);
+        while (len && (s[len - 1] == '\r' || s[len - 1] == ' ')) len--;
+        if (!len || strncmp(s, "sdemu", 5)) return 0;
+        if (len >= sizeof l->teensy_ver) len = sizeof l->teensy_ver - 1;
+        if (strlen(l->teensy_ver) != len || memcmp(l->teensy_ver, s, len)) {
+            memcpy(l->teensy_ver, s, len); l->teensy_ver[len] = 0;
+            l->n_teensy_ver++;
+        }
+        return 1;
+    }
+    return 0;
+}
+
+static void console_bytes(link_t *l, const uint8_t *p, size_t n)
+{
+    for (size_t i = 0; i < n; i++) {
+        if (p[i] == '\n') { l->cline[l->clen] = 0; link_console_line(l, l->cline); l->clen = 0; }
+        else if (l->clen + 1 < sizeof l->cline) l->cline[l->clen++] = (char)p[i];
+    }
+}
+
+uint8_t *link_msg(link_t *l, uint16_t type, uint32_t len)
+{
+    out_room(l, TL_HDR + len);
     uint8_t *h = l->out + l->olen;
     wr32le(h, TL_MAGIC); wr16le(h + 4, type); wr16le(h + 6, 0); wr32le(h + 8, len); wr32le(h + 12, l->msg_seq++);
     l->olen += TL_HDR + len;
@@ -179,6 +221,7 @@ int link_read(link_t *l)
                 if (j + 4 > l->ilen) j = l->ilen >= 3 ? l->ilen - 3 : 0;   /* keep a possible magic prefix */
                 if (j <= i) break;
                 if (l->console) fwrite(l->in + i, 1, j - i, stderr);
+                console_bytes(l, l->in + i, j - i);
                 l->rx_junk += j - i;
                 i = j;
                 continue;

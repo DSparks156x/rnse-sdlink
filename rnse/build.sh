@@ -9,7 +9,7 @@ set -e
 cd "$(dirname "$0")"
 OUT=${OUT:-out}
 XCF=${XCF--DSD_LEAVEFIX}
-X=~/sh-elf/bin/sh-elf-
+X=${SH_ELF:-~/sh-elf/bin/sh-elf-}
 CF="-mb -m4-single -O2 -ffreestanding -fno-builtin -nostdlib -fno-common -Wall -Wextra -Wno-unused-parameter -Isrc ${SDLRAM}"
 LIBGCC=$(${X}gcc -mb -m4-single -print-libgcc-file-name)
 mkdir -p $OUT

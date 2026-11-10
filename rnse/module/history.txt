@@ -1,0 +1,3 @@
+# SDLink module build ids, oldest first (mkmodule.py appends new ones; module.json 'history').
+# An updater uses the order to tell an older installed module from a newer one. Commit new lines with their sources.
+F46C419D 2026-11-10

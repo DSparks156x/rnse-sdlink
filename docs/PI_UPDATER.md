@@ -49,3 +49,22 @@ This uses the unit's CAN service (the B-series commands on the 0x7Bx IDs): B1 re
    - Restart `avsd-chain`.
 8. **Keep a rollback.** Keep the previous `sector_107.bin`. After any disc install, recheck the sector 107 CRC and re-apply the Pi's
    newer image if it differs.
+
+## In rnse-carpi
+carpid does this as the LIVI firmware screen's **Install** (`crates/carpid/src/firmware.rs`). Where it differs from the steps above:
+- **Staging goes over CAN (B3 data frames), not SD.** The SD bootstrap (`sdboot`, `sdstage`) uses firmware-specific addresses
+  that are not in the firmware table, so it only works on the bench lineage. B3 needs only the CAN service every SDLink firmware
+  has. About 26 000 frames at ~400 a second; a CRC mismatch at B3 END restages slower (200, then 100 a second). The Teensy is not
+  used, but the chain is still stopped.
+- **The table version must equal** the image's `+0x98`, not just be at least it: the module refuses any other table version.
+- **The bus is leased** (carpi-gate) from auto start off to the commit, and for the final off-word write. Every other sender on
+  ICAN is refused meanwhile. Only these frames pass the lease: B9 to `0x8F72F004`, B3, B7 slot 0 sector 107, B6 with one target armed.
+- **Skip if current** compares the 0xA0-byte header first and reads the whole sector only when it matches.
+- **Order between builds:** build ids are hashes, so `module.json` carries `history` (`rnse/module/history.txt`, oldest first);
+  `mkmodule.py` appends a new build there. Commit that line with the sources.
+- **Rollback** is the previous release's `firmware/rnse/sector_107.bin` under `/opt/carpi/releases/`.
+
+The Teensy's version reaches carpid through avlink: it asks `ver` on the console once the link runs and writes
+`TEENSY_VERSION='...'` into `--rnse-file`. With the chain stopped, carpid asks itself.
+
+Not yet run on a car: the first CAN commit from the Pi.

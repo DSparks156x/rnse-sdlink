@@ -529,7 +529,22 @@ static void rnse_report(void)
     char line[256];
     rnse_ver_line(&g_ver, O.fmt_min, O.fmt_max, line, sizeof line);
     fprintf(stderr, "avlink: %s\n", line);
-    if (O.rnse_file && rnse_ver_write(O.rnse_file, &g_ver)) fprintf(stderr, "avlink: %s: %s\n", O.rnse_file, strerror(errno));
+    if (O.rnse_file && rnse_ver_write(O.rnse_file, &g_ver, g_link.teensy_ver)) fprintf(stderr, "avlink: %s: %s\n", O.rnse_file, strerror(errno));
+}
+/* The Teensy's firmware version (its 'ver' console command, answered on the same port) for --rnse-file, so an updater can compare
+ * it with the bundled one. Asked once STATUS flows (a byte before the DTR debounce would drop the link), again every 2 s, 5 times. */
+static uint64_t g_teensy_seen, g_teensy_ask_t;
+static int g_teensy_asks;
+static void teensy_version(uint64_t t)
+{
+    if (g_link.n_teensy_ver != g_teensy_seen) {
+        g_teensy_seen = g_link.n_teensy_ver;
+        fprintf(stderr, "avlink: Teensy firmware %s\n", g_link.teensy_ver);
+        if (O.rnse_file && rnse_ver_write(O.rnse_file, &g_ver, g_link.teensy_ver)) fprintf(stderr, "avlink: %s: %s\n", O.rnse_file, strerror(errno));
+    }
+    if (g_link.teensy_ver[0] || !g_link.n_status || g_teensy_asks >= 5 || t - g_teensy_ask_t < 2000000u) return;
+    link_raw(&g_link, "\nver\n", 5);
+    g_teensy_asks++; g_teensy_ask_t = t;
 }
 static void rnse_update(void)
 {
@@ -709,7 +724,7 @@ int main(int argc, char **argv)
         g_have_link = 1;
         send_config();
         rnse_ver_none(&g_ver);                     /* until the unit announces itself: today's format */
-        if (O.rnse_file && rnse_ver_write(O.rnse_file, &g_ver)) fprintf(stderr, "avlink: %s: %s\n", O.rnse_file, strerror(errno));
+        if (O.rnse_file && rnse_ver_write(O.rnse_file, &g_ver, NULL)) fprintf(stderr, "avlink: %s: %s\n", O.rnse_file, strerror(errno));
     }
     if (O.keyctl && (g_keyfd = open(O.keyctl, O_RDWR | O_NONBLOCK)) < 0) { perror(O.keyctl); return 1; }
     signal(SIGINT, on_sig); signal(SIGTERM, on_sig); signal(SIGPIPE, SIG_IGN);
@@ -760,6 +775,7 @@ int main(int argc, char **argv)
             if (live) { reader_update(t); backoff_update(t); }
             key_feedback(t);
             rnse_update();
+            teensy_version(t);
             sdctl_poll();
             if (g_img_wait) img_t = t;             /* a bootstrap image is read once, later: it must outlast the stream around it */
             if (live && !!g_img_wait != g_img_stale && (g_img_wait || t - img_t > IMG_HOLD_US)) { g_img_stale = !!g_img_wait; send_config(); }
