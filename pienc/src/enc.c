@@ -93,6 +93,7 @@ struct rnv2enc {
     uint8_t *R[2][3];          /* recon double buffer */
     uint8_t *HP[3][3];         /* half-pel planes of the reference: [Y,U,V][h,v,hv] */
     int rb, first;
+    uint8_t cpage[NB]; /* frames skipped since the block was last coded (saturating): the decoder copies it forward while this is under nbuf - 1 */
     uint8_t prevmode[NB], changed[NB], forced[NB], damaged[NB], medone[NB], hdirty[BH], mchg[2][NB];
     uint8_t (*rec)[128];
     uint8_t skq[NB]; double skmu[NB]; int qp0; double mu0; /* static-skip validity: (qp, mu, level) of the last evaluated SKIP */
@@ -834,7 +835,7 @@ static void analyse_block(rnv2enc *e, int b, int *ncand) {
     int c, mx = mv[b][0], my = mv[b][1], sy, su, sv, ry, rc, has_mc; int64_t Sds = 0, Sdm = 0, Sdi = 0; unsigned skipc = 0;
     h->valid = 0;
     if (e->forced[b]) return;
-    h->valid = 1; h->cskip = e->prevmode[b] != SKIP ? CY_SKIPCOPY : CY_SKIP;
+    h->valid = 1; h->cskip = e->cpage[b] < e->p.nbuf - 1 ? CY_SKIPCOPY : CY_SKIP;
     qi = e->qt[e->cqp][0]; qa = e->qt[e->cqp][1]; /* built at create */
     gather_blk(e->tY, e->tU, e->tV, b, S);
     gather_blk(e->R[e->rb][0], e->R[e->rb][1], e->R[e->rb][2], b, Z);
@@ -1263,7 +1264,7 @@ void rnv2enc_default_params(rnv2enc_params *p) {
     p->link_cap = 0; p->adapt = 1; p->nlevels = 12; p->lam_lo = 0.0025; p->lam_x = 0.01; p->kappa_lo = 16; p->thr_lo = 0; p->fill_target = 0.25; p->hyst = 0.85; p->dwell = 4; p->pin_level = -1;
     p->max_tries = 12; p->threads = 1; p->static_skip = 1; p->simd = 1; p->me_level = 2; p->me_win_thr = 0; p->me_win_max = 1024; p->rt_rc = 1; p->prune = 3; p->qp_pred = 1;
     p->lag_target = 0.5; p->refine_static = 1; p->max_frame = 1.5; p->stale_d = 6000; p->stale_w = 0; p->burst_probe = 1; p->mu_relax = 1; p->qp_drop = 4; p->fast_refine = 1; p->dither = 0; p->dither_range = 24;
-    p->rc_tol = 0.88; p->btc_lmin = 0.02; p->fill_gap = 1; p->prune_nact = 1200; p->prune_r = 1.5; p->smooth = 0; p->src_mean = 48; p->pw_max = 3; p->btc_gate = 5; p->fill_pen = 2.0; p->r3 = 1; p->src_dead = 3; p->glass_dead = 1; p->lat_q4 = 2; p->lat_q2a = 2; p->lat_q2b = 3; p->lat_q4c = 3; p->lat_sharp = 0; p->rc_gamma = 1.0; p->sf_budget = 0; p->trim_ratio = 1.35; p->spill_qp = 18; p->spill_sf = 2; p->spill_gap = 30; p->spill_carry = 1; p->trim_max = 3; p->spill_cyc = 1; p->nu_relax = 0; p->nu_relax_thr = 0.94; p->nu_relax_n = 3;
+    p->rc_tol = 0.88; p->btc_lmin = 0.02; p->fill_gap = 1; p->prune_nact = 1200; p->prune_r = 1.5; p->smooth = 0; p->src_mean = 48; p->pw_max = 3; p->btc_gate = 5; p->fill_pen = 2.0; p->r3 = 1; p->src_dead = 3; p->glass_dead = 1; p->lat_q4 = 2; p->lat_q2a = 2; p->lat_q2b = 3; p->lat_q4c = 3; p->lat_sharp = 0; p->rc_gamma = 1.0; p->sf_budget = 0; p->trim_ratio = 1.35; p->spill_qp = 18; p->spill_sf = 2; p->spill_gap = 30; p->spill_carry = 1; p->trim_max = 3; p->spill_cyc = 1; p->nu_relax = 0; p->nu_relax_thr = 0.94; p->nu_relax_n = 3; p->nbuf = 3;
 }
 
 static void set_level(rnv2enc *e, int L);
@@ -1272,7 +1273,7 @@ void rnv2enc_force_key(rnv2enc *e) {
     int i;
     memset(e->R[0][0], 0, W * H); memset(e->R[0][1], 128, CW * H); memset(e->R[0][2], 128, CW * H);
     for (i = 0; i < 3; i++) { memset(e->HP[0][i], 0, W * H); memset(e->HP[1][i], 128, CW * H); memset(e->HP[2][i], 128, CW * H); } /* half-pel planes of black: the old ones must not survive the key */
-    e->rb = 0; e->first = 1; memset(e->prevmode, INTRA, NB); memset(e->prev_mv, 0, sizeof e->prev_mv); memset(e->clean, 0, NB);
+    e->rb = 0; e->first = 1; memset(e->prevmode, INTRA, NB); memset(e->cpage, 0, NB); memset(e->prev_mv, 0, sizeof e->prev_mv); memset(e->clean, 0, NB);
 }
 
 rnv2enc *rnv2enc_create(const rnv2enc_params *p) {
@@ -1305,7 +1306,7 @@ rnv2enc *rnv2enc_create(const rnv2enc_params *p) {
     e->rec = xmalloc(128 * NB); e->L = xmalloc(sizeof(latgrid)); e->q4 = p->lat_q4; e->q2a = p->lat_q2a; e->q2b = p->lat_q2b; e->q4c = p->lat_q4c; e->lamp = 1.0; e->mup = 0; e->rslope = -0.6;
     e->dc = xmalloc(sizeof(blkdc) * NB); e->dcp = xmalloc(sizeof(dcand) * NB * 3);
     e->bs = xmalloc(sizeof(blkstat) * NB); e->bs2 = xmalloc(sizeof(blkstat) * NB); e->bs2_cls = -1; e->bd = xmalloc(sizeof(blkdec) * NB); e->bd2 = xmalloc(sizeof(blkdec) * NB); e->bd3 = xmalloc(sizeof(blkdec) * NB);
-    memset(e->prevmode, INTRA, NB); memset(e->prev_mv, 0, sizeof e->prev_mv);
+    memset(e->prevmode, INTRA, NB); memset(e->cpage, 0, NB); memset(e->prev_mv, 0, sizeof e->prev_mv);
     e->rate_pf = e->p.rate / p->fps; e->buf = p->buf_frames * e->p.rate / p->fps; e->fill = 0; e->qp = p->qp_min; e->mu = p->mu_min; e->pend_dt = -1; e->dtf = 1; e->since_spill = 1 << 20;
     e->w2.cap = 0; e->s3cap = 1 << 20; e->s3 = xmalloc(e->s3cap); e->ocap = 1 << 21; e->obuf = xmalloc(e->ocap);
     run_jobs(e, job_halfpel, 3 * BH);
@@ -1400,7 +1401,7 @@ int rnv2enc_encode(rnv2enc *e, const uint8_t *pix, int stride, enum rnv2_fmt fmt
     e->nprev_act = e->nact; e->nact = 0;
     for (b = 0; b < NB; b++) {
         if (!e->forced[b]) e->act[e->nact++] = (uint16_t)b;
-        else { blkdec *d = &e->bd[b]; d->mode = SKIP; d->cbp = 0; d->cbits = 0; d->ebits = 0; d->cyc = e->prevmode[b] != SKIP ? CY_SKIPCOPY : CY_SKIP; }
+        else { blkdec *d = &e->bd[b]; d->mode = SKIP; d->cbp = 0; d->cbits = 0; d->ebits = 0; d->cyc = e->cpage[b] < e->p.nbuf - 1 ? CY_SKIPCOPY : CY_SKIP; }
     }
     t1 = now_ms();
     if (e->key) { /* the reference is black: nothing to search */
@@ -1554,6 +1555,7 @@ int rnv2enc_encode(rnv2enc *e, const uint8_t *pix, int stride, enum rnv2_fmt fmt
     for (b = 0; b < NB; b++) {
         int m = e->bd[b].mode;
         e->prevmode[b] = (uint8_t)m;
+        e->cpage[b] = m != SKIP ? 0 : e->cpage[b] < 255 ? (uint8_t)(e->cpage[b] + 1) : 255;
         /* clean: the reference equals the target at the panel, so only a source change wakes this block */
         if (m == SKIP) e->clean[b] = e->forced[b] ? e->clean[b] : (uint8_t)(e->dc[b].valid == 2);
         if (m == SKIP) e->prev_mv[b][0] = e->prev_mv[b][1] = 0; else { e->prev_mv[b][0] = e->mv0[b][0]; e->prev_mv[b][1] = e->mv0[b][1]; }

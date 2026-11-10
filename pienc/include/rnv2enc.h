@@ -69,6 +69,7 @@ typedef struct {
     /* superframe budget (0 = off, the old rate control bit for bit).  See README.txt "SUPERFRAME BUDGET". */
     double rc_tol, btc_lmin; int fill_gap; int prune_nact; double prune_r; int force_mode, smooth, src_mean; double pw_max; int btc_gate; double fill_pen; int r3, src_dead, glass_dead, lat_q4, lat_q2a, lat_q2b, lat_q4c, lat_sharp; double rc_gamma, rc_lmin; /* RNV3 */
     int tone_pal; /* --tonepal T: pixels within T codes of a flat pale colour on screen get that colour's mid-level target; 0 = off */
+    int nbuf;                  /* frame buffers the decoder rotates (2 or 3; the unit runs 3): a coded block is copied forward on each of the next nbuf - 1 frames it is skipped in, and the cycle model charges each copy */
     double nu_relax, nu_relax_thr; int nu_relax_n; /* cycle price: nu_relax = factor applied inside a frame while cycles are under nu_relax_thr of the cap, at most nu_relax_n times, 0 = off */
     double sf_budget;          /* bytes of video one superframe carries (avlink --maxvid x 512).  Non-key frames are held to this ceiling, or to a whole number of superframes when they spill deliberately */
     double trim_ratio;         /* a frame up to this x the ceiling is cut by re-running the mode decision at a higher lambda, no qp analysis pass (1.35) */

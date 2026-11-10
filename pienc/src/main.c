@@ -312,6 +312,7 @@ int main(int argc, char **argv) {
         else if (!strcmp(a, "--nurelax")) p.nu_relax = atof(ARG);
         else if (!strcmp(a, "--nurelaxthr")) p.nu_relax_thr = atof(ARG);
         else if (!strcmp(a, "--nurelaxn")) p.nu_relax_n = atoi(ARG);
+        else if (!strcmp(a, "--nbuf")) { p.nbuf = atoi(ARG); if (p.nbuf != 2 && p.nbuf != 3) { fprintf(stderr, "--nbuf must be 2 or 3\n"); return 1; } }
         else if (!strcmp(a, "--srcdead")) p.src_dead = atoi(ARG);
         else if (!strcmp(a, "--glassdead")) p.glass_dead = atoi(ARG);
         else if (!strcmp(a, "--latq")) { const char *f = ARG; sscanf(f, "%d,%d,%d,%d", &p.lat_q4, &p.lat_q2a, &p.lat_q2b, &p.lat_q4c); }
