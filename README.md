@@ -2,20 +2,8 @@
 
 Experimental: audio and video for an Audi RNS-E (SH7773 "193PU" head unit) delivered through its SD card slot.
 A Teensy 4.1 pretends to be an SD card; a program on the RNS-E reads A/V "superframes" from it, decodes them and drives the screen
-and the audio sink on the TV source. The source is typically Android Auto (Hudiy) running on a Raspberry Pi 5.
+and the audio sink on the TV source. Full 48khz 16bit audio uncompressed, compressed 480p60 with custom encoder RNSV3
 
-**State (2026-11-07): experimental, running in the author's car on one unit. Not a product.** Nothing here is safe to run on
-a car you care about. The RNS-E side pokes firmware internals at fixed addresses that only match
-specific firmware builds (checked at runtime in `rnse/layout.py`, `FW_CHECKS`). Misuse of flash tools (none are in this repo)
-can brick the unit.
-
-Measured on the bench, with the reader in the unit's flash and the stream started by the hook on TV entry: 4.56 MB/s total over
-SD, 60 superframes/s, 59.6 fps shown, 0 CRC errors in a 41 s window. Video alone reached about 4.2 to 4.3 MB/s. Open: recovery
-after the slot loses power is fixed in the Teensy code but not proven, the Teensy dropped off USB about every 15 minutes on one
-bench day, cold power-up and live Android Auto by ear are untested. Details and what is flashed versus RAM: `docs/BENCH_NOTES.md`.
-
-Used as a submodule by the Pi-side front ends (Hudiy integration in RNS-E-Hudiy, later LIVI): they supply the screen and the
-music, this repo carries them to the head unit.
 
 ## Hardware
 - Raspberry Pi 5 (aarch64, Pi OS Bookworm) running a Wayland compositor (labwc) with Hudiy / Android Auto
