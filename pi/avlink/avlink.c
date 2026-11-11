@@ -60,6 +60,12 @@
 #define BACKOFF_UP_US    500000u   /* one step up this often */
 #define BACKOFF_UP       0.03      /* of the configured cap */
 #define CATCHUP_MAX_LAG  3         /* an early tick only while the reader has room */
+/* Audio first. The unit holds 162.5 ms of audio (mkmodule target 7800) and each superframe carries one tick of it, so a reader that falls that far behind on big
+ * superframes (a full-screen change) runs the FIFO dry: a fade, silence, a refill, heard as a dip (car 2026-11-10). While the reader lags, no new frame starts: the
+ * superframes go out audio-only (REPEAT, a few sectors, no decode), the reader catches up in a few ticks and the picture holds instead of the sound. */
+#define VHOLD_LAG        4         /* superframes built and not yet read (67 ms, STATUS up to 50 ms old): hold new frames */
+#define VHOLD_CALM_LAG   2         /* release at or under this */
+#define VHOLD_LATE_US    100000u   /* a late tick (Teensy queue full) this recently counts as lag too: its audio is still on the Pi */
 #define CATCHUP_OVER     3648      /* frames over the prime level before an early tick: over the steady level (400) + a PipeWire burst (2048) + a margin of two ticks, so a burst alone never triggers one */
 
 /* ------------------------------------------------------------------ options */
@@ -239,6 +245,8 @@ static uint32_t g_seq, g_built, g_planned, g_first_total, g_last_fid, g_audio_pt
 static int g_video_done;
 static uint64_t g_t0;
 static uint32_t g_late_ticks, g_repeat_sf, g_credit_waits, g_sent_sf;
+static int g_vhold;                 /* audio first: no new frame starts while set */
+static uint32_t g_vholds, g_vhold_sf;
 static uint16_t audio_frames_per_sf(void) { return (uint16_t)(48000.0 / O.fps + 0.5); }
 
 static uint16_t total_for(const frag_t *fr)
@@ -278,7 +286,7 @@ static void build_sf(int blocking)
     sf_hdr h;
     memset(&h, 0, sizeof h);
     frag_t fr = {0}, *frp = NULL;
-    if (fq_n) { fr = fq[fq_head]; fq_head = (fq_head + 1) % FQ_N; fq_n--; frp = &fr; }
+    if (fq_n && !(g_vhold && fq[fq_head].off == 0)) { fr = fq[fq_head]; fq_head = (fq_head + 1) % FQ_N; fq_n--; frp = &fr; }
     uint16_t af = audio_frames_per_sf();
     uint32_t ab = 0;
     if (!O.no_audio) { audio_take(&g_aud, af, abuf, blocking); ab = (uint32_t)af * 4; }
@@ -310,6 +318,7 @@ static void build_sf(int blocking)
         h.flags |= SFF_REPEAT;
         h.frame_id = batch ? 0 : (uint16_t)g_last_fid;   /* sdgen.py writes 0 on REPEAT */
         g_repeat_sf++;
+        if (g_vhold && fq_n) g_vhold_sf++;
     }
     if (batch && O.eos && g_built + 1 == (uint32_t)O.k) h.flags |= SFF_EOS;
     /* next_total_hint: total_sec of seq+1 if it is already known */
@@ -318,7 +327,7 @@ static void build_sf(int blocking)
         if (g_built + 1 == (uint32_t)O.k) h.next_total_hint = g_first_total;   /* slot window wraps (sdgen) */
         else h.next_total_hint = total_for(fq_n ? &fq[fq_head] : NULL);         /* plan_fill made it certain */
     } else {
-        h.next_total_hint = fq_n ? total_for(&fq[fq_head]) : 0;
+        h.next_total_hint = g_vhold ? total_for(NULL) : fq_n ? total_for(&fq[fq_head]) : 0;   /* held: audio-only (short is a second read, long a wasted one) */
     }
     uint32_t vb = frp ? fr.len : 0;
     uint16_t total = sf_total_sec(ab, vb);
@@ -481,6 +490,15 @@ static void backoff_update(uint64_t t)
     }
 }
 
+static uint64_t g_late_t;
+static void vhold_update(uint64_t t)
+{
+    if (O.k || O.nocredits || !g_have_link || g_rd.stalled || !g_link.n_served) { g_vhold = 0; return; }
+    int lag = reader_lag(), late = g_late_t && t - g_late_t < VHOLD_LATE_US;
+    if (!g_vhold && (lag >= VHOLD_LAG || late)) { g_vhold = 1; g_vholds++; }
+    else if (g_vhold && lag <= VHOLD_CALM_LAG && !late) g_vhold = 0;
+}
+
 /* Audio left on the Pi by late ticks, and a reader with room again: send an early tick. It is an ordinary superframe (a queued frame if there is one, else REPEAT), so seq, pts and next_total_hint
  * stay exact. Audio in flight is conserved, so draining the Pi back to its level returns the unit's FIFO to its target and no further: the unit cuts a backlog only 75 ms over that. */
 static int catchup_due(uint64_t t, uint64_t period)
@@ -612,14 +630,14 @@ static void print_stats(const char *tag)
     fprintf(stderr, "%s sf built=%u sent=%u repeat=%u late=%u frames=%u drop=%u audio_in=%llu silence=%llu adrop=%llu raw=%llu adj=%d "
             "credit_waits=%u keyreq=%u | teensy status=%llu free=%u/%u slots=%u newest=%u served=%u srv_sect=%u holds=%u "
             "timeouts=%u notready=%u expired=%u idle=%u evicted=%u conv=%u rxerr=%u bus=%u junk=%llu "
-            "| rd_stalled=%d stalls=%u discards=%u vdiscarded=%u waitkey=%d window_waits=%u away_ticks=%u cap_kb=%u backoffs=%u catchups=%u "
+            "| rd_stalled=%d stalls=%u discards=%u vdiscarded=%u waitkey=%d window_waits=%u away_ticks=%u cap_kb=%u backoffs=%u catchups=%u vholds=%u vhold_sf=%u "
             "| rnse_build=%08X rnse_fmt=%d stream_fmt=%d hs_blocked=%u\n",
             tag, g_built, g_sent_sf, g_repeat_sf, g_late_ticks, g_frames_in, g_frames_dropped,
             (unsigned long long)g_aud.frames_in, (unsigned long long)g_aud.frames_silence, (unsigned long long)g_aud.frames_dropped, (unsigned long long)g_aud.raw_bytes / 4, (int)g_tick_adj, g_credit_waits, g_key_reqs,
             (unsigned long long)g_link.n_status, s->free_sectors, s->pool_sectors, s->free_slots, s->newest_seq,
             s->served_seq, s->sectors_served, s->holds, s->hold_timeouts, s->notready, s->expired, s->idle, s->evicted,
             s->converted, s->rx_errors, s->bus_width, (unsigned long long)g_link.rx_junk,
-            g_rd.stalled, g_stalls, g_discards, g_vdiscarded, g_wait_key, g_window_waits, g_away_ticks, (unsigned)(g_cap_now / 1000), g_backoffs, g_catchups,
+            g_rd.stalled, g_stalls, g_discards, g_vdiscarded, g_wait_key, g_window_waits, g_away_ticks, (unsigned)(g_cap_now / 1000), g_backoffs, g_catchups, g_vholds, g_vhold_sf,
             (unsigned)g_ver.info.build_id, g_ver.announced ? g_ver.info.fmt : 0, g_ver.fmt, g_hs_blocked);
 }
 
@@ -755,7 +773,7 @@ int main(int argc, char **argv)
                 g_hs_blocked++;                    /* the RNS-E module plays no format we send: nothing goes out, the input is dropped */
                 if (g_can_discard) video_drop_input();
             } else if (g_have_link && tq_n >= O.maxq) {
-                g_late_ticks++;                    /* USB/credits behind: don't consume a seq, encoder backs up */
+                g_late_ticks++; g_late_t = t;      /* USB/credits behind: don't consume a seq, encoder backs up */
             } else if (g_can_discard && g_rd.stalled && !g_stop_tlv && t - g_rd.t_act > RD_POLLING_US && t - away_t < AWAY_PERIOD_US) {
                 g_away_ticks++;                    /* nobody reading: no point filling the Teensy, audio stays current in the audio stage */
             } else { build_sf(0); away_t = t; }
@@ -772,7 +790,7 @@ int main(int argc, char **argv)
              * open). Keep asking until STATUS flows. A later counter reset fails closed; seamless reboot recovery needs an epoch handshake. */
             if (g_link.n_status != last_nstatus) { last_nstatus = g_link.n_status; last_status_t = t; }
             else if (t - last_status_t > 300000u && t - last_cfg_t > 200000u) { send_config(); last_cfg_t = t; }
-            if (live) { reader_update(t); backoff_update(t); }
+            if (live) { reader_update(t); backoff_update(t); vhold_update(t); }
             key_feedback(t);
             rnse_update();
             teensy_version(t);
