@@ -93,7 +93,7 @@ trap 'kill $HUD 2>/dev/null; exit 0' TERM INT
 sleep 6
 
 alive() { [ -s "$1" ] && kill -0 "$(cat "$1")" 2>/dev/null; }
-n=0
+n=0; age=0; lastsig=
 while :; do
   sleep 2
   # Every 10 s: keep the music on the Pi clock if Hudiy, WirePlumber or a replugged mic re-routed it (cheap no-op when it is in place)
@@ -105,7 +105,10 @@ while :; do
   alive "$CHAINDIR/link.pid" || why="avlink gone"
   pgrep -x 'parec|pw-record' >/dev/null || why="audio capture gone (avlink would stay on silence)"
   updating || pgrep -x "$APP_PROC" >/dev/null || why="$APP_PROC gone"
-  age=$(( $(date +%s) - $(stat -c %Y "$CHAINDIR/live.log" 2>/dev/null || echo 0) ))
+  # Silence counted in loop passes, not wall time: carpid sets the clock from the car after boot (forward by minutes, no RTC),
+  # and an mtime from before the jump would look that old.
+  sig=$(stat -c '%s %Y' "$CHAINDIR/live.log" 2>/dev/null)
+  if [ "$sig" != "$lastsig" ]; then lastsig=$sig; age=0; else age=$((age + 2)); fi
   [ "$age" -gt "$STALE_S" ] && why="avlink silent for ${age} s"
   if [ -n "$why" ]; then
     say "restart: $why"
