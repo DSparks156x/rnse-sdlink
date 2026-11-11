@@ -25,8 +25,8 @@ SDLink hook and table (`docs/FIRMWARE_CONTRACT.md`).
      then holds the validated table address.
    - Otherwise, probe the table addresses the current firmware builds use:
      - r64 line `0x806AA900`;
-     - PCBBC NA `0x806ACC00`;
-     - PCBBC EU `0x806BAC00`.
+     - PCBBC NA `0x806ACE00` (tone builds r66/r68 on; `0x806ACC00` before);
+     - PCBBC EU `0x806BAE00` (tone build r312 on; `0x806BAC00` before).
 2. **The image fits the table:** image `+0x98` (required table version) <= table version, and table ram_map == 1.
 3. **The image checks out before sending:** `+0x70 == 0x00D60000`, N sane, the sum matches, and the sha256 matches the release's `.sha256`.
 4. **The encoder matches:** the decoder in sector 107 and the Pi encoder share the stream format, so release and install them together.

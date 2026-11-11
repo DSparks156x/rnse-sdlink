@@ -32,13 +32,14 @@ typedef unsigned char u8;
 enum { W_MAGIC, W_OFF, W_STATE, W_STARTS, W_T_WANT, W_T_NOWANT, W_T_NEXT, W_ERR, W_FAILS, W_T_BOOT, W_REASON, W_HEALS, W_STAGE,
        W_PROBES, W_PROBE_LAST, W_ROUTE, W_T_START, W_SAMPLE, W_TRN, W_CRASH, W_STA_RET, W_MRBAD, W_T_STOP, W_BUILD, W_T_LAST,
        W_FWT, W_FWT_ST,     /* v2: validated table address (never anything else), table status (FWT_OK or FV_*) */
-       W_HS_ST, W_HS_K, W_HS_T0, W_HS_N, W_HS_ACK };   /* version handshake (appended; words 0..26 unchanged), see hs_gate */
+       W_HS_ST, W_HS_K, W_HS_T0, W_HS_N, W_HS_ACK,     /* version handshake (appended; words 0..26 unchanged), see hs_gate */
+       W_TN_ST, W_TN_SNAP, W_TN_CUR, W_TN_N, W_TN_EXT }; /* tone (appended): see tone_poll */
 #define TVA_MAGIC 0x54564132u    /* 'TVA2' state block (v1 used 'TVA1': a v1 -> v2 change re-inits) */
 #define OFF_MAGIC 0x4F464621u
 #define TR_BASE   (TVA_BASE + 0x100)
 #define TR_N      128u
 enum { TS_IDLE, TS_RUN, TS_STOP };
-enum { TR_INIT = 1, TR_SAMPLE, TR_START, TR_STARTFAIL, TR_STOP, TR_EXIT, TR_HEAL, TR_LOADER, TR_ROUTE, TR_CRASHOFF };
+enum { TR_INIT = 1, TR_SAMPLE, TR_START, TR_STARTFAIL, TR_STOP, TR_EXIT, TR_HEAL, TR_LOADER, TR_ROUTE, TR_CRASHOFF, TR_TONE };
 enum { WHY_SRC = 1, WHY_SCREEN, WHY_POWER, WHY_DU, WHY_OFF };
 
 /* ---- firmware table ---- */
@@ -115,7 +116,7 @@ static u32 fwt_check(const u32 *t)
     u32 a = (u32)t, i;
     if ((a & 3u) || a < FLASH_LO || a + FWT_NWORDS * 4u > FLASH_HI) return FV(FV_ADDR, 0);
     if (t[FWT_W_MAGIC] != FWT_MAGIC) return FV(FV_MAGIC, 0);
-    if (t[FWT_W_VERSION] != FWT_VERSION) return FV(FV_VERSION, t[FWT_W_VERSION]);
+    if (t[FWT_W_VERSION] != FWT_VERSION && t[FWT_W_VERSION] != FWT_VERSION_TONE) return FV(FV_VERSION, t[FWT_W_VERSION]);
     if (t[FWT_W_NWORDS] != FWT_NWORDS) return FV(FV_NWORDS, t[FWT_W_NWORDS]);
     if (t[FWT_W_RAMMAP] != SDL_RAMMAP) return FV(FV_RAMMAP, t[FWT_W_RAMMAP]);
     if (crc32_bits((const u8 *)t, (FWT_NWORDS - 1u) * 4u) != t[FWT_NWORDS - 1u]) return FV(FV_CRC, 0);
@@ -154,22 +155,145 @@ static inline u32 want_now(void)
 
 extern void tva_task(void);
 
+/* ------------------------------------------------------------------ tone: SDLink on TV uses the TV source's bass/treble
+ * (analysis/tone_source_v1/IMPLEMENTATION.md). The firmware keeps bass/treble per audio input in a battery-backed cache and picks the
+ * slot by the input the audio controller REPORTS; SDLink plays through the IIS (SD/MP3) input, so stock would play and edit the MP3
+ * player's tone while the TV page shows TV's. While SDLink plays on TV (state RUN, TV source, MMI on, reported input IIS, no overlay):
+ *   enter: the IIS pair (sampled while SDLink did not hold the slot) is kept in W_TN_SNAP; TV's pair goes into the IIS slot through
+ *          the firmware's own tone_set (slot store + checksum + backup record + UART to the controller);
+ *   run:   a knob edit lands in the IIS slot (stock): copy it to the TV slot, save, write the TV pair of the HMI mirror, notify the HMI;
+ *   leave: the IIS slot gets the snapshot back (saved; pushed to the controller when the MP3 player is the live input now).
+ * Version-1 table, or an extension that does not check out: nothing here runs and nothing outside our RAM is written. */
+#define TN_TAG    0x544E0000u                             /* 'TN' << 16 | bass << 8 | treble */
+#define FWX_OK    0x544E4F4Bu                             /* 'TNOK' */
+#define FX(r, d)  (0xFB000000u | ((u32)(r) << 16) | ((u32)(d) & 0xFFFFu))
+enum { TN_OFF, TN_IDLE, TN_ACTIVE };
+enum { FX_ADDR = 1, FX_MAGIC, FX_NWORDS, FX_CRC, FX_SIGADDR, FX_SIG, FX_LIT, FX_LAYOUT };
+#define SRC_STATUS FW(FWE_SRC_STATUS)
+#define CTRL_IIS   FW(FWE_CTRL_IIS)
+
+/* table already passed fwt_check. -> extension address, or 0 (W_TN_EXT says why). Reads flash only. */
+static const u32 *fwx_check(const u32 *t)
+{
+    const u32 *x = t + FWT_NWORDS;
+    u32 a = (u32)x, i, lay, sl, mi;
+    if (t[FWT_W_VERSION] != FWT_VERSION_TONE) { TVA(W_TN_EXT) = 0; return 0; }
+    if (a + FWX_NWORDS * 4u > FLASH_HI) { TVA(W_TN_EXT) = FX(FX_ADDR, 0); return 0; }
+    if (x[0] != FWX_MAGIC) { TVA(W_TN_EXT) = FX(FX_MAGIC, 0); return 0; }
+    if (x[1] != FWX_NWORDS) { TVA(W_TN_EXT) = FX(FX_NWORDS, x[1]); return 0; }
+    if (crc32_bits((const u8 *)x, (FWX_NWORDS - 1u) * 4u) != x[FWX_NWORDS - 1u]) { TVA(W_TN_EXT) = FX(FX_CRC, 0); return 0; }
+    for (i = 0; i < FWX_NSIG; i++) {
+        u32 f = x[FWX_HDR + i];
+        if ((f & 1u) || f < FLASH_LO || f + 4u > FLASH_HI) { TVA(W_TN_EXT) = FX(FX_SIGADDR, i); return 0; }
+        if (be32((const u8 *)f) != x[FWX_SIG0 + i]) { TVA(W_TN_EXT) = FX(FX_SIG, i); return 0; }
+    }
+    /* the data addresses must be the ones the firmware's own code loads */
+    if (x[FWX_SIG0 + FWX_TN_CACHE_LIT] != x[FWX_HDR + FWX_TN_CACHE] || x[FWX_SIG0 + FWX_TN_MIRROR_LIT] != x[FWX_HDR + FWX_TN_MIRROR]) {
+        TVA(W_TN_EXT) = FX(FX_LIT, 0); return 0;
+    }
+    lay = x[FWX_HDR + FWX_TN_LAYOUT]; sl = x[FWX_HDR + FWX_TN_SLOTS]; mi = x[FWX_HDR + FWX_TN_MIR];
+    i = (sl >> 8) > (sl & 255u) ? sl >> 8 : sl & 255u;        /* highest slot used */
+    if ((sl >> 8) > 15u || (lay >> 24) + i >= ((lay >> 16) & 255u) || ((lay >> 16) & 255u) + i >= ((lay >> 8) & 255u) ||
+        ((lay >> 8) & 255u) > 0x40u || (lay & 3u) || (mi >> 8) > 0x40u || (mi & 255u) > 0x40u || (x[FWX_HDR + FWX_TN_CACHE] & 3u)) {
+        TVA(W_TN_EXT) = FX(FX_LAYOUT, 0); return 0;
+    }
+    TVA(W_TN_EXT) = FWX_OK;
+    return x;
+}
+
+#define XV(e) (x[FWX_HDR + FWX_##e])
+static u32 tn_pair(const u32 *x, u32 slot)
+{
+    const volatile u8 *c = (const volatile u8 *)XV(TN_CACHE);
+    u32 lay = XV(TN_LAYOUT);
+    return ((u32)c[(lay >> 24) + slot] << 8) | c[((lay >> 16) & 255u) + slot];
+}
+static void tn_put(const u32 *x, u32 slot, u32 p)          /* raw slot write; the caller saves */
+{
+    volatile u8 *c = (volatile u8 *)XV(TN_CACHE);
+    u32 lay = XV(TN_LAYOUT);
+    c[(lay >> 24) + slot] = (u8)(p >> 8);
+    c[((lay >> 16) & 255u) + slot] = (u8)p;
+}
+static void tn_save(const u32 *x) { ((void (*)(int))XV(TN_SAVE))(0); }
+static void tn_set(const u32 *x, u32 p)                   /* both values into the REPORTED input's slot + controller */
+{
+    ((int (*)(int, int))XV(TN_SET))(2, (int)(p >> 8));
+    ((int (*)(int, int))XV(TN_SET))(3, (int)(p & 255u));
+}
+static void tn_mirror(const u32 *x, u32 off, u32 p)        /* HMI mirror pair: treble, bass (805BCA1E order) */
+{
+    volatile u8 *m = (volatile u8 *)XV(TN_MIRROR);
+    m[off] = (u8)p;
+    m[off + 1u] = (u8)(p >> 8);
+    ((void (*)(int, int))XV(TN_NOTIFY))((int)(XV(TN_NOTE) >> 16), (int)(XV(TN_NOTE) & 0xFFFFu));
+}
+static inline void tn_count(u32 shift) { TVA(W_TN_N) += 1u << shift; }   /* bytes: enters 24, syncs 16, restores 8, pushes 0 */
+
+static void tone_poll(const u32 *x)
+{
+    u32 si = XV(TN_SLOTS) >> 8, sv = XV(TN_SLOTS) & 255u, iis, on, held;
+    iis = tn_pair(x, si);
+    held = R8(SRC_CTX) == SRC_TV && R8(SRC_STATUS) == CTRL_IIS;      /* the only state in which SDLink can hold the IIS slot */
+    on = held && TVA(W_STATE) == TS_RUN && R8(PWM_STATE) == PWM_ON && !R8(SRC_OVERLAY);
+    if (TVA(W_TN_ST) != TN_ACTIVE) {
+        TVA(W_TN_ST) = TN_IDLE;
+        if (!held || (TVA(W_TN_SNAP) >> 16) != (TN_TAG >> 16)) TVA(W_TN_SNAP) = TN_TAG | iis;   /* the MP3 player's own pair */
+        if (!on) return;
+        {
+            u32 tv = tn_pair(x, sv);
+            TVA(W_TN_ST) = TN_ACTIVE; TVA(W_TN_CUR) = TN_TAG | tv; tn_count(24);
+            trace(TR_TONE, 1, (TVA(W_TN_SNAP) << 16) | tv);
+            if (iis != tv) {
+                tn_set(x, tv); tn_count(0);
+                if (tn_pair(x, si) != tv) {                   /* reported input moved under us: undo, retry next tick */
+                    trace(TR_TONE, 4, tn_pair(x, si));
+                    tn_put(x, si, TVA(W_TN_SNAP) & 0xFFFFu); tn_save(x);
+                    TVA(W_TN_ST) = TN_IDLE;
+                }
+            }
+        }
+        return;
+    }
+    if ((TN_TAG | iis) != TVA(W_TN_CUR)) {                   /* a knob edit landed in the IIS slot: it is TV's now */
+        tn_put(x, sv, iis);
+        tn_save(x);
+        tn_mirror(x, XV(TN_MIR) & 255u, iis);
+        TVA(W_TN_CUR) = TN_TAG | iis; tn_count(16);
+        trace(TR_TONE, 2, iis);
+    }
+    if (on) return;
+    {   /* leave: the MP3 player's pair back */
+        u32 s = TVA(W_TN_SNAP) & 0xFFFFu;
+        tn_put(x, si, s);
+        if (R8(SRC_STATUS) == CTRL_IIS && R8(SRC_CTX) != SRC_TV && R8(PWM_STATE) == PWM_ON) { tn_set(x, s); tn_count(0); }   /* MP3 plays now */
+        else tn_save(x);
+        tn_mirror(x, XV(TN_MIR) >> 8, s);
+        TVA(W_TN_ST) = TN_IDLE; tn_count(8);
+        trace(TR_TONE, 3, s);
+    }
+}
+
+static void sm_poll(u32 now);
+
 /* ------------------------------------------------------------------ ACON task, 100 ms. Must not block. */
 void tva_poll(const u32 *fwt)
 {
-    u32 now, want, sample, st, v;
+    u32 now, v;
+    const u32 *x;
     v = fwt_check(fwt);
     if (v) { fwt_fail(fwt, v); return; }                      /* never starts on a table that does not check out */
     TVA(W_FWT) = (u32)fwt;
     now = tick();
     if (TVA(W_MAGIC) != TVA_MAGIC || now < TVA(W_T_LAST)) {   /* first call after power-up, or after a reset that kept RAM */
-        u32 i, off = 0, crash = 0;
+        u32 i, off = 0, crash = 0, keep = 0;
         if (TVA(W_MAGIC) == TVA_MAGIC) {
             off = TVA(W_OFF) == OFF_MAGIC ? OFF_MAGIC : 0;   /* only traced now */
             crash = TVA(W_CRASH);
             if (TVA(W_STATE) != TS_IDLE) crash++;             /* the unit reset while a stream ran */
+            keep = 1;                                         /* RAM kept: so is the tone state (a session cut by the reset is undone below) */
         }
-        for (i = 0; i < 0x100 / 4 + TR_N * 4; i++) if (i != W_FWT) TVA(i) = 0;
+        for (i = 0; i < 0x100 / 4 + TR_N * 4; i++) if (i != W_FWT && !(keep && i >= W_TN_ST && i <= W_TN_N)) TVA(i) = 0;
         TVA(W_OFF) = 0;   /* any reset re-arms auto start (off word: flash tools, bench); the crash guard below re-sets it */
         TVA(W_CRASH) = crash; TVA(W_T_BOOT) = now; TVA(W_BUILD) = TVA_BUILD_ID;
         TVA(W_MAGIC) = TVA_MAGIC;
@@ -178,6 +302,15 @@ void tva_poll(const u32 *fwt)
     }
     TVA(W_FWT_ST) = FWT_OK;
     TVA(W_T_LAST) = now;
+    sm_poll(now);
+    x = fwx_check(fwt);
+    if (x) tone_poll(x);
+    else TVA(W_TN_ST) = TN_OFF;
+}
+
+static void sm_poll(u32 now)
+{
+    u32 want, sample, st;
     sample = ((u32)R8(SRC_CTX) << 24) | (((u32)R16(SCR_GROUP) << 8) & 0xFFFF00u) | R8(PWM_STATE);
     if (sample != TVA(W_SAMPLE)) { TVA(W_SAMPLE) = sample; trace(TR_SAMPLE, sample, R8(SRC_OVERLAY)); }
 

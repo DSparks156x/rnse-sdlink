@@ -1267,7 +1267,8 @@ static u32 fwt_load(void)
     if (a != ~CTL_W(CTL_FWT + 1)) return 1;
     if ((a & 3u) || !((a >= 0x80000000u && a < 0x81000000u) || (a >= (u32)SDL_RAM_LO && a + FWT_NWORDS * 4u <= (u32)SDL_RAM_HI))) return 2;
     for (i = 0; i < FWT_NWORDS; i++) g_fwt[i] = t[i];
-    if (g_fwt[FWT_W_MAGIC] != FWT_MAGIC || g_fwt[FWT_W_VERSION] != FWT_VERSION || g_fwt[FWT_W_NWORDS] != FWT_NWORDS) return 3;
+    if (g_fwt[FWT_W_MAGIC] != FWT_MAGIC || (g_fwt[FWT_W_VERSION] != FWT_VERSION && g_fwt[FWT_W_VERSION] != FWT_VERSION_TONE) ||
+        g_fwt[FWT_W_NWORDS] != FWT_NWORDS) return 3;   /* v2 = v1 + tone extension after it (tvauto's): same first part */
     if (g_fwt[FWT_W_RAMMAP] != SDL_RAMMAP) return 4;
     crc32_init();
     if (crc32_upd(0, (const u8 *)g_fwt, (FWT_NWORDS - 1u) * 4u) != g_fwt[FWT_NWORDS - 1u]) return 5;

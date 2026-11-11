@@ -115,6 +115,23 @@ The kernel layout is assumed the same everywhere (task control block stride 0x40
 **Versioning.** Adding, removing or reordering entries changes the table format: bump `FWT_VERSION`. A module refuses tables of
 other versions, and its header word +0x98 lets an updater refuse to install a module that is newer than the unit's table.
 
+**Version 2: tone extension (2026-11-10).** Version 2 = the version-1 table above, word for word, except word 1 = 2 (its CRC covers
+it as before), followed directly by the tone extension (`fwtab.h` `FWT_TONE_SIGNED` / `FWT_TONE_VALUES`):
+
+| word | content |
+|---|---|
+| x+0 | `'SDTN'` |
+| x+1 | nwords of the extension (incl. its CRC) |
+| x+2 .. | tone entries: tone set, tone save, HMI notify, the two literal words that hold the cache and mirror addresses (SIGNED); cache address, cache layout, IIS/TV slots, HMI mirror address, IIS/TV mirror offsets, notify arguments |
+| .. | first 4 bytes at each tone SIGNED entry |
+| last | CRC-32 (zlib) of the extension words before it |
+
+A module of 2026-11-10 or later accepts versions 1 and 2 (`FWT_VERSION` stays 1 = the version it needs; header +0x98 = 1).
+Version 1, or an extension that fails its check (magic, nwords, CRC, signatures, literal words = cache/mirror values, layout bounds),
+turns only the tone feature off; SDLink runs as before. sdstream copies and checks only the version-1 part. A module older than this
+refuses a version-2 table (`FA03`, SDLink off, unit stock): install the module (107) before the table sector.
+What the feature does: `analysis/tone_source_v1/IMPLEMENTATION.md` (private tools repo).
+
 ## RAM map (`rnse/src/sdl_ram.h`, ram_map 1)
 The table's ram_map word is the firmware's promise that these regions are free. The module refuses any other value.
 
@@ -161,6 +178,11 @@ On units with the EU voice-recognition module, the firmware build disables that 
 | 29 | first ack tick (pending timer), 0 = none |
 | 30 | announcements sent since power-up |
 | 31 | last ack word: verdict << 24 \| chosen format << 16 |
+| 32 | tone state: 0 off (no valid extension), 1 idle, 2 active (SDLink holds the IIS slot with TV's pair) |
+| 33 | tone snapshot: `'TN'` << 16 \| MP3 (IIS) bass << 8 \| treble, kept across a reset that keeps RAM |
+| 34 | tone pair last seen in the IIS slot while active (`'TN'` << 16 \| bass << 8 \| treble) |
+| 35 | tone counters (bytes): enters, knob syncs, restores, pushes |
+| 36 | tone extension status: 0 = version-1 table, `'TNOK'` (`0x544E4F4B`), or `FB<reason><entry>` (1 address, 2 magic, 3 nwords, 4 CRC, 5 signature address, 6 signature, 7 literal word, 8 layout) |
 | +0x100 | trace ring |
 
 What `tva_poll` does on each call:

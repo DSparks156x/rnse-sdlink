@@ -3,7 +3,7 @@
  * FWT_SIGNED / FWT_VALUES lists below: keep one X(NAME) per line, nothing else on that line but an optional comment).
  *
  * Table layout (big-endian u32 words, in the firmware's own patch area, address passed in r4 by hook v2):
- *   [0] 'SDFW'  [1] version 1  [2] nwords (whole table)  [3] fw_id (free-form)  [4] ram_map 1
+ *   [0] 'SDFW'  [1] version 1 (2 = followed by the tone extension, below)  [2] nwords (this part)  [3] fw_id (free-form)  [4] ram_map 1
  *   [5 .. 5+FWE_N)           one word per entry, enum order
  *   [5+FWE_N .. +FWE_NSIG)   signature: first 4 bytes at each SIGNED entry's address, read from the firmware image
  *   [nwords-1]               CRC-32 (zlib) of all bytes before it
@@ -114,4 +114,38 @@ enum { FWT_SIGNED(FWT_ENUM_) FWE_NSIG, FWE_V0_ = FWE_NSIG - 1, FWT_VALUES(FWT_EN
 
 /* the includer defines FWT_BASE_PTR (an expression giving const u32 * to the table) */
 #define FW(e)       ((FWT_BASE_PTR)[FWT_HDR + (e)])
+
+/* ---- table version 2 = the version-1 table above, unchanged except word 1 = 2 (its own CRC as before), followed directly by the
+ * TONE EXTENSION (tvauto only: SDLink on TV uses the TV source's bass/treble, analysis/tone_source_v1/IMPLEMENTATION.md):
+ *   x[0] 'SDTN'  x[1] nwords of the extension (incl. its CRC)
+ *   x[2 .. 2+FWX_N)          one word per tone entry, enum order (FWT_TONE_SIGNED then FWT_TONE_VALUES)
+ *   x[2+FWX_N .. +FWX_NSIG)  first 4 bytes at each tone SIGNED entry
+ *   x[last]                  CRC-32 (zlib) of the extension words before it
+ * A module accepts version 1 and 2 (FWT_VERSION stays the version it NEEDS, header +0x98). Version 1, or an extension that does not
+ * check out, = tone feature off; SDLink itself runs either way. sdstream copies only the version-1 part. */
+#define FWT_VERSION_TONE 2u
+#define FWX_MAGIC    0x5344544Eu   /* 'SDTN' */
+#define FWX_HDR      2u
+
+/* tone SIGNED entries: code, or a literal-pool word (its signature IS the data address the code uses: checked against the value entry) */
+#define FWT_TONE_SIGNED(X) \
+    X(TN_SET)       /* u8 tone_set(id 2 bass / 3 treble, s8 value): store in the REPORTED input's slot, save, UART 19 00 02 id val */ \
+    X(TN_SAVE)      /* void tone_save(0): checksum + backup record of the battery cache */ \
+    X(TN_NOTIFY)    /* void hmi_notify(cat, code): qpost to the HMI queue + set_flg (audio status changed = 3,1) */ \
+    X(TN_CACHE_LIT) /* literal word in the cache getter: must hold TN_CACHE */ \
+    X(TN_MIRROR_LIT) /* literal word in the HMI mirror refresh: must hold TN_MIRROR */
+
+#define FWT_TONE_VALUES(X) \
+    X(TN_CACHE)     /* u8[] battery cache of per-input settings; checksum word at -4 */ \
+    X(TN_LAYOUT)    /* bass offset << 24 | treble offset << 16 | checksummed length << 8 */ \
+    X(TN_SLOTS)     /* cache slot of the IIS input << 8 | slot of the TV input */ \
+    X(TN_MIRROR)    /* HMI tone mirror (pairs: treble, bass) */ \
+    X(TN_MIR)       /* mirror pair offset of the IIS input << 8 | of the TV input */ \
+    X(TN_NOTE)      /* hmi_notify arguments: cat << 16 | code */
+
+#define FWX_ENUM_(n) FWX_##n,
+enum { FWT_TONE_SIGNED(FWX_ENUM_) FWX_NSIG, FWX_V0_ = FWX_NSIG - 1, FWT_TONE_VALUES(FWX_ENUM_) FWX_N };
+#undef FWX_ENUM_
+#define FWX_NWORDS  (FWX_HDR + FWX_N + FWX_NSIG + 1u)
+#define FWX_SIG0    (FWX_HDR + FWX_N)
 #endif
