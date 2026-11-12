@@ -31,9 +31,9 @@ FWT_VERSION = 1                                   # fwtab.h FWT_VERSION (checked
 TAG = b'.SDS'
 
 # The run parameters tvauto writes into sdstream's CTL words (rnse/sdstream.py make_ctl with: slot 0, gate 0, IIS route, no hop, mode av,
-# secs 0 (forever), wrap 0 (live), target 7800, block 960, sink 3, standby off). Word 1 (stop word) is never written by tvauto.
+# secs 0 (forever), wrap 0 (live), target 14400, block 960, sink 3, standby off). Word 1 (stop word) is never written by tvauto.
 CTL_WORDS = [0x43544C31, 0x00000000, 0x00000000, 0x00000060, 0x00000017, 0x00000000, 0x00000000, 0x00000001,
-             0x00000300, 0x000003C0, 0x00001E78, 0x00000003, 0x00000040, 0x00000000, 0x00000000, 0x00000000]
+             0x00000300, 0x000003C0, 0x00003840, 0x00000003, 0x00000040, 0x00000000, 0x00000000, 0x00000000]
 CTL_FLAGS = 0x17
 USE_SCREEN = 1                                    # TV screen word as well as the source context
 STANDBY = 0
@@ -112,7 +112,11 @@ def main():
     fwt = (RNSE / 'src' / 'fwtab.h').read_text()
     if '#define FWT_VERSION  %du' % FWT_VERSION not in fwt:
         die('fwtab.h FWT_VERSION != %d' % FWT_VERSION)
-    build_id = int(hashlib.sha256(img).hexdigest()[:8], 16)
+    # Everything that goes into the sector but the id itself: the stream image, tvauto's sources and its run parameters
+    # (a new CTL word alone must read as a new module to the updater).
+    cfg = struct.pack('>%dI4I' % len(CTL_WORDS), *CTL_WORDS, CTL_FLAGS, USE_SCREEN, STANDBY, FWT_VERSION)
+    srcs = b''.join((HERE / n).read_bytes().replace(b'\r\n', b'\n') for n in ('tvauto.c', 'hdr.S', 'tvauto.ld'))
+    build_id = int(hashlib.sha256(img + cfg + srcs).hexdigest()[:8], 16)
 
     MOD.mkdir(parents=True, exist_ok=True)
     (MOD / 'sdstream_pin.bin').write_bytes(img)
