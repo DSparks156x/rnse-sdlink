@@ -156,9 +156,9 @@ On units with the EU voice-recognition module, the firmware build disables that 
 | 5 | 0 | secs (forever) |
 | 6 | 0 | wrap (live) |
 | 7 | 1 | p1c |
-| 8 | `0x300` | sink depth 3 |
+| 8 | `0x800` | sink depth 8 |
 | 9 | 960 | block |
-| 10 | 14400 | target (300 ms) |
+| 10 | 9600 | target (200 ms) |
 | 11 | 3 | frame buffers (2 or 3) |
 | 12 | `0x40` | read hint (sectors) |
 | 13, 14 | 0 | start sequence, max superframes (0 = no limit) |
