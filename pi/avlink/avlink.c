@@ -60,7 +60,7 @@
 #define BACKOFF_UP_US    500000u   /* one step up this often */
 #define BACKOFF_UP       0.03      /* of the configured cap */
 #define CATCHUP_MAX_LAG  3         /* an early tick only while the reader has room */
-/* Audio first. The unit holds 200 ms of audio (mkmodule target 9600; 162.5 ms before 2026-11-12, 300 ms briefly) and each superframe carries one tick of it, so a reader that falls that far behind on big
+/* Audio first. The unit holds 80 ms of audio in its FIFO + 300 ms in the sink ring (mkmodule target 3840, sink 15; FIFO 162.5 ms / sink 60 ms before 2026-11-12) and each superframe carries one tick of it, so a reader that falls that far behind on big
  * superframes (a full-screen change) runs the FIFO dry: a fade, silence, a refill, heard as a dip (car 2026-11-10). While the reader lags, no new frame starts: the
  * superframes go out audio-only (REPEAT, a few sectors, no decode), the reader catches up in a few ticks and the picture holds instead of the sound. */
 #define VHOLD_LAG        4         /* superframes built and not yet read (67 ms, STATUS up to 50 ms old): hold new frames */

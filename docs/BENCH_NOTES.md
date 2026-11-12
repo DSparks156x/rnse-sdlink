@@ -11,7 +11,7 @@ this repo; "RAM" means loaded over CAN or SD into RAM and gone at the next power
 | Teensy firmware (`teensy/sdemu`) | Teensy 4.1, flashed over USB | hex `c1ba0665` is on the Teensy (includes the card-resume fix, see Recovery). Earlier `ef7e280f` carried the 1500-sector pool and slot pin |
 | `pi/avlink` | Pi | deployed; the Pi build has `--whole-sf` |
 | Encoder (`pienc/`, from the working tree's `pienc_budget`) | Pi | deployed; see "Live Pi settings" for what runs |
-| Reader, decoder, audio sink (`rnse/src/sdstream.c`, `rnv2sh.c` fast decoder) | RNS-E | as module SDST in the unit's flash (sector 96): reader without the per-superframe sleep, ring 170 sectors x 6, audio block 960 / sink 8 |
+| Reader, decoder, audio sink (`rnse/src/sdstream.c`, `rnv2sh.c` fast decoder) | RNS-E | as module SDST in the unit's flash (sector 96): reader without the per-superframe sleep, ring 170 sectors x 6, audio block 960 / sink 15 / target 80 ms |
 | Module that starts it on TV entry (`rnse/module`, sector 107) | RNS-E, ACON task 100 ms tick through the firmware hook | in the unit's flash; auto-starts the stream when the TV screen is entered, no CAN (`docs/FIRMWARE_CONTRACT.md`) |
 | Bench host (`rnse/benchd.py`, `rnse_bench.py`, `sdfast.py`) | PC | loads RAM programs over CAN, or over SD (about 2 s instead of minutes) |
 

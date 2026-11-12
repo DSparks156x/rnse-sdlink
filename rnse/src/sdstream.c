@@ -286,7 +286,7 @@ static void a_service(void)
     fill = a_wr - a_rd;
     if (a_state == 1 && fill >= target + sink_max * blk) { a_state = 2; a_fadein = 1; }   /* the ring takes its blocks first, then the FIFO sits at target */
     while (a_state == 2 && credits > ST(S_A_BLOCKS)) {
-        u32 *dst = (u32 *)(TONE_BUF + a_k * MAXBLK * 4), n, i;
+        u32 *dst = (u32 *)(TONE_BUF + a_k * MAXBLK * 4), n, i, room;
         const u32 *fifo = (const u32 *)AFIFO;
         u32 rs = p1c != 0, need = rs ? ((rs_frac + blk * (u32)rs_step) >> 16) + FIR_AHEAD : blk, used, keep_frac = rs_frac, old_rd = 0, cut = 0;
         int r;
@@ -300,9 +300,10 @@ static void a_service(void)
         if (a_rebuf && fill >= target) { a_rebuf = 0; a_fadein = 1; }   /* the ring is already full of silence here */   /* jitter buffer full again: play */
         n = a_rebuf ? 0 : (fill < blk ? fill : blk);
         if (n < blk && rf >= 2) break;                  /* sink still holds two blocks: wait for more data */
-        if (n == blk && rs && fill > target + RESYNC_OVER) {   /* backlog after a stall: latency matters more than these frames */
+        room = (sink_max - 1u - rf) * blk;              /* ring slots still free after this block: a stall drained them, the backlog refills them first */
+        if (n == blk && rs && fill > target + room + RESYNC_OVER) {   /* backlog after a stall: latency matters more than these frames */
             old_rd = a_rd; cut = 1;
-            a_rd = a_wr - target; fill = target; rs_frac = 0;
+            a_rd = a_wr - target - room; fill = target + room; rs_frac = 0;
             ST(S_A_RESYNC)++;
         }
         if (n == blk && rs && fill >= need) {
