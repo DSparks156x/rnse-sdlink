@@ -10,7 +10,10 @@
 //   with build F46C419D, fw_id 54B, table 1 and that stream format range; the reads go through the firmware's read_begin and
 //   gen_sector + hs_patch exactly as fxsd.cpp build_img. Prints "HS none|pending|accept|reject"; a reject stays stock (no stream reads),
 //   then counts the SF_BEGINs that still arrive for 1.5 s.
+//   --reannounce MS (with --announce): while reading, repeat the same announcement every MS ms from 500 ms on, as sdstream kreq_poll
+//   does while its decoder waits for a key. Prints "HS reannounced=N acked=N".
 // Usage: host_link --ptyfile F --k K --out served.rsav [--bus 4|1] [--start-delay ms] [--stale-ms ms] [--timeout s] [--announce MIN:MAX]
+//        [--reannounce MS]
 #include <errno.h>
 #include <fcntl.h>
 #include <poll.h>
@@ -111,7 +114,7 @@ static int announce(int fmt_min, int fmt_max, int *fmt) {
 
 int main(int argc, char **argv) {
   const char *ptyfile = nullptr, *outp = nullptr;
-  int k = 0, start_delay = 0, stale = 0, timeout_s = 120, hs_min = 0, hs_max = 0;
+  int k = 0, start_delay = 0, stale = 0, timeout_s = 120, hs_min = 0, hs_max = 0, reann_ms = 0;
   for (int i = 1; i + 1 < argc; i += 2) {
     if (!strcmp(argv[i], "--ptyfile")) ptyfile = argv[i + 1];
     else if (!strcmp(argv[i], "--k")) k = atoi(argv[i + 1]);
@@ -121,6 +124,7 @@ int main(int argc, char **argv) {
     else if (!strcmp(argv[i], "--stale-ms")) stale = atoi(argv[i + 1]);
     else if (!strcmp(argv[i], "--timeout")) timeout_s = atoi(argv[i + 1]);
     else if (!strcmp(argv[i], "--announce")) sscanf(argv[i + 1], "%d:%d", &hs_min, &hs_max);
+    else if (!strcmp(argv[i], "--reannounce")) reann_ms = atoi(argv[i + 1]);
   }
   if (!ptyfile || !outp || k < 1) { fprintf(stderr, "usage: host_link --ptyfile F --k K --out F [--bus 4|1] ...\n"); return 2; }
   t0_us = mono_us();
@@ -169,10 +173,17 @@ int main(int argc, char **argv) {
   // ---- mode A reader
   uint32_t seq = 0, hint = 178, done = 0;
   int tries = 0, rc = 0;
-  unsigned long served = 0;
+  unsigned long served = 0, reann = 0, reann_ack = 0;
+  uint64_t treann = mono_us() + 500000u;
   while (!done) {
     if (mono_us() - tstart > (uint64_t)timeout_s * 1000000u) { fprintf(stderr, "host_link: TIMEOUT at seq %u\n", seq); rc = 3; break; }
     service(0);
+    if (reann_ms && hs_max && mono_us() >= treann) {
+      int f = 0;
+      reann++;
+      if (announce(hs_min, hs_max, &f)) reann_ack++;
+      treann = mono_us() + (uint64_t)reann_ms * 1000u;
+    }
     uint32_t base = AVS_WIN_LBA + (seq & 0xFF) * 256u;
     read_cmd(base, (int)hint, rbuf);
     const uint8_t *h = rbuf;
@@ -202,6 +213,7 @@ int main(int argc, char **argv) {
   }
   fclose(out);
   for (int i = 0; i < 20; i++) service(1);           // let the last STATUS out
+  if (reann_ms) printf("HS reannounced=%lu acked=%lu\n", reann, reann_ack);
   const AvsStatus &s = AVS.st;
   printf("HOSTLINK rc=%d served_sf=%lu reads=%lu wire_crc_bad=%lu hdr_bad=%lu seq_mism=%lu zero_bad=%lu "
          "notready_seen=%lu idle_seen=%lu expired_seen=%lu retries=%lu holds=%lu teensy_holds=%u hold_timeouts=%u "

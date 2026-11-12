@@ -26,4 +26,9 @@
 #define SDL_HS_ACCEPT       1
 #define SDL_HS_REJECT       2
 
+/* Unit only (not mirrored): tvauto hands sdstream the announcement in CTL words, so the reader can repeat it as a key request while
+ * the decoder waits for a key (PROTOCOL.md 4.5). Word SDL_CTL_HSW = SDL_HSW_MAGIC, the next 4 = w[2k] << 16 | w[2k + 1]. */
+#define SDL_CTL_HSW         57
+#define SDL_HSW_MAGIC       0x53444857   /* 'SDHW' */
+
 #endif

@@ -437,18 +437,20 @@ static void send_config(void)
 
 /* video was lost on the way to the RNS-E (the decoder now waits for a key): ask the encoder for one at once, not at the next keyint */
 static int g_keyfd = -1;
-static uint32_t g_key_reqs;
+static uint32_t g_key_reqs, g_unit_keyreqs;
 static uint64_t g_key_t;
+static int g_unit_kreq;                            /* the unit re-announced: its decoder waits for a key (rnse_update) */
 static void key_feedback(uint64_t t)
 {
     static uint32_t last; static int have;
     const tl_status *s = &g_link.st;
     uint32_t lost = s->expired + s->evicted + s->notready;
     if (!have) { last = lost; have = g_link.n_status != 0; return; }
-    if (g_rd.stalled) { last = lost; return; }     /* no reader right now: a key would be lost too */
-    /* video lost, or the reader is back (its decoder needs a key), or frames were discarded and the key has not arrived: ask again */
-    if ((lost == last && !g_rd.returned && !g_wait_key) || t - g_key_t < 500000u) return;
-    last = lost; g_key_t = t; g_rd.returned = 0;
+    if (g_rd.stalled) { last = lost; g_unit_kreq = 0; return; }     /* no reader right now: a key would be lost too */
+    /* video lost, or the reader is back (its decoder needs a key), or frames were discarded and the key has not arrived,
+     * or the unit asks (it dropped video itself): ask again */
+    if ((lost == last && !g_rd.returned && !g_wait_key && !g_unit_kreq) || t - g_key_t < 500000u) return;
+    last = lost; g_key_t = t; g_rd.returned = 0; g_unit_kreq = 0;
     if (g_keyfd >= 0 && write(g_keyfd, "key\n", 4) == 4) g_key_reqs++;
 }
 
@@ -571,6 +573,9 @@ static void rnse_update(void)
         return;
     }
     g_rnse_seen = g_link.n_rnse;
+    /* a new announcement (Teensy count moved) after the first: the unit's reader repeats it while its decoder waits for a key
+     * (sdstream kreq_poll). A resend of the same one to a new sender keeps its count. */
+    if (g_ver.announced && g_link.rnse.count != g_ver.info.count && g_ver.fmt && !g_rd.stalled) { g_unit_kreq = 1; g_unit_keyreqs++; }
     rnse_ver_t nv;
     rnse_ver_set(&nv, &g_link.rnse, O.fmt_min, O.fmt_max);
     int changed = !g_ver.announced || nv.fmt != g_ver.fmt || memcmp(&nv.info, &g_ver.info, offsetof(tl_rnse_info, count));
@@ -628,12 +633,12 @@ static void print_stats(const char *tag)
     if (O.quiet) return;
     const tl_status *s = &g_link.st;
     fprintf(stderr, "%s sf built=%u sent=%u repeat=%u late=%u frames=%u drop=%u audio_in=%llu silence=%llu adrop=%llu raw=%llu adj=%d "
-            "credit_waits=%u keyreq=%u | teensy status=%llu free=%u/%u slots=%u newest=%u served=%u srv_sect=%u holds=%u "
+            "credit_waits=%u keyreq=%u unit_keyreq=%u | teensy status=%llu free=%u/%u slots=%u newest=%u served=%u srv_sect=%u holds=%u "
             "timeouts=%u notready=%u expired=%u idle=%u evicted=%u conv=%u rxerr=%u bus=%u junk=%llu "
             "| rd_stalled=%d stalls=%u discards=%u vdiscarded=%u waitkey=%d window_waits=%u away_ticks=%u cap_kb=%u backoffs=%u catchups=%u vholds=%u vhold_sf=%u "
             "| rnse_build=%08X rnse_fmt=%d stream_fmt=%d hs_blocked=%u\n",
             tag, g_built, g_sent_sf, g_repeat_sf, g_late_ticks, g_frames_in, g_frames_dropped,
-            (unsigned long long)g_aud.frames_in, (unsigned long long)g_aud.frames_silence, (unsigned long long)g_aud.frames_dropped, (unsigned long long)g_aud.raw_bytes / 4, (int)g_tick_adj, g_credit_waits, g_key_reqs,
+            (unsigned long long)g_aud.frames_in, (unsigned long long)g_aud.frames_silence, (unsigned long long)g_aud.frames_dropped, (unsigned long long)g_aud.raw_bytes / 4, (int)g_tick_adj, g_credit_waits, g_key_reqs, g_unit_keyreqs,
             (unsigned long long)g_link.n_status, s->free_sectors, s->pool_sectors, s->free_slots, s->newest_seq,
             s->served_seq, s->sectors_served, s->holds, s->hold_timeouts, s->notready, s->expired, s->idle, s->evicted,
             s->converted, s->rx_errors, s->bus_width, (unsigned long long)g_link.rx_junk,

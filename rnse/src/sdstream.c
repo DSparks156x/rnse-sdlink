@@ -16,6 +16,7 @@
 #include "avsd.h"
 #include "rnv2sh.h"
 #include "sdmem_target.h"
+#include "sdl_ver.h"
 
 /* SDLink v2: every firmware address and firmware-specific constant comes from the firmware table (fwtab.h), copied to g_fwt by
  * fwt_load() before anything else runs. The pointer is in CTL word CTL_FWT (and its complement in CTL_FWT + 1), written by the
@@ -48,7 +49,7 @@ enum { S_SEQ = 8, S_SF_OK, S_HDR_BAD, S_RETRY, S_EXPIRED, S_SEQ_MISM, S_RD_CALLS
        S_SSI_CR, S_SSI_SR, S_E219_A, S_E219_B, S_P904_A, S_P904_B,
        S_STUCK_N, S_STUCK_MS, S_STUCK_LBA, S_STUCK_CNT, S_SDR0, S_SDR1, S_SDR2, S_SDR3, S_SDR4, S_SDR5, S_SDR6, S_SDR7,
        S_FL_N, S_FL_WAIT, S_FL_F14, S_FL_F20, S_FL_F34, S_FL_F50, S_FL_MAX, S_FL_BLK,
-       S_SESS, S_R_MIN, S_R_ZERO, S_RATE_MHZ, S_CTX_CHG, S_CTX_A, S_CTX_B, S_DU_FIX, S_A_RESYNC, S_MUTE_A, S_KEYS, S_RESTARTS };
+       S_SESS, S_R_MIN, S_R_ZERO, S_RATE_MHZ, S_CTX_CHG, S_CTX_A, S_CTX_B, S_DU_FIX, S_A_RESYNC, S_MUTE_A, S_KEYS, S_RESTARTS, S_KREQ };
 enum { E_OK, E_NOCTL, E_PARAM, E_NOCARD, E_SINK_BUSY, E_OPN, E_NO_CREDIT, E_READ, E_STOPPED, E_DYD, E_SRC_LEFT, E_NOFWT };
 enum { L_SEQ, L_FLAGS, L_EV, L_RD, L_DEC, L_FILL, L_TOTAL, L_TICK };
 /* L_EV bits */
@@ -797,7 +798,8 @@ struct sfe { u32 hf, sseq, total, c_rd, lost, seq; };
 static volatile struct sfe r_e[NSF];
 static volatile u32 rd_done, rd_err;
 static u32 g_secs, g_hint, g_seq, g_maxsf, g_t_start, g_steal, g_t_all0;
-static u32 need_key, g_sess_seq;
+static volatile u32 need_key;      /* decoder writes, the reader reads (key request) */
+static u32 g_sess_seq;
 static inline u32 secs_up(void) { return g_secs && tick() - g_t_all0 >= g_secs * 1000u; }   /* secs 0 = forever */
 static int (*g_dec)(rnv_state *, const rnv_u8 *, rnv_u32);
 static u32 g_nbuf;
@@ -854,6 +856,36 @@ static void tr_crc(const u8 *sf, u32 seq, u32 hf, u32 total, u32 vsec, u32 vb)
 #define TR_READER(ev) ((void)0)
 #endif
 
+/* Key request (docs/PROTOCOL.md 4.5): while the decoder waits for a key it may have dropped deltas the Pi never saw lost (CRC bad, fragment
+ * or decode error). The reader repeats tvauto's announcement (8 one-sector reads into the free ring slot); the Teensy forwards it as
+ * RNSE_INFO and avlink asks the encoder for a key. After the wait has held KREQ_HOLD_MS, then every KREQ_GAP_MS. Reader task only:
+ * it owns the SD calls. ST(S_KREQ): low 16 bits announcements sent, high 16 acked ('SDHA' echo) by the Teensy. */
+#define KREQ_HOLD_MS 250u
+#define KREQ_GAP_MS  500u
+static u32 hs_ok, hs_w[SDL_HS_N], kr_since, kr_last;
+static void hs_load(void)                               /* tvauto's words (CTL SDL_CTL_HSW..+4); none, or a bad check: no key requests */
+{
+    u32 i, sum = 0;
+    hs_ok = 0;
+    if (CTL_W(SDL_CTL_HSW) != SDL_HSW_MAGIC) return;
+    for (i = 0; i < SDL_HS_N; i++) hs_w[i] = (CTL_W(SDL_CTL_HSW + 1 + i / 2) >> (i & 1 ? 0 : 16)) & 0xFFFFu;
+    for (i = 0; i < SDL_HS_N - 1; i++) sum += hs_w[i];
+    hs_ok = (hs_w[0] & 0xFF00u) == SDL_HS_W0 && (~sum & 0xFFFFu) == hs_w[SDL_HS_N - 1];
+}
+static void kreq_poll(u32 buf)
+{
+    const u8 *s = (const u8 *)buf;
+    u32 now, i;
+    if (!hs_ok || g_wrap) return;
+    if (!need_key) { kr_since = 0; return; }
+    now = tick();
+    if (!kr_since) { kr_since = now | 1u; return; }
+    if (now - kr_since < KREQ_HOLD_MS || (kr_last && now - kr_last < KREQ_GAP_MS)) return;
+    kr_last = now | 1u;
+    for (i = 0; i < SDL_HS_N; i++) if (timed_read(g_slot, SDL_HS_LBA + (i << 16) + hs_w[i], buf, 1)) return;
+    ST(S_KREQ) += be32(s) == SDL_HS_ACK && be16(s + 4) == hs_w[0] && be16(s + 18) == hs_w[SDL_HS_N - 1] ? 0x10001u : 1u;
+}
+
 void reader_main(void)
 {
     u32 rdfail = 0, retry = 0, lost = 0, due = 0, have_due = 0, seq = g_sess_seq ? g_sess_seq : g_seq, hint = g_hint;
@@ -873,6 +905,7 @@ void reader_main(void)
             tr_pw++;
 #endif
             dly_tsk(1); continue; }  /* decoder behind: hold the read, audio still services */
+        kreq_poll(buf);                                 /* buf is free here: the decoder is < NSF behind */
         r = timed_read(g_slot, lba, buf, hint);
         c_rd = now_counts() - c0;
         if (r) {
@@ -1115,7 +1148,7 @@ static u32 session(void)
     { u32 z; for (z = 0; z < 16; z++) TR_H[z] = 0; tr_left = 0; tr_pw = 0; *(volatile u32 *)SDL_TR_Z = 0; }
 #endif
     r_w = r_r = 0; rd_done = 0; rd_err = 0; rd_in = 0; stuck_seen = 0;
-    asm_on = 0; fl_have = 0; need_key = g_wrap ? 0 : 1;     /* mid-stream start: wait for a key instead of decoding deltas on black */
+    asm_on = 0; fl_have = 0; kr_since = kr_last = 0; need_key = g_wrap ? 0 : 1;     /* mid-stream start: wait for a key instead of decoding deltas on black */
     ST(S_A_BLOCKS) = 0; ST(S_A_HANDLE) = 0; du_up = 0; first_shown_t = 0; g_sess_t0 = tick();
     ST(S_SESS)++;
     t_start = tick();
@@ -1315,9 +1348,10 @@ int main(void)
     g_dec = (flags & F_PREF) ? rnvo_decode : rnvf_decode;   /* --pref: the old decoder, A/B on the bench */
     for (i = 64; i < 128; i++) ST(i) = 0;           /* st_begin clears 0..63 only */
     ST(S_A_MIN) = 0xFFFFFFFFu; ST(S_R_MIN) = 0xFFFFFFFFu;
-    { typedef char chk[(S_RESTARTS < 128) ? 1 : -1]; (void)sizeof(chk); }
+    { typedef char chk[(S_KREQ < 128) ? 1 : -1]; (void)sizeof(chk); }   /* S_KREQ = 127: SD_FASTSTUCK (bench, not with FWTAB) also uses ST(127) */
     for (i = 0; i < LOGN * 8; i++) R32(RES_BASE + 4 * i) = 0;
     KEYREQ = 0; key_on = 0; key_slot.busy = 0;
+    hs_load();
     crc32_init();
     ST(S_CD_RAW) = R32(CD_GPIO);
     {

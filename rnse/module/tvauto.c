@@ -96,6 +96,23 @@ enum { FV_ADDR = 1, FV_MAGIC, FV_VERSION, FV_NWORDS, FV_RAMMAP, FV_CRC, FV_SIGAD
 #define CRASH_MAX   3u
 
 static inline u32 tick(void) { return R32(TICK_MS); }
+
+/* The version announcement words (docs/PROTOCOL.md 4.5): announce() sends them; tva_task also hands them to sdstream (CTL SDL_CTL_HSW),
+ * whose reader repeats them as a key request while its decoder waits for a key. */
+static void hs_words(u32 *w)
+{
+    const u32 *t = (const u32 *)TVA(W_FWT);
+    u32 i, sum = 0;
+    w[0] = SDL_HS_W0 | SDL_HS_VER;
+    w[1] = TVA_BUILD_ID >> 16;
+    w[2] = TVA_BUILD_ID & 0xFFFFu;
+    w[3] = (SDL_STREAM_FMT_MIN << 8) | SDL_STREAM_FMT;
+    w[4] = t[FWT_W_FWID] >> 16;
+    w[5] = t[FWT_W_FWID] & 0xFFFFu;
+    w[6] = t[FWT_W_VERSION] & 0xFFFFu;
+    for (i = 0; i < SDL_HS_N - 1; i++) sum += w[i];
+    w[SDL_HS_N - 1] = ~sum & 0xFFFFu;
+}
 static inline u32 be32(const u8 *p) { return ((u32)p[0] << 24) | ((u32)p[1] << 16) | ((u32)p[2] << 8) | p[3]; }
 #define dly_tsk(ms) ((int (*)(int))FW_DLY_TSK)(ms)
 
@@ -421,18 +438,9 @@ static inline u32 be16(const u8 *p) { return ((u32)p[0] << 8) | p[1]; }
 
 static u32 announce(void)
 {
-    const u32 *t = (const u32 *)TVA(W_FWT);
     const u8 *s = (const u8 *)PROBE_BUF;
-    u32 w[SDL_HS_N], i, sum = 0, v;
-    w[0] = SDL_HS_W0 | SDL_HS_VER;
-    w[1] = TVA_BUILD_ID >> 16;
-    w[2] = TVA_BUILD_ID & 0xFFFFu;
-    w[3] = (SDL_STREAM_FMT_MIN << 8) | SDL_STREAM_FMT;
-    w[4] = t[FWT_W_FWID] >> 16;
-    w[5] = t[FWT_W_FWID] & 0xFFFFu;
-    w[6] = t[FWT_W_VERSION] & 0xFFFFu;
-    for (i = 0; i < SDL_HS_N - 1; i++) sum += w[i];
-    w[SDL_HS_N - 1] = ~sum & 0xFFFFu;
+    u32 w[SDL_HS_N], i, v;
+    hs_words(w);
     TVA(W_HS_N)++;
     for (i = 0; i < SDL_HS_N; i++) if (sd_read1(SDL_HS_LBA + (i << 16) + w[i])) return HS_NONE;
     oc_inval(PROBE_BUF, 512);
@@ -520,6 +528,12 @@ void tva_task(void)
     for (i = 0; i < sizeof ctl / sizeof ctl[0]; i++) if (i != 1) R32(CTL_BASE + 4 * i) = ctl[i];   /* word 1 = stop word: keep */
     R32(CTL_BASE + 4 * CTL_FWT) = TVA(W_FWT);                 /* the table, for sdstream's fwt_load */
     R32(CTL_BASE + 4 * (CTL_FWT + 1)) = ~TVA(W_FWT);
+    {   /* the announcement, for sdstream's key requests */
+        u32 w[SDL_HS_N];
+        hs_words(w);
+        for (i = 0; i < SDL_HS_N / 2; i++) R32(CTL_BASE + 4 * (SDL_CTL_HSW + 1 + i)) = w[2 * i] << 16 | w[2 * i + 1];
+        R32(CTL_BASE + 4 * SDL_CTL_HSW) = SDL_HSW_MAGIC;
+    }
     TVA(W_STAGE) = 3;
     trace(TR_LOADER, tick(), 0);
     ((int (*)(void))IMG_MAIN)();

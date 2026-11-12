@@ -37,7 +37,7 @@ F = ['seq', 'sf_ok', 'hdr_bad', 'retry', 'expired', 'seq_mism', 'rd_calls', 'rd_
      'a_ev_other', 'frag_in', 'frag_err', 'span_max', 'vframe_max', 'span1', 'span2', 'span3', 'span4', 'span5',
      'span6', 'span7', 'span8p', 'log_n', 'mem_cmd', 'mem_bad', 'mem_tx', 'mem_retry', 'mem_io',
      'iis_ret', 'iis_saved', 'iis_ms', 'iis_reissue', 'iis_end', 'ssi_cr', 'ssi_sr', 'e219a', 'e219b', 'p904a', 'p904b', 'stuck_n', 'stuck_ms', 'stuck_lba', 'stuck_cnt', 'sdr0', 'sdr1', 'sdr2', 'sdr3', 'sdr4', 'sdr5', 'sdr6', 'sdr7', 'fl_n', 'fl_wait', 'fl_f14', 'fl_f20', 'fl_f34', 'fl_f50', 'fl_max', 'fl_blk',
-     'sess', 'r_min', 'r_zero', 'rate_mhz', 'ctx_chg', 'ctx_a', 'ctx_b', 'du_fix', 'a_resync', 'mute_a', 'keys', 'restarts']
+     'sess', 'r_min', 'r_zero', 'rate_mhz', 'ctx_chg', 'ctx_a', 'ctx_b', 'du_fix', 'a_resync', 'mute_a', 'keys', 'restarts', 'kreq']
 LOGN = 1024
 CPM = L.TMU_HZ / 1000.0
 EV = ['hdr_bad', 'retry', 'vdec', 'verr', 'vcrc', 'vdrop', 'late', 'acrc', 'under', 'discont', 'tlv_bad', 'shown']
@@ -120,7 +120,7 @@ def report(d, info=None):
         print('  audio rate match: step offset %+.0f ppm; sink rate %.2f Hz (TMU clock); sink ring min %d, ring empty %d; backlog cuts %d' % (
             L.s32(d['fl_blk']) * 15.26, d['rate_mhz'] / 1000.0, d['r_min'] if d['r_min'] != 0xFFFFFFFF else -1, d['r_zero'], d['a_resync']))
     print('  first frame shown %d ms after session start' % d['stuck_ms'])
-    print('  sessions %d, source left %d, ctx %08X -> %08X, DU re-asserted %d, mute at route %04X, keys %d, restarts %d' % (d['sess'], d['ctx_chg'], d['ctx_a'], d['ctx_b'], d['du_fix'], d['mute_a'], d['keys'], d['restarts']))
+    print('  sessions %d, source left %d, ctx %08X -> %08X, DU re-asserted %d, mute at route %04X, keys %d, restarts %d, key requests %d (acked %d)' % (d['sess'], d['ctx_chg'], d['ctx_a'], d['ctx_b'], d['du_fix'], d['mute_a'], d['keys'], d['restarts'], d['kreq'] & 0xFFFF, d['kreq'] >> 16))
     if d['du']:
         print('  display: state %X (1 = took array 0, |100 = restored), buffer reuse waits %d, pace waits %d' % (
             d['du'], d['reuse_waits'], d['pace_waits']))

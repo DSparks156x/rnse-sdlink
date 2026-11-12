@@ -134,6 +134,7 @@ SH decoder sources are `rnse_proto/src/rnv2sh.c`, `rnv2sh.h`, `rnv3_sh.inc`, wit
 | Stream running | `live.log`: `rd_stalled`, `served` | `rd_stalled=0`, `served` rising (only while on TV) |
 | Frames flowing | `live.log`: `frames`, `drop`, `waitkey` | `frames` rising, `drop=0`, `waitkey=0` |
 | Key requests | `keyreq` | Rises on each TV entry; shouldn't climb steadily while watching |
+| Unit key requests | `unit_keyreq` | The RNS-E's decoder waited > 250 ms for a key. Can rise on TV entry; climbing while watching = losses only the unit saw |
 | Encoder limits | `enc.log` | No `rnv3enc: frame N over ...` lines |
 | Unit decode | `benchd.py sdstream status` (needs CAN) | Decode errors 0, CRC bad 0, underruns 0 |
 

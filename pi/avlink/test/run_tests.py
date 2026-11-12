@@ -7,7 +7,7 @@ r"""run_tests.py -- avlink checks on the PC (Windows Python + WSL gcc). No hardw
               (highway110_night K=48 one superframe per frame; turn_night K=48 --maxvid 60 = TLV 0x11 fragments;
               --raw adds rawtest4 K=30 = 770 KB frames over 7 superframes)
   0. units    test_credits, test_nocredits, test_stall, test_discard, test_rnsever (version announcement, Pi side);
-              test_handshake.py (announcement end to end: avlink -> pty -> host_link unit model, accept / reject / none); ownership: teensy/tools/test_avstream_ownership.cpp (ASan/UBSan);
+              test_handshake.py (announcement end to end: avlink -> pty -> host_link unit model, accept / reject / none / re-announce = key request); ownership: teensy/tools/test_avstream_ownership.cpp (ASan/UBSan);
               host selftest of the firmware's sdproto/avstream against tools/sdemu_ref.py (sec_4064 differs since before batch 1)
   3. e2e      avlink -> pty (fake /dev/ttyACM0) -> Teensy host build (sdemu avstream.cpp + sdproto.cpp, the same
               files the firmware uses) -> simulated RNS-E mode A reader (SPEC 2.A.4) -> served superframes

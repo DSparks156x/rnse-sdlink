@@ -162,6 +162,8 @@ On units with the EU voice-recognition module, the firmware build disables that 
 | 11 | 3 | frame buffers (2 or 3) |
 | 12 | `0x40` | read hint (sectors) |
 | 13, 14 | 0 | start sequence, max superframes (0 = no limit) |
+| 57 | `'SDHW'` | announcement words follow (`SDL_CTL_HSW`, `sdl_ver.h`) |
+| 58..61 | — | announcement `w[2k] << 16 \| w[2k+1]`: sdstream repeats it as a key request (`docs/PROTOCOL.md` 4.5) |
 | 62/63 | — | table address and its complement |
 
 `rnse/sdstream.py make_ctl` produces the same words from command-line options.
@@ -196,3 +198,5 @@ What `tva_poll` does on each call:
   formats (`sdl_ver.h`) and the validated table's fw_id and version through the LBAs of 8 reads (`docs/PROTOCOL.md` 4.5). A Pi that
   plays none of the unit's formats rejects, and the unit then stays stock. Words 0..26 and the probe are unchanged; the handshake
   state is appended (27..31). Not in the standby build (`TVA_STANDBY`, no probe loop).
+- **Key request.** `tva_task` also writes the announcement to CTL 57..61. While sdstream's decoder waits for a key (250 ms, then every
+  500 ms) its reader repeats those 8 reads; avlink answers with a key. Count in STAT word 127 (low 16 sent, high 16 acked).

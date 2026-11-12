@@ -666,9 +666,20 @@ with no superframes sent until an announcement with a common format arrives. Not
 format (`AVL_FMT_DEFAULT` 1), and `no version announced` once the unit reads the stream. `--rnse-file` (the chain: `$CHAINDIR/rnse.txt`)
 holds shell lines `RNSE_ANNOUNCED, RNSE_BUILD, RNSE_FMT, RNSE_FMT_MIN, RNSE_FW_ID, RNSE_TABLE, RNSE_HS, STREAM_FMT` (0 = not streaming).
 
+**Key request (2026-11-12, module 1383EC2D).** The unit's decoder drops deltas until a key frame after losses the Teensy never sees
+(CRC bad, fragment error, decode error, lost superframe). With `--keyint 0` that key only came on TV re-entry. Now:
+- `tva_task` writes the announcement to CTL words 57..61 (`SDL_CTL_HSW`: `'SDHW'`, then `w[2k] << 16 | w[2k+1]`).
+- sdstream's reader (`kreq_poll`, the task that owns the SD calls): decoder `need_key` held 250 ms -> the same 8 reads into the free
+  ring slot, then every 500 ms while it holds. ~8 one-sector reads, about one superframe of reader time. `ST(127)` (`S_KREQ`): low 16
+  sent, high 16 acked. Bad or missing CTL words: no requests.
+- Teensy: unchanged; an identical announcement bumps `count` and goes out as `RNSE_INFO`.
+- avlink `rnse_update`: an `RNSE_INFO` whose `count` differs from the previous one, while streaming (format chosen) and the reader not
+  stalled = key request; `key_feedback` writes `key` to `--keyctl` (500 ms limit shared with loss keys). No new log line or verdict
+  change. STAT `unit_keyreq=` counts them. A resend to a new sender keeps its count: no request.
+
 **Compatibility matrix.** Old module or stock firmware: no announcement, nothing changes. New module + old Teensy: 8 extra reads every
-~2 s while probing, no other change. New Teensy + old avlink: `RNSE_INFO` ignored, no verdict, the unit waits 1 s once per run, then as
-before. New everything: as above.
+~2 s while probing, and every 500 ms while the decoder waits for a key; no other change. New Teensy + old avlink: `RNSE_INFO` ignored,
+no verdict, the unit waits 1 s once per run, then as before (re-announcements are ignored too). New everything: as above.
 
 ---------------------------------------------------------------------------------------------------
 
