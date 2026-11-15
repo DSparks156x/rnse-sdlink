@@ -56,7 +56,7 @@ def wsl(cmd, timeout=300, check=True):
 
 def build(e2e):
     o = q(OUT)
-    lib = 'sf.c wire.c crc.c audio.c link.c'
+    lib = 'sf.c wire.c crc.c audio.c link.c asrc.c -lm'
     wsl('cd %s && cc -O2 -g -std=c11 -Wall -Wextra -Wno-unused-parameter avlink.c %s -o %s/avlink 2>&1' % (q(AVL), lib, o))
     wsl('cd %s && cc -std=c11 -Wall -Wextra -Werror -O2 test/test_credits.c link.c -o %s/credit-test' % (q(AVL), o))
     wsl('cd %s && cc -std=c11 -Wall -Wextra -Werror -O2 test/test_rnsever.c link.c -o %s/rnsever-test' % (q(AVL), o))

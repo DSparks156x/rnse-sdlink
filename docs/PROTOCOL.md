@@ -37,7 +37,7 @@ Evidence tags:
 | Container | per tick a **superframe**: 1 header sector (64 B header + 448 B down-channel), audio sectors, video sectors |
 | Addressing | superframe slot window: LBA = 0x10000 + (seq mod 256) * 256. Same scheme for the stock driver (A) and the custom driver (B) |
 | Uplink | stage 1: **CMD60 "W32"** vendor command (32 bits up in the argument, 32 bits down in the R1 field, no DAT, no CRC token). Stage 2: CMD25 writes to LBA channel windows |
-| Clocking | RNS-E SSI is the audio master. The RNS-E reports fill and its sample counter every tick; the Pi sends exactly the requested samples (bit-exact sources) or runs an ASRC (phone sources) |
+| Clocking | RNS-E SSI is the audio master. The RNS-E reports fill and its sample counter (IMPLEMENTED 2026-11-14 as LBA-encoded status reads, 4.6, not W32); the Pi runs the one ASRC and the unit copies the samples |
 | Bring-up order | **Mode A (stock driver) first**, at 1-bit / ~3 MHz, then 4-bit, then 25 MHz. Mode B only if mode A throughput or latency is short |
 
 ---------------------------------------------------------------------------------------------------
@@ -683,6 +683,65 @@ no verdict, the unit waits 1 s once per run, then as before (re-announcements ar
 
 ---------------------------------------------------------------------------------------------------
 
+### 4.6 Audio status uplink and Pi rate matching (IMPLEMENTED 2026-11-14)
+
+Goal: one sample-rate conversion, on the Pi, in float, and samples played unchanged on the unit. Before this, the unit bridged the Pi clock
+and its SSI clock with `rnse/src/rs_fir.h` (24 taps, 65 phases, Q15; -36 dB alias at 18 kHz, -21 dB at 20 kHz).
+
+**Transport: status reads, not CMD60.** The stream runs in mode A (the stock raw-read API), so a CMD60 needs the custom driver (mode B)
+that does not exist. The proven alternative is the handshake's trick (4.5): the data is in the LBA of an ordinary single-sector read.
+Constants: `rnse/src/sdl_ver.h` `SDL_ST_*` (mirrored `teensy/sdemu/avstream.h` `AVS_ST_*`, `pi/avlink/tlink.h` `TL_ST_*`).
+
+    LBA = 0x60000 + (k << 16) + v        (window 0x60000..0x7FFFF, inside RSAVLINK.BIN between the test pattern and the handshake window)
+
+| k | v |
+|---|---|
+| 0 (`SDL_ST_FILL`) | frames queued - target, + 0x8000, saturated. Queued = FIFO + sink ring blocks x block - the part of the playing block already out (TMU time since the newest credit at 48 kHz, at most one block): no 20 ms block sawtooth. Target = CTL target + sink_max x block (where the FIFO sits at `target`) |
+| 1 (`SDL_ST_CNT`) | low 16 bits of the frames the sink consumed: credits x block + the same elapsed part. SSI-paced (a credit = a ring element finished, 8062C564) |
+
+**Unit** (`sdstream.c` `st_poll`, reader task, live stream only, while the sink plays): one read every `SDL_ST_EVERY` (8) superframes, at the
+top of the reader loop (the FIFO then holds the newest superframe's audio, the same point of the 60 Hz cycle every time), k alternating.
+7.5 reads/s, one single-sector SD call each (the key request makes 8 of them in about one superframe of reader time). STAT 128.. (`S_UPL`, `S_PT`, `S_PT_SW`, `S_UPL_ERR`, `S_UPL_FAIL`).
+A superframe with header flag `SDL_H_RATEMATCH` (512) puts the audio task in pass-through: each block is a plain copy of the FIFO into the
+sink (`rs` off; the cut / fade-in / underrun fades stay). 30 superframes without the flag (0.5 s): back to `rs_fir`. The stock sink path is
+bit-exact with sdstream's open parameters (r64 RE 2026-11-14: Snd_dyD memcpy, worker byte swap only if pblock[5] = 0, IIR only if
+pblock[7] != 0, DMA ch6 to SSI TDR; no FIR, gain or dither).
+
+**Teensy** (`AvStream::read_begin`): a read in the window is queued (16 deep) with `micros()` and a running count; the main loop sends each as
+`TL_RNSE_STAT` (16 B: u16 ver 1, u16 size 16, u8 kind, u8 0, u16 value, u32 t_us, u32 count). The sector content is unchanged.
+
+**Pi** (`pi/avlink/asrc.c`, `avlink.c` `stat_update` / `asrc_tick`):
+- Converter: polyphase Kaiser-windowed sinc, 96 taps, 2048 phases with linear interpolation, beta 14.5, float table, double accumulators,
+  cutoff at the input Nyquist (so the integer-position step-1 bypass is an exact copy). Tones: <= -135 dB error up to 20 kHz at 125 ppm and
+  swept +-300 ppm (`test/asrc_test.c`); music: -147 dB below the signal against a 64-zero-crossing reference (`test/ab_asrc.py`).
+  ~5 ms of CPU per second of audio (x86; the Pi 5 is in the same class).
+- Controller (`ratectl`): PI on the filtered fill error (Tp 20 s, Ti 80 s, error filter 2 s; frozen while the reader is stalled or the
+  error is over 2400 frames: the unit's own cut / rebuffer handles those), the integrator seeded once from a 30 s least-squares slope of the
+  consumed counter on the Pi clock (input = 48 kHz on the Pi clock, avsd_clock drives the graph), step clamp +-1500 ppm, slew <= 0.5 ppm
+  per tick (30 ppm/s). Long-run sim (`test/ratectl_sim.c`, 30 min, 125 ppm + 20 ppm drift, 300 ms stalls): fill error within +-60 frames,
+  no underruns.
+- Reports younger than 1.5 s: the step follows the controller and every superframe carries `SFF_RATEMATCH`; output frames per superframe
+  vary (799..801). Otherwise: step exactly 1 on a whole-sample position (an exact copy, 48 frames later) and no flag, so the unit resamples.
+- Then `audio_quantize`: gain (`--gain-db`, at most -3 when given; none = unity), TPDF +-1 LSB (none on exact silence or an exact s16
+  value), round, saturate. Input s16 or float32 (`--audio-f32`; hud2.sh captures float).
+- STAT: `rm` (rate matching on), `stat`, `stat_lost`, `fill_err`, `fill_ef`, `step_ppm`, `integ_ppm`, `ff_ppm`, `seeded`, `frozen`, `clip`.
+
+**Compatibility.** Old module (no status reads): no flag, the Pi passes samples at step 1, the unit resamples as before. New module + old
+Teensy: the status reads return the usual sector, nothing reaches the Pi, same as an old module. New module + new Teensy + old avlink:
+`TL_RNSE_STAT` is ignored, no flag, the unit resamples. Old Pi with gain: as before.
+
+**Sink ring (r64 RE 2026-11-14).** Snd_opn regions (8062DA58): staging 8F9B6320..8F9DA320, byte FIFO 8F9DA320..8FA86760 (705 600 B),
+ring 8FA86760..8FAC6760 = 16 elements x 16 KiB (`mov #16,r7` at 8062D5F0, a constant), then another driver's RAM: the regions cannot grow.
+An element holds up to 4096 frames, so the ring alone can hold 15 x 4096 = 61 440 frames (1.28 s) with block 4096 (`MAXBLK`, `TONE_BUF`
+4 x 16 KiB). Today block 960 x 15 = 300 ms. Latency costs 1:1 (and video follows audio, `AV_DELAY`). More than 16 posted blocks queue in the
+byte FIFO, but sdstream's `sink_max` gating keeps it empty.
+
+**44.1 kHz (not enabled).** Rate code 8 (pblock[2]) sets FF972000 = 0x3DFF instead of 0x3EFF with the same SSICR (CKDV /8, 16-bit data in
+32-bit slots): it selects a second 512 fs master clock, 22.5792 MHz -> 44 100 Hz (the stock MP3 player uses it for 44.1 kHz files), no
+software SRC. That would put the DSP's 44.1 kHz coefficient sets at their design rate (DSP_48K_CORRECTION). Not yet measured on a unit; it
+needs the sink opened at rate 8 (old Pi builds must keep getting 48 kHz, so it has to be negotiated, e.g. a new audio_fmt) and the Pi
+converter set to 48000 -> 44100 (`asrc_init(..., 48000, 44100, 128, ...)`: <= -135 dB to 20 kHz, tested).
+
 ## 5. Pi <-> Teensy USB protocol
 
 ### 5.1 Transport
@@ -718,6 +777,7 @@ reconnect.
 | 0x84 CMDLOG | T->Pi | {u32 t_us, u8 idx (bit6 = ACMD), u32 arg, u8 responded} records (bring-up; can be disabled) |
 | 0x85 SERVED | T->Pi | u32 sf_seq, u32 t_us of its first start bit (latency) |
 | 0x08 HS_VERDICT | Pi->T | 8 B: u32 build_id, u16 check, u8 verdict (1 accept, 2 reject), u8 fmt (0 = none). Answers RNSE_INFO (4.5). An older Teensy ignores it |
+| 0x87 RNSE_STAT | T->Pi | 16 B: one audio status read (4.6): u16 ver 1, u16 size 16, u8 kind, u8 0, u16 value, u32 t_us, u32 count. An older avlink ignores it |
 | 0x86 RNSE_INFO | T->Pi | 32 B, versioned: u16 ver 1, u16 size 32, u32 build_id, u8 fmt, u8 fmt_min, u8 hs_ver, u8 0, u32 fw_id, u16 table_ver, u16 check, u32 count, u32 age_ms, u32 0. A later layout keeps these 32 B first and raises size. An older avlink ignores it |
 
 IMPLEMENTED 2026-11-04 (`pi/avlink/tlink.h` = `teensy/sdemu/avstream.h`): CONFIG = 16 B {u16 hold_cut_ms (30),

@@ -37,12 +37,18 @@
 #define AVS_HS_ACK      0x53444841u  // 'SDHA'
 enum { AVS_HS_PENDING = 0, AVS_HS_ACCEPT = 1, AVS_HS_REJECT = 2 };
 
+// Audio status uplink (docs/PROTOCOL.md 4.6) = rnse/src/sdl_ver.h SDL_ST_*: the unit's reader reads LBA AVS_ST_LBA + (k << 16) + v,
+// k = 0 fill error (+0x8000), k = 1 consumed-frame counter (low 16 bits). Each one goes to the Pi as TL_RNSE_STAT; the sector keeps its content.
+#define AVS_ST_LBA      0x60000u
+#define AVS_ST_SECT     0x20000u
+
 #define TL_MAGIC 0x4B4E4C54u
 enum {
   TL_SF_BEGIN = 0x01, TL_WIRE = 0x02, TL_SF_END = 0x03, TL_META = 0x04, TL_CONFIG = 0x05, TL_DOWNLINK = 0x06,
   TL_FLUSH = 0x07, TL_HOST_WRITE = 0x81, TL_UPLINK = 0x82, TL_STATUS = 0x83, TL_CMDLOG = 0x84, TL_SERVED = 0x85,
   TL_HS_VERDICT = 0x08,   // Pi->T: AvsHsVerdict (an older Teensy ignores the type)
-  TL_RNSE_INFO = 0x86     // T->Pi: AvsRnseInfo, the unit's announcement (an older avlink ignores the type)
+  TL_RNSE_INFO = 0x86,    // T->Pi: AvsRnseInfo, the unit's announcement (an older avlink ignores the type)
+  TL_RNSE_STAT = 0x87     // T->Pi: AvsRnseStat, one audio status read (an older avlink ignores the type)
 };
 enum { SFF_KEY = 1, SFF_REPEAT = 2, SFF_IDLE = 4, SFF_DISCONT = 8, SFF_ADISCONT = 16, SFF_SYNTH = 32,
        SFF_NOTREADY = 64, SFF_EXPIRED = 128, SFF_EOS = 256 };
@@ -68,6 +74,13 @@ struct AvsRnseInfo {                 // = tl_rnse_info in pi/avlink/tlink.h (32 
   uint32_t count;                    // complete announcements decoded since Teensy boot
   uint32_t age_ms;                   // since the newest one
   uint32_t rsv1;
+};
+struct AvsRnseStat {                 // = tl_rnse_stat in pi/avlink/tlink.h (16 B, little-endian)
+  uint16_t ver, size;                // 1, 16
+  uint8_t kind, rsv;                 // SDL_ST_FILL (0) / SDL_ST_CNT (1)
+  uint16_t value;                    // as read from the LBA
+  uint32_t t_us;                     // Teensy micros() at the read command
+  uint32_t count;                    // status reads decoded since Teensy boot (a gap = reports lost on the way)
 };
 struct AvsHsVerdict {                // = tl_hs_verdict (8 B): applies only to the announcement with that build id and check
   uint32_t build_id;
@@ -176,6 +189,8 @@ class AvStream {
   volatile uint32_t hs_verdict;                                // check << 16 | fmt << 8 | verdict, one store (main) / one load (IRQ)
   uint32_t hs_sent_count; uint8_t hs_sent_link;                // main: what went to the Pi
   void hs_read(uint32_t lba);
+  // audio status uplink: IRQ (read_begin) -> main loop (poll) ring
+  volatile uint32_t ust_w[16], ust_t[16], ust_c[16]; volatile uint8_t ust_head, ust_tail; uint32_t ust_count;
   void hs_poll(uint32_t t);
 };
 

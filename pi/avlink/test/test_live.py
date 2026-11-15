@@ -19,8 +19,8 @@ TOOLS = os.path.join(ROOT, 'teensy', 'tools', 'host_link')
 def build(pi, sd, out, tag):
     os.makedirs(out, exist_ok=True)
     av, rd = os.path.join(out, 'avlink_' + tag), os.path.join(out, 'live_reader_' + tag)
-    src = [os.path.join(pi, f) for f in ('avlink.c', 'sf.c', 'wire.c', 'crc.c', 'audio.c', 'link.c')]
-    subprocess.run(['gcc', '-O2', '-g', '-std=c11', '-w', '-o', av] + src, check=True)
+    src = [os.path.join(pi, f) for f in ('avlink.c', 'sf.c', 'wire.c', 'crc.c', 'audio.c', 'link.c', 'asrc.c')]
+    subprocess.run(['gcc', '-O2', '-g', '-std=c11', '-w', '-o', av] + src + ['-lm'], check=True)
     inc = os.path.join(out, 'inc_' + tag)                 # the reader's own includes resolve against this tree
     shutil.rmtree(inc, ignore_errors=True)
     for d in ('sdemu', os.path.join('tools', 'host_link')):
@@ -65,9 +65,13 @@ def run(av, rd, size, reader_args, maxvid=140, keysize=200000, fps=60, log=None,
         with open(log, 'w') as f:
             f.write(out + '\n' + err)
     j = {}
+    sink = {}
     for line in out.splitlines():
         if line.startswith('JSON '):
             j = json.loads(line[5:])
+        elif line.startswith('SINK '):
+            sink = json.loads(line[5:])
+    j.update(sink)
     end = [x for x in err.splitlines() if x.startswith('END')]
     # The reader exits first and closes the pty, so avlink can see the hangup before our SIGTERM: rc 1 with exactly that message is a clean end of test.
     j['avlink_rc'] = 0 if al.returncode == 1 and 'device hung up' in err and 'credit accounting' not in err else al.returncode
@@ -107,6 +111,10 @@ SCEN2 = [
     ('away03_55',  3000,  ['--absent-at', '3', '--absent-for', '0.3', '--total', '9'], 140, 'settle', {'fps': 55}),
     ('keys4s_60',  60000, ['--total', '14', '--settle', '3'], 140, 'none', {'keyevery': 4}),               # periodic key, exactly 60 fps: compare the older tree
     ('keys4s_55',  60000, ['--total', '14', '--settle', '3'], 140, 'none', {'keyevery': 4, 'fps': 55}),
+    # audio rate matching closed-loop (docs/PROTOCOL.md 4.6): a unit sink 125 ppm slow (the measured 47994 Hz), and one 400 ppm fast. The audio
+    # carries interpolated sample stamps then, so a_* are not latencies here; fill statistics instead.
+    ('rate_slow',  20000, ['--total', '45', '--settle', '15', '--sink-hz', '47994'], 140, 'rate'),
+    ('rate_fast',  20000, ['--total', '45', '--settle', '15', '--sink-hz', '48019.2'], 140, 'rate'),
 ]
 QUICK = {'away10_3k', 'away03_3k', 'over_60k', 'wsf_steady'}
 
@@ -135,6 +143,13 @@ def check(kind, j):
             bad.append('steady: video %.0f ms evicted %s expired %s' % (j.get('v_mean', 0), j.get('evicted'), j.get('expired')))
         if j.get('al_discards', 0):
             bad.append('steady: %s discards' % j.get('al_discards'))
+    elif kind == 'rate':
+        if j.get('rm_frac', 0) < 0.9:
+            bad.append('rate matching on for %.0f %% of the superframes, want >= 90' % (100 * j.get('rm_frac', 0)))
+        if j.get('unders', 1) or j.get('cuts', 1):
+            bad.append('sink ran dry %s times, backlog cut %s times' % (j.get('unders'), j.get('cuts')))
+        if abs(j.get('fill_mean', 9e9)) > 1200 or j.get('fill_max', 9e9) > 3000 or j.get('fill_min', -9e9) < -3000:
+            bad.append('fill error mean %.0f, range %.0f..%.0f frames after the settle time' % (j.get('fill_mean', 0), j.get('fill_min', 0), j.get('fill_max', 0)))
     elif kind == 'overload':
         if not j.get('nv'):
             bad.append('no video')
@@ -169,6 +184,9 @@ def main():
         res[name] = j
         print('%-11s %7.0f %7.0f %7.0f %7.0f %7.0f %8.0f %8.0f %6s %6s %5s %5s %5s %5s %6s' % (name, j.get('v_mean', -1), j.get('v_p95', -1), j.get('v_max', -1), j.get('a_mean', -1), j.get('a_max', -1),
               j.get('first_sf_ms', -1), j.get('first_vid_ms', -1), j.get('keys', '?'), j.get('chain_breaks', '?'), j.get('al_discards', '-'), j.get('evicted', '?'), j.get('expired', '?'), j.get('seq_max', '?'), j.get('mid_holds', '?')), flush=True)
+        if kind == 'rate':
+            print('   sink: fill error mean %.0f sd %.0f range %.0f..%.0f frames, rate-matched %.1f %%, %s reports, %.3f frames/superframe' % (
+                j.get('fill_mean', 0), j.get('fill_sd', 0), j.get('fill_min', 0), j.get('fill_max', 0), 100 * j.get('rm_frac', 0), j.get('reports'), j.get('afr_mean', 0)), flush=True)
         if not a.no_check:
             for b in check(kind, j):
                 print('   FAIL %s' % b, flush=True)

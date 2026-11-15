@@ -4,7 +4,8 @@
  *
  * Pipeline (each stage is its own function so a stage can move, e.g. audio into the Teensy later):
  *   video source (.rnv: 4-byte BE length + RNV2 frame)  -> fragmenter (frames > maxvid sectors -> TLV 0x11)
- *   audio stage (48 kHz s16 PCM -> s16 BE, 800 frames per tick at 60 Hz; audio.c)
+ *   audio stage (48 kHz s16/f32 PCM -> float, 800 frames per tick at 60 Hz; audio.c) -> ASRC to the unit's sink rate (asrc.c, steered by its
+ *   status reports) -> gain + TPDF dither + saturate -> s16 BE (audio_quantize)
  *   superframe builder (sf.c: header + down-channel TLVs + audio + video sectors, CRC-32s)
  *   wire images (wire.c: 528 B per sector, per-line CRC16)  -> TLNK SF_BEGIN / WIRE (32-sector chunks) / SF_END
  *   USB writer with STATUS credits (link.c)
@@ -23,6 +24,7 @@
 #include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
+#include "asrc.h"
 #include "audio.h"
 #include "crc.h"
 #include "link.h"
@@ -73,6 +75,7 @@ static struct {
     const char *dev, *video, *audio, *yuvcrc, *dump_sf, *dump_wire, *keyctl, *rnse_file;
     int fmt_min, fmt_max;     /* stream formats this chain sends (rnse_ver.h AVL_FMT_*; --fmts for tests) */
     double gain_db;
+    int audio_f32, no_asrc, gain_set;
     int audio_be, no_audio, maxvid, k, eos, wire, chunk, console, stats_s, nocredits, maxq, quiet;
     double fps, linkcap;
     uint32_t seq0;
@@ -279,23 +282,71 @@ static void plan_fill(int blocking)
 
 #include "sdctl.h"
 
+/* ------------------------------------------------------------------ rate matching (docs/PROTOCOL.md 4.6)
+ * The unit reports its fill error and consumed-frame counter (sdstream st_poll -> Teensy TL_RNSE_STAT). While reports arrive the converter runs at
+ * the step the controller wants and every superframe carries SFF_RATEMATCH, so the unit copies the samples unchanged. Without reports (older module or
+ * Teensy, no session, --no-asrc) the step is exactly 1 on a whole-sample position: the samples pass unchanged, the unit resamples as before. */
+#define RM_FRESH_US 1500000u        /* reports come every ~133 ms: this long without one, rate matching is off */
+static asrc_t g_asrc;
+static ratectl_t g_rc;
+static int g_rm, g_asrc_ok;
+static uint64_t g_stat_seen, g_stat_t, g_rm_on, g_rm_off;
+static uint32_t g_stat_lost, g_stat_cnt_last;
+static void stat_update(uint64_t t)
+{
+    if (!g_have_link) return;
+    if (g_link.n_stat - g_stat_seen > 64) { g_stat_lost += (uint32_t)(g_link.n_stat - g_stat_seen - 64); g_stat_seen = g_link.n_stat - 64; }
+    for (; g_stat_seen < g_link.n_stat; g_stat_seen++) {
+        const tl_rnse_stat *r = &g_link.stat[g_stat_seen % 64].s;
+        uint64_t tp = g_link.stat[g_stat_seen % 64].t_pi_us;
+        if (g_stat_cnt_last && r->count - g_stat_cnt_last > 1 && r->count - g_stat_cnt_last < 1000) g_stat_lost += r->count - g_stat_cnt_last - 1;
+        g_stat_cnt_last = r->count;
+        if (r->kind == TL_ST_FILL) ratectl_fill(&g_rc, (int)r->value - 0x8000, tp, g_rd.stalled);
+        else ratectl_count(&g_rc, r->value, tp, g_asrc.in_total);
+        g_stat_t = tp;
+    }
+    int rm = g_asrc_ok && !O.no_asrc && g_stat_t && t - g_stat_t < RM_FRESH_US;
+    if (rm && !g_rm) g_rm_on++;
+    if (!rm && g_rm) { g_rm_off++; ratectl_reset(&g_rc); }
+    g_rm = rm;
+}
+/* one tick of audio through the converter: n input frames -> the frames to send */
+static int asrc_tick(const float *in, int n, float *out, int cap)
+{
+    if (!g_asrc_ok) { memcpy(out, in, sizeof(float) * 2 * (size_t)n); return n; }
+    if (g_rm) asrc_set_step(&g_asrc, ratectl_step(&g_rc));
+    else {
+        g_rc.out = g_rc.integ;                          /* next time the slew starts from the clock ratio the integrator keeps */
+        if (g_asrc.step != 1.0) { asrc_set_step(&g_asrc, 1.0); asrc_snap(&g_asrc); }
+    }
+    return asrc_process(&g_asrc, in, n, out, cap);
+}
+
 /* build superframe g_seq from the head fragment (or REPEAT) + one tick of audio */
 static void build_sf(int blocking)
 {
     static uint8_t abuf[48000 * 4];
+    static float ain[2 * 4096], aout[2 * 4096];
     sf_hdr h;
     memset(&h, 0, sizeof h);
     frag_t fr = {0}, *frp = NULL;
     if (fq_n && !(g_vhold && fq[fq_head].off == 0)) { fr = fq[fq_head]; fq_head = (fq_head + 1) % FQ_N; fq_n--; frp = &fr; }
     uint16_t af = audio_frames_per_sf();
     uint32_t ab = 0;
-    if (!O.no_audio) { audio_take(&g_aud, af, abuf, blocking); ab = (uint32_t)af * 4; }
+    uint16_t aout_n = af;
+    if (!O.no_audio) {
+        audio_take(&g_aud, af, ain, blocking);
+        aout_n = (uint16_t)asrc_tick(ain, af, aout, 4096);
+        audio_quantize(&g_aud, aout, aout_n, abuf);
+        ab = (uint32_t)aout_n * 4;
+    }
     int batch = O.k > 0;
     if (g_stop_tlv > 0) { sf_tlv(&h, TLV_STOP, "STOP", 4); g_stop_tlv--; }
     h.seq = g_seq;
     h.audio_pts = g_audio_pts;
     h.video_pts = g_audio_pts + AV_DELAY;
-    h.audio_frames = O.no_audio ? 0 : af;
+    h.audio_frames = O.no_audio ? 0 : aout_n;
+    if (!O.no_audio && g_rm) h.flags |= SFF_RATEMATCH;
     h.audio_fmt = O.no_audio ? AUDIO_FMT_NONE : AUDIO_FMT_S16;
     h.video_fmt = VIDEO_FMT_RNV2;
     h.pi_time_us = batch ? g_built * 16667u : (uint32_t)(now_us() - g_t0);
@@ -347,7 +398,7 @@ static void build_sf(int blocking)
         t->seq = g_seq; t->total = total; t->next_idx = 0; t->state = 0; t->body = body;
     } else free(body);
     g_seq++; g_built++;
-    g_audio_pts += af;
+    g_audio_pts += aout_n;
 }
 
 /* Tick clock. Each tick sends a fixed 800 frames, so the tick must run at the audio source's rate: in the car a DAC clocks the PipeWire sink, not the Pi clock.
@@ -362,7 +413,7 @@ static uint64_t tick_period(uint64_t period, uint64_t t)
     if (O.no_audio || g_aud.fd < 0) return period;
     if (g_aud.last_arrival) { g_aud.last_arrival = 0; g_last_audio_us = t; }
     if (!g_aud.primed || !g_last_audio_us || t - g_last_audio_us > 250000u) { g_lvl_have = 0; g_tick_adj = 0; return period; }
-    int64_t lvl = (int64_t)(g_aud.have / 4) << 8;
+    int64_t lvl = (int64_t)(audio_have_frames(&g_aud)) << 8;
     if (!g_lvl_have) { g_lvl_q8 = lvl; g_lvl_have = 1; }
     g_lvl_q8 += (lvl - g_lvl_q8) >> 5;            /* ~0.5 s */
     int64_t err = (g_lvl_q8 >> 8) - (48 * AUDIO_PRIME_MS + 400);   /* frames over the level we want after a tick, mean of the burst sawtooth */
@@ -508,7 +559,7 @@ static int catchup_due(uint64_t t, uint64_t period)
     static uint64_t last;
     if (!g_can_discard || O.no_audio || g_aud.fd < 0 || !g_aud.primed || g_rd.stalled || !g_link.n_served || g_stop_tlv) return 0;
     if (tq_n >= O.maxq - 1 || reader_lag() > CATCHUP_MAX_LAG || t - last < period / 2) return 0;
-    if (g_aud.have / 4 < (size_t)(48 * AUDIO_PRIME_MS + CATCHUP_OVER)) return 0;
+    if (audio_have_frames(&g_aud) < (size_t)(48 * AUDIO_PRIME_MS + CATCHUP_OVER)) return 0;
     last = t;
     return 1;
 }
@@ -636,14 +687,17 @@ static void print_stats(const char *tag)
             "credit_waits=%u keyreq=%u unit_keyreq=%u | teensy status=%llu free=%u/%u slots=%u newest=%u served=%u srv_sect=%u holds=%u "
             "timeouts=%u notready=%u expired=%u idle=%u evicted=%u conv=%u rxerr=%u bus=%u junk=%llu "
             "| rd_stalled=%d stalls=%u discards=%u vdiscarded=%u waitkey=%d window_waits=%u away_ticks=%u cap_kb=%u backoffs=%u catchups=%u vholds=%u vhold_sf=%u "
-            "| rnse_build=%08X rnse_fmt=%d stream_fmt=%d hs_blocked=%u\n",
+            "| rnse_build=%08X rnse_fmt=%d stream_fmt=%d hs_blocked=%u "
+            "| rm=%d rm_on=%llu rm_off=%llu stat=%llu stat_lost=%u fill_err=%.0f fill_ef=%.0f step_ppm=%.2f integ_ppm=%.2f ff_ppm=%.2f seeded=%d frozen=%u clip=%llu\n",
             tag, g_built, g_sent_sf, g_repeat_sf, g_late_ticks, g_frames_in, g_frames_dropped,
             (unsigned long long)g_aud.frames_in, (unsigned long long)g_aud.frames_silence, (unsigned long long)g_aud.frames_dropped, (unsigned long long)g_aud.raw_bytes / 4, (int)g_tick_adj, g_credit_waits, g_key_reqs, g_unit_keyreqs,
             (unsigned long long)g_link.n_status, s->free_sectors, s->pool_sectors, s->free_slots, s->newest_seq,
             s->served_seq, s->sectors_served, s->holds, s->hold_timeouts, s->notready, s->expired, s->idle, s->evicted,
             s->converted, s->rx_errors, s->bus_width, (unsigned long long)g_link.rx_junk,
             g_rd.stalled, g_stalls, g_discards, g_vdiscarded, g_wait_key, g_window_waits, g_away_ticks, (unsigned)(g_cap_now / 1000), g_backoffs, g_catchups, g_vholds, g_vhold_sf,
-            (unsigned)g_ver.info.build_id, g_ver.announced ? g_ver.info.fmt : 0, g_ver.fmt, g_hs_blocked);
+            (unsigned)g_ver.info.build_id, g_ver.announced ? g_ver.info.fmt : 0, g_ver.fmt, g_hs_blocked,
+            g_rm, (unsigned long long)g_rm_on, (unsigned long long)g_rm_off, (unsigned long long)g_link.n_stat, g_stat_lost, g_rc.e_last, g_rc.e_f,
+            g_rm ? g_rc.out * 1e6 : 0.0, g_rc.integ * 1e6, g_rc.ff_ratio * 1e6, g_rc.seeded, g_rc.n_frozen, (unsigned long long)g_aud.clipped);
 }
 
 /* ------------------------------------------------------------------ --wire-test: wire images of a raw file */
@@ -668,7 +722,9 @@ static void usage(void)
         "avlink [options]\n"
         "  --dev PATH         Teensy CDC (/dev/ttyACM0) or any byte stream; omit = build/dump only\n"
         "  --video FILE|-     .rnv stream (4-byte BE length + RNV2 frame), e.g. rnv2enc ... -o -\n"
-        "  --audio FILE|-     48 kHz s16 stereo PCM, little-endian (--audio-be: big-endian); none = silence\n"
+        "  --audio FILE|-     48 kHz s16 stereo PCM, little-endian (--audio-be: big-endian, --audio-f32: float32 LE); none = silence\n"
+        "  --gain-db G        audio gain, at most -3; none = unity (applied in float, TPDF-dithered once to s16, saturating)\n"
+        "  --no-asrc          never rate-match: the unit resamples (as before 2026-11-14)\n"
         "  --no-audio         audio_fmt 0, no audio sectors\n"
         "  --yuvcrc FILE      'frame crc' lines (rnv2enc --crc, video/out/*_c.txt) -> down-channel TLV 0x10\n"
         "  --maxvid N         video sectors per superframe (248); larger frames go out as TLV 0x11 fragments\n"
@@ -700,7 +756,9 @@ int main(int argc, char **argv)
         else if (!strcmp(a, "--video")) O.video = ARG;
         else if (!strcmp(a, "--audio")) O.audio = ARG;
         else if (!strcmp(a, "--audio-be")) O.audio_be = 1;
-        else if (!strcmp(a, "--gain-db")) O.gain_db = atof(ARG);
+        else if (!strcmp(a, "--audio-f32")) O.audio_f32 = 1;
+        else if (!strcmp(a, "--no-asrc")) O.no_asrc = 1;
+        else if (!strcmp(a, "--gain-db")) { O.gain_db = atof(ARG); O.gain_set = 1; }
         else if (!strcmp(a, "--no-audio")) O.no_audio = 1;
         else if (!strcmp(a, "--yuvcrc")) O.yuvcrc = ARG;
         else if (!strcmp(a, "--maxvid")) O.maxvid = atoi(ARG);
@@ -733,11 +791,18 @@ int main(int argc, char **argv)
         return 2;
     }
     int live = O.k == 0;
-    if (vsrc_open(&g_vid, O.video, live) || audio_open(&g_aud, O.no_audio ? NULL : O.audio, O.audio_be, live)) {
+    if (vsrc_open(&g_vid, O.video, live) || audio_open(&g_aud, O.no_audio ? NULL : O.audio, O.audio_be, O.audio_f32, live)) {
         perror("avlink: input");
         return 1;
     }
-    if (O.gain_db != 0) { double g = 1; for (int n = 0; n < 200; n++) g *= 1.0 + O.gain_db / 200 * 0.11512925; g_aud.gain_q15 = (int)(g * 32768 + 0.5); }   /* 10^(dB/20), no libm */
+    if (O.gain_set && O.gain_db > AUDIO_GAIN_MAX_DB) {   /* no --gain-db: unity, samples pass unchanged (tests, bit-exact sources) */
+        fprintf(stderr, "avlink: --gain-db %.1f is over the %.0f dB ceiling (DSP input headroom): using %.0f\n", O.gain_db, AUDIO_GAIN_MAX_DB, AUDIO_GAIN_MAX_DB);
+        O.gain_db = AUDIO_GAIN_MAX_DB;
+    }
+    audio_set_gain_db(&g_aud, O.gain_db);
+    g_asrc_ok = live && !asrc_init(&g_asrc, 48000, 48000, 96, 2048, 14.5, 1.0);   /* batch (--k card images): no converter, sdgen.py-identical audio */
+    if (live && !g_asrc_ok) fprintf(stderr, "avlink: no memory for the rate converter: the unit resamples\n");
+    ratectl_init(&g_rc, 1.0);
     if (O.yuvcrc && !(g_crcf = fopen(O.yuvcrc, "r"))) { perror(O.yuvcrc); return 1; }
     if (O.dump_sf && !(g_dump_sf = fopen(O.dump_sf, "wb"))) { perror(O.dump_sf); return 1; }
     if (O.dump_wire && !(g_dump_wire = fopen(O.dump_wire, "wb"))) { perror(O.dump_wire); return 1; }
@@ -798,6 +863,7 @@ int main(int argc, char **argv)
             if (live) { reader_update(t); backoff_update(t); vhold_update(t); }
             key_feedback(t);
             rnse_update();
+            stat_update(t);
             teensy_version(t);
             sdctl_poll();
             if (g_img_wait) img_t = t;             /* a bootstrap image is read once, later: it must outlast the stream around it */

@@ -164,14 +164,14 @@ Current: `GAIN=-3` in `hud2.sh`, capturing from `echo_cancel_sink`, which follow
 |---|---|---|
 | Android Auto to Hudiy | Fixed, no phone volume effect (owner). Several tracks over 2 min peaked -5.5 to -7 dBFS, rms about -16, with no clicks or dropouts (owner's player and settings; possibly loudness-normalised) | Measured |
 | Hudiy sink volume and EQ | 0 dB at defaults | Measured |
-| `avlink --gain-db` | -3 dB. **Above 0 wraps into harsh distortion: there is no clip code** | Code |
-| Rate match on the unit | 0 dB, clamped. Overshoot up to +1.9 dB | Code, inferred |
+| `avlink --gain-db` | -3 dB, applied in float, then one TPDF-dithered rounding to s16. Since 2026-11-14 it saturates (counted as `clip=` in STAT) and `--gain-db` above -3 is lowered to -3 | Code |
+| Rate match | Since 2026-11-14 on the Pi (avlink ASRC, float, no gain, after `--gain-db`'s float stage), with a new module + Teensy; the unit then copies the samples. Older pairs: the unit's resampler, 0 dB clamped, overshoot up to +1.9 dB | Code |
 | DSP IIS scaler | Coefficient -9.5 dB; real gain -3.5 or +2.5 dB depending on an unread shifter | Firmware |
 | DSP volume | Depends on the knob. Clip onset for a full-scale track depends on the same unknowns | Inferred |
 
 - **Ceiling for `GAIN`: -2.5 dB,** so the DSP scaler stays clean under either shifter. Use -3 at most, and -6 if any tone or EQ boost is on, because boosts have no pre-EQ headroom from volume 16 up (datasheet).
 - **FM is about 20 dB louder at the old -18 setting:** 1.7 dB from the scaler plus 18 dB from our own cut (firmware and code). FM's real digital level is unknown.
-- **A UI must cap `GAIN` at -3,** and shouldn't offer positive values unless saturation is added to `avlink`.
+- **A UI must cap `GAIN` at -3.** avlink now saturates instead of wrapping and refuses more than -3 itself, but the DSP scaler headroom above still sets the ceiling.
 
 Logs now persist in `~/avsd/logs/<date>-<boot id>-{live,enc}.log`, newest 40 runs, added to `car/avsd_run.sh`. Not yet run under the real supervisor.
 

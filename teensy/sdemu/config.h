@@ -3,7 +3,7 @@
 #pragma once
 #include <stdint.h>
 
-#define FW_VERSION "sdemu 0.5 (2026-11-10, touch, live stream, pool 1500, version handshake)"
+#define FW_VERSION "sdemu 0.6 (2026-11-14, touch, live stream, pool 1500, version handshake, audio status uplink)"
 
 // ---------------------------------------------------------------- pins (SPEC 1.2)
 // Teensy pin   pad          FLEXIO2   SD signal (SD card pin / microSD pin)

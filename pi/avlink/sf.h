@@ -11,7 +11,8 @@
 
 enum {
     SFF_KEY = 1, SFF_REPEAT = 2, SFF_IDLE = 4, SFF_DISCONT = 8, SFF_ADISCONT = 16, SFF_SYNTH = 32,
-    SFF_NOTREADY = 64, SFF_EXPIRED = 128, SFF_EOS = 256
+    SFF_NOTREADY = 64, SFF_EXPIRED = 128, SFF_EOS = 256,
+    SFF_RATEMATCH = 512       /* the Pi rate-matched this audio to the unit's sink (rnse/src/sdl_ver.h SDL_H_RATEMATCH): the unit copies it unchanged */
 };
 enum { AUDIO_FMT_NONE = 0, AUDIO_FMT_S16 = 1, AUDIO_FMT_S24_32 = 2 };
 #define VIDEO_FMT_RNV2 2

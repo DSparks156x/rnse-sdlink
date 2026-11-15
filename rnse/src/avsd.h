@@ -28,7 +28,7 @@
 #define DEC_STREAM_MAX 0x280000u
 #define SF_BUF       ((u32)SDL_ASM0)
 #define SF_BUF_BYTES 0x40000u
-#define AFIFO        ((u32)SDL_AFIFO)   /* ends 8F9A0000. Firmware sink: temp+byte FIFO 8F9B6320..8F9DA320 (read at 8EA19824), ring 8F9DA320.. : stay out, it silently overwrote our FIFO tail and stacks */
+#define AFIFO        ((u32)SDL_AFIFO)   /* ends 8F9A0000. Firmware sink (r64 RE 2026-11-14, 8062DA58): staging 8F9B6320..8F9DA320, byte FIFO 8F9DA320..8FA86760, ring 16 x 16 KiB 8FA86760..8FAC6760: stay out, it silently overwrote our FIFO tail and stacks */
 #define AFIFO_FRAMES 32768u
 
 #define CD_GPIO      0xFF93E00Cu

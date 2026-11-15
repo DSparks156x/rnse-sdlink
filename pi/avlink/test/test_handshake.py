@@ -21,7 +21,7 @@ HL = os.path.join(ROOT, 'teensy', 'tools', 'host_link', 'main.cpp')
 def build(out):
     av, hl = os.path.join(out, 'avlink_hs'), os.path.join(out, 'host_link_hs')
     subprocess.run(['gcc', '-O2', '-std=c11', '-Wall', '-Wextra', '-Wno-unused-parameter', '-o', av] +
-                   [os.path.join(AVL, f) for f in ('avlink.c', 'sf.c', 'wire.c', 'crc.c', 'audio.c', 'link.c')], check=True)
+                   [os.path.join(AVL, f) for f in ('avlink.c', 'sf.c', 'wire.c', 'crc.c', 'audio.c', 'link.c', 'asrc.c')] + ['-lm'], check=True)
     subprocess.run(['g++', '-O2', '-std=c++17', '-Wall', '-Wextra', '-Wno-unused-parameter', '-DAVS_HOST', '-o', hl, HL,
                     os.path.join(SD, 'avstream.cpp'), os.path.join(SD, 'sdproto.cpp')], check=True)
     return av, hl

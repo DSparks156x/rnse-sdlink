@@ -4,6 +4,9 @@
 //   Decoder model: need_key as in decode_slot (start, lost -> wait for a key, DISCONT clears it). Each test frame carries a
 //   frame number, so a delta decoded on the wrong reference is counted (chain_breaks): after a discard this must stay 0.
 //   Measures per superframe: age of the newest complete video frame and of the audio. No USB, no SD bus, no decoder time.
+//   --sink-hz R: a model of the unit's audio sink as well (sdstream a_service + st_poll): it plays the superframes' audio at R frames/s on this
+//   clock once target + ring are queued, rebuffers when it runs dry, cuts a backlog 75 ms over, and sends the audio status reads (fill error,
+//   consumed counter) every 8 superframes, so avlink's rate matching runs closed-loop. Reports fill statistics after the settle time.
 #include <errno.h>
 #include <fcntl.h>
 #include <poll.h>
@@ -14,6 +17,7 @@
 #include <time.h>
 #include <unistd.h>
 #include <algorithm>
+#include <math.h>
 #include <vector>
 #include "../../sdemu/avstream.h"
 #include "../../sdemu/config.h"
@@ -50,7 +54,7 @@ static void wait_us(uint64_t us) { uint64_t e = mono() + us; while (mono() < e) 
 static uint32_t be32(const uint8_t *p) { return (uint32_t)p[0] << 24 | p[1] << 16 | p[2] << 8 | p[3]; }
 static uint16_t be16(const uint8_t *p) { return (uint16_t)(p[0] << 8 | p[1]); }
 static uint8_t rb[256 * 512];
-static double us_per_sector = 100, us_per_read = 420, sleep_us = 0;
+static double us_per_sector = 100, us_per_read = 420, sleep_us = 0, sink_hz = 0;
 static unsigned max_sf_sectors = 170;
 static unsigned long mid_holds;                         // start-bit holds inside a read: sector > 0 (one count per sector held)
 static void rd(uint32_t lba, int n, uint8_t *d) {
@@ -86,6 +90,7 @@ int main(int c, char **v) {
     else if (!strcmp(v[i], "--sleep-us")) sleep_us = atof(v[i + 1]);
     else if (!strcmp(v[i], "--max-sf")) max_sf_sectors = (unsigned)atoi(v[i + 1]);
     else if (!strcmp(v[i], "--settle")) settle = atof(v[i + 1]);
+    else if (!strcmp(v[i], "--sink-hz")) sink_hz = atof(v[i + 1]);
   }
   t0 = mono(); sdp_init();
   mfd = posix_openpt(O_RDWR | O_NOCTTY); grantpt(mfd); unlockpt(mfd);
@@ -107,6 +112,12 @@ int main(int c, char **v) {
   unsigned long chain_breaks = 0, vdrop = 0, frames_shown = 0, keys_shown = 0, sf_total = 0, retries = 0, hdr_bad = 0;
   double first_sf = -1, first_vid = -1, first_key = -1;  // ms after the last return (or after start, without an absence)
   double f_ts = 0; uint32_t f_no = 0, f_key = 0; int f_on = 0;
+  // unit sink model (--sink-hz)
+  const double tgt = 3840 + 15 * 960;                    // mkmodule CTL: target 3840 + sink 15 x block 960
+  double pushed = 0, cons0 = 0; uint64_t play_t = 0; int playing = 0; unsigned st_n = 0, st_k = 0;
+  unsigned long unders = 0, cuts = 0, n_rm = 0, n_sf_a = 0, n_reports = 0; double afr_sum = 0;
+  std::vector<Sample> fs;
+  auto consumed = [&](uint64_t now) { return playing ? cons0 + (double)(now - play_t) * sink_hz / 1e6 : cons0; };
   auto flush = [&](int b) {
     printf("%3d %4u v_mean %6.0f v_max %6.0f a_mean %6.0f a_max %6.0f shown %3u exp %3u nr %3u gap %5.0f seq %6u free %5d slots %2d\n", b, nsf, nvid ? vsum / nvid : 0, vmax, na ? asum / na : 0, amax, nvid, nexp, nnr, (double)maxgap / 1000.0, seq, AVS.free_sectors(), AVS_NSLOT - AVS.used_slots());
     fflush(stdout);
@@ -150,7 +161,28 @@ int main(int c, char **v) {
     if (last_sf && n - last_sf > maxgap) maxgap = n - last_sf;
     last_sf = n;
     uint32_t ab = be32(h + 32), vb = be32(h + 24); uint16_t asec = be16(h + 36), vsec = be16(h + 38);
-    if (ab >= 4) {
+    if (sink_hz > 0 && ab >= 4) {                        // unit sink: push, play, report
+      uint16_t afr = be16(h + 28);
+      double c = consumed(n);
+      if (playing && pushed < c) { unders++; playing = 0; cons0 = pushed; c = pushed; }    // ran dry: rebuffer
+      pushed += afr; n_sf_a++; afr_sum += afr;
+      if (hf & 512u) n_rm++;
+      if (!playing && pushed - c >= tgt) { playing = 1; play_t = n; cons0 = c; }
+      if (playing && pushed - c > tgt + 3600) { cuts++; pushed = c + tgt; }                // backlog cut (sdstream RESYNC_OVER)
+      if (playing) {
+        double e = pushed - c - tgt;
+        fs.push_back({es, e});
+        if (++st_n >= 8) {                               // st_poll: one single-sector status read
+          st_n = 0;
+          int ei = (int)(e < -32768 ? -32768 : e > 32767 ? 32767 : e);
+          uint32_t val = st_k ? ((uint32_t)(uint64_t)c & 0xFFFFu) : (uint32_t)(ei + 0x8000);
+          AVS.read_begin(0x60000u + (st_k << 16) + val);
+          wait_us((uint64_t)us_per_read);
+          st_k ^= 1; n_reports++;
+        }
+      }
+    }
+    if (sink_hz <= 0 && ab >= 4) {
       const uint8_t *a = rb + asec * 512;
       uint32_t idx = (uint32_t)be16(a) | ((uint32_t)be16(a + 2) << 16);
       if (idx) { uint32_t nowi = (uint32_t)(n * 48 / 1000); double l = (double)(int32_t)(nowi - idx) / 48.0; asum += l; na++; if (l > amax) amax = l; as.push_back({es, l}); }
@@ -193,6 +225,11 @@ int main(int c, char **v) {
   std::vector<double> vw, aw; for (auto &x : vs) if (x.e >= from) vw.push_back(x.v); for (auto &x : as) if (x.e >= from) aw.push_back(x.v);
   // hold on the screen: the longest stretch without a new picture after `from`
   double maxhold = 0, prev = from; for (auto &x : vs) if (x.e >= from) { if (x.e - prev > maxhold) maxhold = x.e - prev; prev = x.e; }
+  std::vector<double> fw; for (auto &x : fs) if (x.e >= from) fw.push_back(x.v);
+  double fsd = 0, fm = mean(fw); for (double x : fw) fsd += (x - fm) * (x - fm); fsd = fw.size() > 1 ? sqrt(fsd / (double)(fw.size() - 1)) : 0;
+  if (sink_hz > 0)
+    printf("SINK {\"fill_mean\":%.1f,\"fill_sd\":%.1f,\"fill_min\":%.1f,\"fill_max\":%.1f,\"unders\":%lu,\"cuts\":%lu,\"rm_frac\":%.4f,\"reports\":%lu,\"afr_mean\":%.4f}\n",
+           fm, fsd, pct(fw, 0), pct(fw, 1), unders, cuts, n_sf_a ? (double)n_rm / (double)n_sf_a : 0, n_reports, n_sf_a ? afr_sum / (double)n_sf_a : 0);
   printf("JSON {\"v_mean\":%.1f,\"v_p95\":%.1f,\"v_max\":%.1f,\"a_mean\":%.1f,\"a_p95\":%.1f,\"a_max\":%.1f,\"nv\":%zu,\"na\":%zu,"
          "\"first_sf_ms\":%.1f,\"first_vid_ms\":%.1f,\"first_key_ms\":%.1f,\"chain_breaks\":%lu,\"vdrop\":%lu,\"frames\":%lu,\"keys\":%lu,\"sf\":%lu,\"seq_max\":%u,"
          "\"mid_holds\":%lu,\"retries\":%lu,\"hdr_bad\":%lu,\"maxhold_ms\":%.0f,\"evicted\":%u,\"expired\":%u,\"notready\":%u,\"idle\":%u,\"rx_errors\":%u,\"pool\":%d,\"free\":%d}\n",

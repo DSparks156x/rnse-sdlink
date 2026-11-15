@@ -26,6 +26,20 @@
 #define SDL_HS_ACCEPT       1
 #define SDL_HS_REJECT       2
 
+/* Audio status uplink (docs/PROTOCOL.md 4.6): sdstream's reader reads one sector at SDL_ST_LBA + (k << 16) + v, right after a superframe's
+ * audio went into its FIFO. k = SDL_ST_FILL: v = (queued frames - target) + 0x8000, saturated (FIFO + sink ring - the part of the playing
+ * block already out); k = SDL_ST_CNT: v = low 16 bits of the frames the sink has consumed (SSI-paced, credit count x block + elapsed part).
+ * The two alternate, one read every SDL_ST_EVERY superframes. A status-aware Teensy forwards each as TL_RNSE_STAT; an older one returns its
+ * usual sector. The window lies in RSAVLINK.BIN between the test pattern (0x40100..0x500FF) and the handshake window. */
+#define SDL_ST_LBA          0x60000
+#define SDL_ST_SECT         0x20000
+#define SDL_ST_FILL         0
+#define SDL_ST_CNT          1
+#define SDL_ST_EVERY        8
+/* Superframe header flag (not in older encoders): the Pi rate-matched this audio to the unit's sink (it steers on the status above).
+ * The unit then copies the PCM unchanged into the sink instead of running its own resampler. */
+#define SDL_H_RATEMATCH     512
+
 /* Unit only (not mirrored): tvauto hands sdstream the announcement in CTL words, so the reader can repeat it as a key request while
  * the decoder waits for a key (PROTOCOL.md 4.5). Word SDL_CTL_HSW = SDL_HSW_MAGIC, the next 4 = w[2k] << 16 | w[2k + 1]. */
 #define SDL_CTL_HSW         57

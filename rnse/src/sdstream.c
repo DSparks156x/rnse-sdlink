@@ -50,6 +50,13 @@ enum { S_SEQ = 8, S_SF_OK, S_HDR_BAD, S_RETRY, S_EXPIRED, S_SEQ_MISM, S_RD_CALLS
        S_STUCK_N, S_STUCK_MS, S_STUCK_LBA, S_STUCK_CNT, S_SDR0, S_SDR1, S_SDR2, S_SDR3, S_SDR4, S_SDR5, S_SDR6, S_SDR7,
        S_FL_N, S_FL_WAIT, S_FL_F14, S_FL_F20, S_FL_F34, S_FL_F50, S_FL_MAX, S_FL_BLK,
        S_SESS, S_R_MIN, S_R_ZERO, S_RATE_MHZ, S_CTX_CHG, S_CTX_A, S_CTX_B, S_DU_FIX, S_A_RESYNC, S_MUTE_A, S_KEYS, S_RESTARTS, S_KREQ };
+/* audio status uplink + pass-through (docs/PROTOCOL.md 4.6): words past S_KREQ (STAT has room to word 959) */
+#define S_UPL     128u   /* status reads sent */
+#define S_PT      129u   /* blocks copied unchanged (Pi rate-matched) */
+#define S_PT_SW   130u   /* switches between pass-through and the resampler */
+#define S_UPL_ERR 131u   /* last fill error reported (frames, signed) */
+#define S_UPL_FAIL 132u  /* status reads that failed */
+#define S_NWORDS  136u
 enum { E_OK, E_NOCTL, E_PARAM, E_NOCARD, E_SINK_BUSY, E_OPN, E_NO_CREDIT, E_READ, E_STOPPED, E_DYD, E_SRC_LEFT, E_NOFWT };
 enum { L_SEQ, L_FLAGS, L_EV, L_RD, L_DEC, L_FILL, L_TOTAL, L_TICK };
 /* L_EV bits */
@@ -72,9 +79,11 @@ static volatile int a_state;         /* 0 off, 1 prebuffer, 2 running, 3 dead */
 static u32 a_k;                      /* next block buffer */
 static u32 replaced[3], front;
 static volatile u32 credits;
+static volatile u32 cred_c;          /* now_counts() at the newest credit: the sink just finished a block */
+static volatile u32 pt_on;           /* reader: the newest superframes carry SDL_H_RATEMATCH, so the Pi matched our sink rate */
 /* video frame reassembly (frames spanning several superframes): two 768 KiB buffers, ping-pong */
 #define ASM0 ((u32)SDL_ASM0)
-#define ASM1 ((u32)SDL_ASM1)   /* ends 8F980000; firmware sink ring starts 8F9DA320 (bench 2026-11-05) */
+#define ASM1 ((u32)SDL_ASM1)   /* ends 8F980000; firmware sink staging starts 8F9B6320, its byte FIFO 8F9DA320, ring 8FA86760 (r64 RE 2026-11-14) */
 #define ASM_MAX 0xC0000u
 static u32 asm_on, asm_tot, asm_have, asm_span, asm_key, asm_buf;
 
@@ -184,7 +193,7 @@ static void cb(int h, int ev, int a, int b)
 {
     u32 e = (u32)ev & ~0x100u;
     (void)h; (void)a; (void)b;
-    if (e == CREDIT_EV) credits++;
+    if (e == CREDIT_EV) { cred_c = now_counts(); credits++; }
     else if (e == EOS_EV) ST(S_EOS)++;
     else if (e == 1 || e == 2) ST(S_A_EV_UNDER)++;
     else ST(S_A_EV_OTHER)++;
@@ -242,7 +251,7 @@ static u32 sink_max;
  * step = 1 + PI on fill, clamp +-500 ppm (inaudible). Q16, 1 unit = 15.3 ppm. Bigger errors are faults, not drift: a backlog is cut (cross-fade), an empty FIFO rebuffers (fade). */
 #define RS_MAX 33
 #define RESYNC_OVER 3600u                   /* 75 ms over target: drop the excess */
-static u32 rs_frac, a_fadein;
+static u32 rs_frac, a_fadein, a_rs_was = 1;
 static s32 rs_step, rs_ema, rs_int, a_last_l, a_last_r;
 static void rs_steer(u32 fill)
 {
@@ -288,7 +297,7 @@ static void a_service(void)
     while (a_state == 2 && credits > ST(S_A_BLOCKS)) {
         u32 *dst = (u32 *)(TONE_BUF + a_k * MAXBLK * 4), n, i, room;
         const u32 *fifo = (const u32 *)AFIFO;
-        u32 rs = p1c != 0, need = rs ? ((rs_frac + blk * (u32)rs_step) >> 16) + FIR_AHEAD : blk, used, keep_frac = rs_frac, old_rd = 0, cut = 0;
+        u32 rs = p1c != 0 && !pt_on, need = rs ? ((rs_frac + blk * (u32)rs_step) >> 16) + FIR_AHEAD : blk, used, keep_frac = rs_frac, old_rd = 0, cut = 0;
         int r;
         rf = RING_WR - RING_RD;
         if (rf >= sink_max) break;
@@ -301,7 +310,8 @@ static void a_service(void)
         n = a_rebuf ? 0 : (fill < blk ? fill : blk);
         if (n < blk && rf >= 2) break;                  /* sink still holds two blocks: wait for more data */
         room = (sink_max - 1u - rf) * blk;              /* ring slots still free after this block: a stall drained them, the backlog refills them first */
-        if (n == blk && rs && fill > target + room + RESYNC_OVER) {   /* backlog after a stall: latency matters more than these frames */
+        if (rs != a_rs_was) { a_rs_was = rs; rs_frac = 0; ST(S_PT_SW)++; }   /* pass-through <-> resampler: start on a whole frame */
+        if (n == blk && p1c && fill > target + room + RESYNC_OVER) {   /* backlog after a stall: latency matters more than these frames */
             old_rd = a_rd; cut = 1;
             a_rd = a_wr - target - room; fill = target + room; rs_frac = 0;
             ST(S_A_RESYNC)++;
@@ -313,6 +323,11 @@ static void a_service(void)
             a_last_l = (s16)(dst[blk - 1] >> 16); a_last_r = (s16)dst[blk - 1];
         } else {
             for (i = 0; i < n; i++) dst[i] = fifo[(a_rd + i) & (AFIFO_FRAMES - 1)];
+            if (n == blk && p1c) {                      /* pass-through: same cut and fade-in as the resampler path (p1c 0 = byte-swapped words, no mixing) */
+                if (cut) for (i = 0; i < FADE; i++) dst[i] = mix2(fifo[(old_rd + i) & (AFIFO_FRAMES - 1)], dst[i], (s32)i);
+                if (a_fadein) { a_fadein = 0; for (i = 0; i < FADE; i++) dst[i] = mix2(0, dst[i], (s32)i); }
+                if (!rs && p1c) ST(S_PT)++;
+            }
             if (n < blk) {                              /* sink about to run dry: fade the last sample out, silence, keep the SSI running */
                 u32 w = n ? dst[n - 1] : (((u32)a_last_l << 16) | ((u32)a_last_r & 0xFFFF));
                 for (i = n; i < blk; i++) { u32 g = i - n; dst[i] = g < FADE ? mix2(w, 0, (s32)g) : 0; }
@@ -887,9 +902,37 @@ static void kreq_poll(u32 buf)
     ST(S_KREQ) += be32(s) == SDL_HS_ACK && be16(s + 4) == hs_w[0] && be16(s + 18) == hs_w[SDL_HS_N - 1] ? 0x10001u : 1u;
 }
 
+/* Audio status uplink (docs/PROTOCOL.md 4.6). Live stream only, while the sink plays. One single-sector read every SDL_ST_EVERY superframes, at the
+ * top of the reader loop (the FIFO then holds the newest superframe's audio, so every report sees the same point of the 60 Hz cycle), alternating
+ * the fill error and the consumed-frame counter. Queued = FIFO + sink ring blocks x block - what the SSI already took of the playing block
+ * (time since the newest credit, at 48 kHz on the TMU clock, at most one block): no 20 ms block sawtooth in the report. */
+static u32 st_n, st_k;
+static u32 a_head(void)
+{
+    u32 f = (u32)((unsigned long long)(now_counts() - cred_c) * 48000u / 12487500u);
+    return f > blk ? blk : f;
+}
+static void st_poll(u32 buf)
+{
+    u32 v, h;
+    s32 e;
+    if (g_wrap || !(flags & F_AUDIO) || a_state != 2 || ++st_n < SDL_ST_EVERY) return;
+    st_n = 0;
+    h = a_head();
+    if (!st_k) {
+        e = (s32)(a_wr - a_rd) + (s32)((RING_WR - RING_RD) * blk) - (s32)h - (s32)(target + sink_max * blk);
+        ST(S_UPL_ERR) = (u32)e;
+        e += 0x8000;
+        v = e < 0 ? 0u : e > 0xFFFF ? 0xFFFFu : (u32)e;
+    } else v = (credits * blk + h) & 0xFFFFu;
+    if (timed_read(g_slot, SDL_ST_LBA + ((st_k ? SDL_ST_CNT : SDL_ST_FILL) << 16) + v, buf, 1)) ST(S_UPL_FAIL)++;
+    else ST(S_UPL)++;
+    st_k ^= 1;
+}
+
 void reader_main(void)
 {
-    u32 rdfail = 0, retry = 0, lost = 0, due = 0, have_due = 0, seq = g_sess_seq ? g_sess_seq : g_seq, hint = g_hint;
+    u32 rdfail = 0, retry = 0, lost = 0, due = 0, have_due = 0, pt_miss = 0, seq = g_sess_seq ? g_sess_seq : g_seq, hint = g_hint;
     while (1) {
         u32 w = r_w, buf = SFRING + (w % NSF) * SF_SIZE, slotseq = g_wrap ? seq % g_wrap : seq, lba = 0x10000u + (slotseq & 255u) * 256u, hf, total = 0, sseq;
         const u8 *sf = (const u8 *)buf;
@@ -907,6 +950,7 @@ void reader_main(void)
 #endif
             dly_tsk(1); continue; }  /* decoder behind: hold the read, audio still services */
         kreq_poll(buf);                                 /* buf is free here: the decoder is < NSF behind */
+        st_poll(buf);
         r = timed_read(g_slot, lba, buf, hint);
         c_rd = now_counts() - c0;
         if (r) {
@@ -957,6 +1001,8 @@ void reader_main(void)
             if (hint > SF_SIZE / 512u) hint = SF_SIZE / 512u;
         }
         if (hf & H_ADISCONT) a_flush = 1;
+        if (hf & SDL_H_RATEMATCH) { pt_on = 1; pt_miss = 0; }   /* the Pi matched our rate: copy, don't resample */
+        else if (pt_on && ++pt_miss >= 30) pt_on = 0;          /* 0.5 s without it: back to the resampler */
         if (flags & F_MEM) sdmem_control(&memory_service, sf + 64, be16(sf + 52));
         {   /* audio goes straight to the FIFO, so it never waits for video */
             u32 ab = be32(sf + 32), afr = be16(sf + 28), asec = be16(sf + 36), fmt = sf[30];
@@ -1143,7 +1189,7 @@ static u32 session(void)
     u32 err = E_OK, i, t_start, tcb_r = TCB_OF(RD_TASK), tcb_a = TCB_OF(AU_TASK), saved_r = 0, saved_a = 0, au_up = 0;
     /* per-visit state */
     a_wr = a_rd = 0; a_state = 0; a_k = 0; credits = 0; a_rebuf = 0; a_flush = 0; a_stop = 0; a_fadein = 0; a_last_l = a_last_r = 0;
-    rs_step = 65536; rs_ema = 0; rs_int = 0; rs_frac = 0; rate_c0 = 0;
+    rs_step = 65536; rs_ema = 0; rs_int = 0; rs_frac = 0; rate_c0 = 0; a_rs_was = 1; pt_on = 0; cred_c = now_counts(); st_n = st_k = 0;
     iis_on = 0; iis_st = 0; src_left = 0;
 #ifdef SD_TRACE
     { u32 z; for (z = 0; z < 16; z++) TR_H[z] = 0; tr_left = 0; tr_pw = 0; *(volatile u32 *)SDL_TR_Z = 0; }
@@ -1347,7 +1393,7 @@ int main(void)
         st_end(PROG_SDSTREAM, E_PARAM); return 0;
     }
     g_dec = (flags & F_PREF) ? rnvo_decode : rnvf_decode;   /* --pref: the old decoder, A/B on the bench */
-    for (i = 64; i < 128; i++) ST(i) = 0;           /* st_begin clears 0..63 only */
+    for (i = 64; i < S_NWORDS; i++) ST(i) = 0;      /* st_begin clears 0..63 only */
     ST(S_A_MIN) = 0xFFFFFFFFu; ST(S_R_MIN) = 0xFFFFFFFFu;
     { typedef char chk[(S_KREQ < 128) ? 1 : -1]; (void)sizeof(chk); }   /* S_KREQ = 127: SD_FASTSTUCK (bench, not with FWTAB) also uses ST(127) */
     for (i = 0; i < LOGN * 8; i++) R32(RES_BASE + 4 * i) = 0;

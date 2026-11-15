@@ -48,9 +48,12 @@ withpid() { f=$1; shift; bash -c 'echo $$ > "$0"; exec "$@"' "$f" "$@"; }
 # CAP_SINK (avsd.env) overrides: LIVI plays into its own null sink.
 if [ -n "$CAP_SINK" ]; then CAPSINK=$CAP_SINK; else
 CAPSINK=hudiy_equalizer_sink; pactl list short sinks 2>/dev/null | awk '{print $2}' | grep -Fxq echo_cancel_sink && CAPSINK=echo_cancel_sink; fi
+# pw-record hands avlink float32, PipeWire's own sample format: avlink converts to s16 exactly once (gain, TPDF dither), after its rate converter.
+AFMT=
 if [ "${AUDIOCAP:-pw}" = parec ]; then
   timeout $1 parec -d "${CAP_SINK:-hudiy_equalizer_sink}".monitor --rate=48000 --format=s16le --channels=2 --raw --latency-msec=20 > pcm.fifo 2>parec.log &
 else
-  timeout $1 pw-record --target "$CAPSINK" -P '{stream.capture.sink=true}' --rate 48000 --channels 2 --format s16 --latency 20ms --raw - > pcm.fifo 2>parec.log &
+  timeout $1 pw-record --target "$CAPSINK" -P '{stream.capture.sink=true}' --rate 48000 --channels 2 --format f32 --latency 20ms --raw - > pcm.fifo 2>parec.log &
+  AFMT=--audio-f32
 fi
-timeout $1 bash -c 'echo $$ > cap.pid; exec "$0" "$@"' "${WLCAP_BIN:-$B/wlcap}" $CAPARG 2>cap.log | withpid enc.pid "${ENC_BIN:-$B/rnv3enc}" -i - --fmt $FMT -o - --keyint ${KEYINT:-0} --linkcap ${LINKCAP:-4.5e6} --linkctl key.fifo --stats st.txt --threads ${ENCTHREADS:-2} --maxvid ${MAXVID:-161} ${ENCFLAGS:---cyc ${CYC:-4.05e6} --refill wall --dither ${DITHER:-0} --srcdead ${SRCDEAD:-3} --srcmean ${SRCMEAN:-48} --fillpen ${FILLPEN:-2}} $ENCEXTRA 2>enc.log | withpid link.pid "${AVLINK_BIN:-$B/avlink}" --video - --audio pcm.fifo ${LINKDEV:---dev /dev/ttyACM0} --keyctl key.fifo --linkcap ${LINKCAP:-4.5e6} --maxvid ${MAXVID:-161} --whole-sf ${WHOLESF:-1} --rnse-file rnse.txt --gain-db ${GAIN:--3} --stats ${STATS:-5} --console > live.log 2>&1
+timeout $1 bash -c 'echo $$ > cap.pid; exec "$0" "$@"' "${WLCAP_BIN:-$B/wlcap}" $CAPARG 2>cap.log | withpid enc.pid "${ENC_BIN:-$B/rnv3enc}" -i - --fmt $FMT -o - --keyint ${KEYINT:-0} --linkcap ${LINKCAP:-4.5e6} --linkctl key.fifo --stats st.txt --threads ${ENCTHREADS:-2} --maxvid ${MAXVID:-161} ${ENCFLAGS:---cyc ${CYC:-4.05e6} --refill wall --dither ${DITHER:-0} --srcdead ${SRCDEAD:-3} --srcmean ${SRCMEAN:-48} --fillpen ${FILLPEN:-2}} $ENCEXTRA 2>enc.log | withpid link.pid "${AVLINK_BIN:-$B/avlink}" --video - --audio pcm.fifo $AFMT ${LINKDEV:---dev /dev/ttyACM0} --keyctl key.fifo --linkcap ${LINKCAP:-4.5e6} --maxvid ${MAXVID:-161} --whole-sf ${WHOLESF:-1} --rnse-file rnse.txt --gain-db ${GAIN:--3} --stats ${STATS:-5} --console > live.log 2>&1

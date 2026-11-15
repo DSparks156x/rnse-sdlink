@@ -9,6 +9,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <termios.h>
+#include <time.h>
 #include <unistd.h>
 
 static uint32_t rd32le(const uint8_t *p) { return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24); }
@@ -155,6 +156,13 @@ static int credit_fault(link_t *l)
     return -1;
 }
 
+uint64_t link_now_us(void)
+{
+    struct timespec t;
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    return (uint64_t)t.tv_sec * 1000000u + (uint64_t)t.tv_nsec / 1000u;
+}
+
 static int on_msg(link_t *l, uint16_t type, const uint8_t *p, uint32_t len)
 {
     if (type == TL_STATUS) {
@@ -194,6 +202,14 @@ static int on_msg(link_t *l, uint16_t type, const uint8_t *p, uint32_t len)
         tl_rnse_info r;
         memcpy(&r, p, sizeof r);
         if (r.ver == 1 && r.size >= sizeof r) { l->rnse = r; l->n_rnse++; }   /* a newer layout keeps these 32 B first */
+    }
+    else if (type == TL_RNSE_STAT && len >= sizeof(tl_rnse_stat)) {
+        tl_rnse_stat r;
+        memcpy(&r, p, sizeof r);
+        if (r.ver == 1 && r.size >= sizeof r && r.kind <= TL_ST_CNT) {
+            unsigned i = (unsigned)(l->n_stat % 64);
+            l->stat[i].s = r; l->stat[i].t_pi_us = link_now_us(); l->n_stat++;
+        }
     }
     /* HOST_WRITE / UPLINK / CMDLOG: out of scope here (uplink agent) -- ignored */
     return 0;

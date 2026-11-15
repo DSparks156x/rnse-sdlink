@@ -29,7 +29,7 @@ int main(void)
     mkfifo(fifo, 0600);
     int w = open(fifo, O_RDWR | O_NONBLOCK);           /* keeps a writer so the reader sees no EOF */
     audio_stage a;
-    if (audio_open(&a, fifo, 0, 1)) return 2;
+    if (audio_open(&a, fifo, 0, 0, 1)) return 2;
     static uint8_t junk[32768];
     long total = 0;
     for (int round = 0; round < 8; round++) {          /* more than the 64 KiB buffer holds, with no audio_take: a stalled link */

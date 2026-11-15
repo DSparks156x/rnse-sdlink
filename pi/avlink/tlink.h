@@ -22,7 +22,8 @@ enum {
     TL_CMDLOG = 0x84,
     TL_SERVED = 0x85,    /* u32 sf_seq, u32 t_us of its header sector */
     TL_HS_VERDICT = 0x08,  /* Pi->T: tl_hs_verdict (an older Teensy ignores it) */
-    TL_RNSE_INFO = 0x86    /* T->Pi: tl_rnse_info, the unit's version announcement (docs/PROTOCOL.md 4.5) */
+    TL_RNSE_INFO = 0x86,   /* T->Pi: tl_rnse_info, the unit's version announcement (docs/PROTOCOL.md 4.5) */
+    TL_RNSE_STAT = 0x87    /* T->Pi: tl_rnse_stat, one audio status read of the unit (docs/PROTOCOL.md 4.6) */
 };
 
 /* Version handshake = rnse/src/sdl_ver.h SDL_HS_* = teensy/sdemu/avstream.h AVS_HS_* */
@@ -31,6 +32,18 @@ enum {
 #define TL_HS_PENDING 0
 #define TL_HS_ACCEPT  1
 #define TL_HS_REJECT  2
+
+/* Audio status uplink = rnse/src/sdl_ver.h SDL_ST_* = teensy/sdemu/avstream.h AVS_ST_* */
+#define TL_ST_LBA     0x60000u
+#define TL_ST_FILL    0        /* value = frames queued in the unit - its target, + 0x8000 */
+#define TL_ST_CNT     1        /* value = low 16 bits of the frames its sink consumed */
+typedef struct {
+    uint16_t ver, size;       /* 1, 16 */
+    uint8_t kind, rsv;        /* TL_ST_FILL / TL_ST_CNT */
+    uint16_t value;
+    uint32_t t_us;            /* Teensy micros() at the read command */
+    uint32_t count;           /* status reads the Teensy decoded since boot */
+} tl_rnse_stat;               /* 16 B */
 
 /* CONFIG payload (all optional: 0 = keep the Teensy's current value) */
 typedef struct {

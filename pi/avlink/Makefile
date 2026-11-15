@@ -5,11 +5,11 @@
 CC      ?= gcc
 CFLAGS  ?= -O2 -g
 CFLAGS  += -std=c11 -Wall -Wextra -Wno-unused-parameter
-SRC = avlink.c sf.c wire.c crc.c audio.c link.c
-HDR = sf.h wire.h crc.h audio.h link.h tlink.h
+SRC = avlink.c sf.c wire.c crc.c audio.c link.c asrc.c
+HDR = sf.h wire.h crc.h audio.h link.h tlink.h asrc.h
 
 avlink: $(SRC) $(HDR)
-	$(CC) $(CFLAGS) $(SRC) -o $@
+	$(CC) $(CFLAGS) $(SRC) -o $@ -lm
 
 clean:
 	rm -f avlink

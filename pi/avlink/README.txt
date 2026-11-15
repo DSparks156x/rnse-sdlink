@@ -23,6 +23,7 @@ FILES
   sf.c/.h    superframe header + TLVs + payload layout, CRC-32s        wire.c/.h  wire4 / wire1 images (table CRC16)
   audio.c/.h the audio stage (only place that makes audio bytes)      link.c/.h  TLNK framing, tty setup, credits
   tlink.h    message layout (= teensy/sdemu/avstream.h)                crc.c/.h   CRC-32 / CRC16 (no zlib needed)
+  asrc.c/.h  the one rate converter + its controller, steered by the unit's audio status reports (docs/PROTOCOL.md 4.6)
   rnse_ver.h the RNS-E module's version announcement: format choice, log line, --rnse-file, verdict (docs/PROTOCOL.md 4.5)
   test/run_tests.py   all PC checks (see below)
 
@@ -31,7 +32,9 @@ BUILD (Pi OS Bookworm: gcc + make preinstalled; WSL the same)
 
 RUN
   Video in : .rnv stream = 4-byte big-endian length + RNV2 frame (exactly what rnv2enc -o writes), file or pipe.
-  Audio in : 48 kHz s16 stereo, little-endian (ALSA S16_LE) on a file or FIFO; --audio-be for big-endian.
+  Audio in : 48 kHz s16 stereo, little-endian (ALSA S16_LE) on a file or FIFO; --audio-be for big-endian, --audio-f32 for float32.
+             Live: float -> ASRC (rate-matched to the unit's sink while its status reports arrive, else an exact step-1 copy) ->
+             --gain-db (at most -3; none = unity) -> TPDF dither -> s16, saturating. --no-asrc: never rate-match.
              Without --audio the audio sectors carry silence; --no-audio sends audio_fmt 0.
   Live (default): one superframe per tick (--fps 60, 800 audio frames each), REPEAT when no new video frame,
              frames larger than --maxvid sectors (248) go out as TLV 0x11 fragments over consecutive ticks.
@@ -49,8 +52,8 @@ RUN
 
   Audio hook: the Teensy is to become a UAC2 sound card that inserts audio itself. Then audio.c's audio_take()
   is replaced by "reserve the audio sectors" and the Teensy fills them and patches the header (audio_bytes,
-  audio_crc32, hdr_crc32). Nothing else touches audio bytes. Rate control from the RNS-E STATUS (SPEC 3.5) is not
-  here (needs the uplink): every tick carries exactly 48000/fps frames.
+  audio_crc32, hdr_crc32). Nothing else touches audio bytes. Rate control: since 2026-11-14 from the unit's status reads
+  (PROTOCOL 4.6); a tick takes 48000/fps input frames and sends what the converter makes of them (799..801 when rate-matched).
 
 PC TESTS (Windows Python + WSL gcc; no hardware)
   python -I test\run_tests.py [--raw]

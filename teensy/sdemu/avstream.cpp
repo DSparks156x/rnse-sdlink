@@ -76,7 +76,7 @@ void AvStream::init(AvsSector *const *b, const uint16_t *bn, int nb, now_fn nowf
   ps = 0; mpos = 0; link_active = 0; rx_msgs = 0; last_rx_us = 0;
   wslot = -1; cur_sec = -1; cur_got = 0; cur_dst = nullptr;
   read_gen = 0; read_win = -1; my_gen = 0xFFFFFFFFu; holding = 0; sticky_win = -1; degraded = 0; syn_valid = 0;
-  srv_head = srv_tail = 0; last_status_us = 0; last_sent_free = 0xFFFFFFFFu; last_sent_slots = 0xFFFFFFFFu; tx_seq = 0;
+  srv_head = srv_tail = 0; ust_head = ust_tail = 0; ust_count = 0; last_status_us = 0; last_sent_free = 0xFFFFFFFFu; last_sent_slots = 0xFFFFFFFFu; tx_seq = 0;
   card_state = 0; bus_width = 1; mode = 0; crc7_rejects = 0;
   hs_n = 0; hs_gen = 0; hs_count = 0; hs_t = 0; hs_ack_lba = 0; hs_have = 0; hs_verdict = 0; hs_sent_count = 0; hs_sent_link = 0;
   memset(hs_w, 0, sizeof hs_w); memset(hs_ann, 0, sizeof hs_ann);
@@ -406,6 +406,11 @@ void AvStream::read_begin(uint32_t lba) {
   read_win = rel < AVS_WIN_SECT ? (int)(rel >> 8) : -1;
   read_gen++;
   if (lba - AVS_HS_LBA < AVS_HS_SECT) hs_read(lba);
+  else if (lba - AVS_ST_LBA < AVS_ST_SECT) {                // audio status: queue it for the main loop; full = drop (counted by the gap in count)
+    uint8_t h = ust_head, nh = (uint8_t)((h + 1) & 15);
+    ust_count++;
+    if (nh != ust_tail) { ust_w[h] = lba - AVS_ST_LBA; ust_c[h] = ust_count; ust_t[h] = now ? now() : 0; ust_head = nh; }
+  }
 }
 
 // ---------------------------------------------------------------- version handshake (IRQ side, docs/PROTOCOL.md 4.5)
@@ -608,7 +613,7 @@ void AvStream::send_status(uint32_t t) {
 void AvStream::poll(void) {
   uint32_t t = now();
   reclaim(t);
-  if (!link_active) { srv_tail = srv_head; return; }
+  if (!link_active) { srv_tail = srv_head; ust_tail = ust_head; return; }
   while (srv_tail != srv_head) {
     uint8_t p[8];
     wle32(p, srv_seq[srv_tail]); wle32(p + 4, srv_t[srv_tail]);
@@ -616,6 +621,16 @@ void AvStream::poll(void) {
     send(TL_SERVED, p, 8);
   }
   hs_poll(t);
+  while (ust_tail != ust_head) {
+    uint8_t i = ust_tail;
+    uint32_t w = ust_w[i];
+    AvsRnseStat r;
+    memset(&r, 0, sizeof r);
+    r.ver = 1; r.size = sizeof r;
+    r.kind = (uint8_t)((w >> 16) & 1); r.value = (uint16_t)w; r.t_us = ust_t[i]; r.count = ust_c[i];
+    ust_tail = (uint8_t)((i + 1) & 15);
+    send(TL_RNSE_STAT, &r, sizeof r);
+  }
   uint32_t period = 1000000u / (cfg.status_hz ? cfg.status_hz : 20);
   uint32_t fs = (uint32_t)(AVS_NSLOT - used_slots());
   if (t - last_status_us >= period ||
@@ -826,10 +841,28 @@ int avs_selftest(char *msg, int ml) {
     seen = 0;
     for (int i = 0; i + 16 <= t_txn; i += 16 + (int)le32(t_tx + i + 8)) if (le16(t_tx + i + 4) == TL_RNSE_INFO) seen++;
     if (seen != 1) T_FAIL("FAIL hs INFO to a new sender (%d)", seen);
+    // audio status uplink: each status read -> one TL_RNSE_STAT, in order, with kind/value/count; the sector content is unchanged
+    t_txn = 0; a.poll();
+    a.read_begin(AVS_ST_LBA + 0x7F12u);
+    a.read_begin(AVS_WIN_LBA);
+    a.read_begin(AVS_ST_LBA + 0x10000u + 0xBEEFu);
+    t_txn = 0; a.poll();
+    seen = 0;
+    for (int i = 0; i + 16 <= t_txn; i += 16 + (int)le32(t_tx + i + 8)) {
+      if (le16(t_tx + i + 4) != TL_RNSE_STAT) continue;
+      const uint8_t *q = t_tx + i + 16;
+      if (le32(t_tx + i + 8) != 16 || le16(q) != 1 || le16(q + 2) != 16) T_FAIL("FAIL stat layout");
+      if (seen == 0 && (q[4] != 0 || le16(q + 6) != 0x7F12u || le32(q + 12) != 1)) T_FAIL("FAIL stat fill");
+      if (seen == 1 && (q[4] != 1 || le16(q + 6) != 0xBEEFu || le32(q + 12) != 2)) T_FAIL("FAIL stat counter");
+      seen++;
+    }
+    if (seen != 2) T_FAIL("FAIL stat count (%d)", seen);
+    { uint8_t z[512], g[512]; memset(z, 0x5A, 512); memcpy(g, z, 512);
+      if (a.hs_patch(AVS_ST_LBA + 0x7F12u, g) || memcmp(z, g, 512)) T_FAIL("FAIL stat sector patched"); }
   }
   free(pool);
   snprintf(msg, (size_t)ml, "PASS console,serve,beyond,1bit-convert,future-hold,NOT_READY,EXPIRED,cut-through,"
-           "cut-timeout,reclaim,STATUS,IDLE,FLUSH,overrun,handshake");
+           "cut-timeout,reclaim,STATUS,IDLE,FLUSH,overrun,handshake,status-uplink");
   return 0;
 #undef T_FAIL
 }

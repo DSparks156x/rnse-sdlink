@@ -37,7 +37,8 @@ F = ['seq', 'sf_ok', 'hdr_bad', 'retry', 'expired', 'seq_mism', 'rd_calls', 'rd_
      'a_ev_other', 'frag_in', 'frag_err', 'span_max', 'vframe_max', 'span1', 'span2', 'span3', 'span4', 'span5',
      'span6', 'span7', 'span8p', 'log_n', 'mem_cmd', 'mem_bad', 'mem_tx', 'mem_retry', 'mem_io',
      'iis_ret', 'iis_saved', 'iis_ms', 'iis_reissue', 'iis_end', 'ssi_cr', 'ssi_sr', 'e219a', 'e219b', 'p904a', 'p904b', 'stuck_n', 'stuck_ms', 'stuck_lba', 'stuck_cnt', 'sdr0', 'sdr1', 'sdr2', 'sdr3', 'sdr4', 'sdr5', 'sdr6', 'sdr7', 'fl_n', 'fl_wait', 'fl_f14', 'fl_f20', 'fl_f34', 'fl_f50', 'fl_max', 'fl_blk',
-     'sess', 'r_min', 'r_zero', 'rate_mhz', 'ctx_chg', 'ctx_a', 'ctx_b', 'du_fix', 'a_resync', 'mute_a', 'keys', 'restarts', 'kreq']
+     'sess', 'r_min', 'r_zero', 'rate_mhz', 'ctx_chg', 'ctx_a', 'ctx_b', 'du_fix', 'a_resync', 'mute_a', 'keys', 'restarts', 'kreq',
+     'upl', 'pt', 'pt_sw', 'upl_err', 'upl_fail']   # 128.. : audio status uplink + pass-through (sdstream.c S_UPL..)
 LOGN = 1024
 CPM = L.TMU_HZ / 1000.0
 EV = ['hdr_bad', 'retry', 'vdec', 'verr', 'vcrc', 'vdrop', 'late', 'acrc', 'under', 'discont', 'tlv_bad', 'shown']
@@ -121,6 +122,7 @@ def report(d, info=None):
             L.s32(d['fl_blk']) * 15.26, d['rate_mhz'] / 1000.0, d['r_min'] if d['r_min'] != 0xFFFFFFFF else -1, d['r_zero'], d['a_resync']))
     print('  first frame shown %d ms after session start' % d['stuck_ms'])
     print('  sessions %d, source left %d, ctx %08X -> %08X, DU re-asserted %d, mute at route %04X, keys %d, restarts %d, key requests %d (acked %d)' % (d['sess'], d['ctx_chg'], d['ctx_a'], d['ctx_b'], d['du_fix'], d['mute_a'], d['keys'], d['restarts'], d['kreq'] & 0xFFFF, d['kreq'] >> 16))
+    print('  audio uplink: %d status reads (%d failed), last fill error %d frames; pass-through blocks %d, mode switches %d' % (d['upl'], d['upl_fail'], L.s32(d['upl_err']), d['pt'], d['pt_sw']))
     if d['du']:
         print('  display: state %X (1 = took array 0, |100 = restored), buffer reuse waits %d, pace waits %d' % (
             d['du'], d['reuse_waits'], d['pace_waits']))
@@ -138,7 +140,7 @@ def report(d, info=None):
 
 
 def read_all(b, full_log=False):
-    st = b.final(0x200)
+    st = b.final(0x220)
     if not full_log:                            # the ring is 32 KB = ~80 s over CAN
         return st, b''
     n = min(L.words(st)[8 + F.index('log_n')], LOGN)
@@ -146,7 +148,7 @@ def read_all(b, full_log=False):
 
 
 def show(st):
-    d = decode(st.ljust(0x200, bytes(1)))               # the poll reads only what this line needs: CAN reads stall the unit
+    d = decode(st.ljust(0x220, bytes(1)))               # the poll reads only what this line needs: CAN reads stall the unit
     return 'stage %X seq %d ok %d dec %d err %d tlvbad %d fifo %d under %d' % (
         d['stage'], d['seq'], d['sf_ok'], d['v_dec'], d['v_dec_err'], d['tlv_bad'], d['a_fill'], d['a_under'])
 
@@ -242,12 +244,12 @@ def main(argv):
         stall = {'seq': None, 'hb': None, 't': time.monotonic(), 'n': 0}
 
         def show2(st):                         # stall detector: dump task 159's TCB when the heartbeat stops
-            d = decode(st.ljust(0x200, bytes(1)))
+            d = decode(st.ljust(0x220, bytes(1)))
             if d['hb'] != stall['hb']:
                 stall.update(hb=d['hb'], t=time.monotonic())
             elif time.monotonic() - stall['t'] > 2 + a.poll and stall['n'] < 3:
                 stall['n'] += 1
-                d = decode(b.read(L.STAT_BASE, 0x200))
+                d = decode(b.read(L.STAT_BASE, 0x220))
                 print('  STALL %.1f s: stage %X seq %d hb %X last_rd %d rd_calls %d TCB159 %s' % (
                     time.monotonic() - stall['t'], d['stage'], d['seq'], d['hb'], L.s32(d['last_rd_ret']), d['rd_calls'],
                     b.read(L.TCB159, 0x40).hex()))

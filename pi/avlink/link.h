@@ -27,6 +27,8 @@ typedef struct {
     uint32_t last_served_seq, last_served_t;
     tl_rnse_info rnse;           /* newest RNSE_INFO (valid if n_rnse) */
     uint64_t n_rnse;
+    struct { tl_rnse_stat s; uint64_t t_pi_us; } stat[64];   /* audio status reports, ring (n_stat = total received) */
+    uint64_t n_stat;
     char cline[160]; size_t clen;            /* console text line being collected */
     char teensy_ver[64];         /* the Teensy's FW_VERSION, from its VER / BOOT / HELP console line ("" until seen) */
     uint64_t n_teensy_ver;
@@ -45,5 +47,6 @@ void link_raw(link_t *l, const void *p, size_t n);   /* append console bytes (no
 ver
 " */
 int link_console_line(link_t *l, const char *line);  /* parse one console line; 1 = it carried the firmware version */
+uint64_t link_now_us(void);                       /* CLOCK_MONOTONIC, the clock of stat[].t_pi_us */
 
 #endif
