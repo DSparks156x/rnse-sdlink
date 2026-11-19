@@ -148,3 +148,29 @@ void touch_save(void) {
   EEPROM.update(EE_ADDR, EE_MAGIC);
   for (unsigned i = 0; i < sizeof TC; i++) EEPROM.update(EE_ADDR + 1 + i, ((uint8_t *)&TC)[i]);
 }
+
+// Bench check: line levels with only a 100k pull-down (high = external pull-up present), then a 100 kHz address scan.
+void touch_scan(void) {
+  Wire.end();
+  const uint8_t pins[4] = {18, 19, PIN_TINT, PIN_TRST};
+  int lv[4];
+  for (int i = 0; i < 4; i++) { pinMode(pins[i], INPUT_PULLDOWN); }
+  delay(5);
+  for (int i = 0; i < 4; i++) lv[i] = digitalReadFast(pins[i]);
+  for (int i = 0; i < 4; i++) pinMode(pins[i], INPUT_DISABLE);
+  char line[120];
+  snprintf(line, sizeof line, "I2CLINES SDA=%d SCL=%d INT=%d RST=%d (pulldown 100k; 1 = pulled up)", lv[0], lv[1], lv[2], lv[3]);
+  Serial.println(line);
+  gt_reset();
+  Wire.begin();
+  Wire.setClock(100000);
+  Serial.print("I2CSCAN");
+  int n = 0;
+  for (uint8_t a = 1; a < 0x78; a++) {
+    Wire.beginTransmission(a);
+    if (Wire.endTransmission() == 0) { snprintf(line, sizeof line, " %02X", a); Serial.print(line); n++; }
+  }
+  Serial.println(n ? "" : " none");
+  touch_begin();
+  touch_print();
+}

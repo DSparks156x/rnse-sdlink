@@ -28,3 +28,4 @@ void touch_poll(void);          // call from loop(); never blocks longer than on
 void touch_print(void);         // "TOUCH ..." status line
 bool touch_cfg(const char *key, int v);
 void touch_save(void);          // cfg -> EEPROM
+void touch_scan(void);          // line levels + I2C address scan, then re-probe

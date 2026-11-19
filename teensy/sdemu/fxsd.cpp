@@ -614,7 +614,6 @@ static void mon_tok(const CmdTok &t) {
     if (t.app && t.idx == 6) S.bus4 = (t.arg & 3) == 2;
     if (!t.app && t.idx == 0) S.bus4 = 0;
     if (!t.app && (t.idx == 17 || t.idx == 18)) S.last_lba = t.arg;
-    digitalToggleFast(PIN_LED);
   } else {
     C.resp_seen++;
     if (t.crc == 0) C.resp_crc_bad++;
@@ -737,7 +736,7 @@ void fx_set_mode(FxMode m) {
   engine_stop();
   S.mode = m;
   S.card_state = ST_IDLE;
-  if (m == FX_OFF) { pads_off(); digitalWriteFast(PIN_LED, LOW); return; }
+  if (m == FX_OFF) { pads_off(); return; }
   engine_start();
 }
 void fx_apply_knobs(void) { fx_set_mode(S.mode); }
@@ -747,7 +746,6 @@ void fx_begin(void) {
   AVS.init(pool_banks, pool_bank_n, 2, avs_now, avs_tx);
   pinMode(PIN_DBG, OUTPUT); digitalWriteFast(PIN_DBG, LOW);
   pinMode(PIN_OE, OUTPUT); digitalWriteFast(PIN_OE, LOW);
-  pinMode(PIN_LED, OUTPUT); digitalWriteFast(PIN_LED, LOW);
   pinMode(PIN_CDSENSE, INPUT);               // no pull: never feed the slot
   pads_off();
   analogReadResolution(12);
@@ -797,7 +795,6 @@ static void vdd_poll(void) {
     __enable_irq();
     pads_update_pulls();                     // pulls only while the host powers the slot
     digitalWriteFast(PIN_OE, drive_ok ? HIGH : LOW);
-    digitalWriteFast(PIN_LED, drive_ok ? HIGH : LOW);
   }
 }
 

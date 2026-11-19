@@ -334,6 +334,7 @@ static void cmd_line(char *s) {
   }
   else if (!strcmp(c, "touch")) {
     if (argc == 2 && !strcmp(argv[1], "save")) { touch_save(); Serial.println("OK saved"); }
+    else if (argc == 2 && !strcmp(argv[1], "scan")) touch_scan();
     else if (argc >= 3 && !touch_cfg(argv[1], atoi(argv[2]))) Serial.println("ERR touch key/value");
     else touch_print();
   }
@@ -354,12 +355,29 @@ static void console_byte(uint8_t ch) {
 }
 static uint8_t rxbuf[4096];
 
+
+// Status LED (pin 13, PWM): dim = powered, bright = USB enumerated, flicker = SD sectors served or Pi link traffic.
+extern "C" volatile uint8_t usb_configuration;
+static void led_poll(void) {
+  static uint32_t last_sec, last_msg, t_flick;
+  static int cur = -1;
+  uint32_t now = millis();
+  uint32_t sec = C.sectors_served + C.small_blocks, msg = AVS.rx_msgs;
+  int busy = sec != last_sec || msg != last_msg;
+  last_sec = sec; last_msg = msg;
+  if (busy && now - t_flick >= 80) t_flick = now;    // at most ~12 flickers/s while streaming
+  int lvl = usb_configuration ? 255 : 6;
+  if (now - t_flick < 30) lvl = usb_configuration ? 10 : 60;
+  if (lvl != cur) { analogWrite(PIN_LED, lvl); cur = lvl; }
+}
+
 void setup() {
   fx_begin();                                // pads high-Z first thing
+  analogWrite(PIN_LED, 6);                   // dim: powered
   Serial.begin(115200);
   fx_set_mode(FX_CARD);                      // card from power-up, before anything that waits: drives only while slot VDD is sensed
   uint32_t t0 = millis();
-  while (!Serial && millis() - t0 < 2000) fx_poll();
+  while (!Serial && millis() - t0 < 2000) { fx_poll(); led_poll(); }
   touch_begin();                             // ~75 ms GT911 reset + probe; SD pads already high-Z
   Serial.println("BOOT " FW_VERSION);
   help();
@@ -368,6 +386,7 @@ void setup() {
 
 void loop() {
   fx_poll();
+  led_poll();
   touch_poll();
   for (int rounds = 0; rounds < 16; rounds++) {      // USB RX: TLNK messages -> stream pool, the rest -> console
     int n = Serial.available();
