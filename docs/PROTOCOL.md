@@ -83,7 +83,7 @@ p53, p56). DMA users are S0 and S3; the CMD path is CPU-driven.
 | DAT2 | 9 | **36** | GPIO_B1_02 | D18 | same |
 | DAT3 | 1 | **37** | GPIO_B1_03 | D19 | same (the host may also use a DAT3 pull-up for detect) |
 | VSS1, VSS2 | 3, 6 | GND (several wires) | | | |
-| VDD | 4 | **not connected to 3V3**. 10k/20k divider to pin 14 (A0) = "host powered" sense | | | |
+| VDD | 4 | **not connected to 3V3**. 10k/10k divider to pin 14 (A0) = "host powered" sense | | | |
 | bus-switch OE (car build) | | 3 | | | GPIO out |
 | LA trigger / debug | | 2 | | | GPIO out, pulse on CMD decode / CRC error |
 

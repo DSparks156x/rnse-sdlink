@@ -13,7 +13,7 @@
 //   7          GPIO_B1_01   D17       DAT1 (SD 8 / uSD 8)
 //  36          GPIO_B1_02   D18       DAT2 (SD 9 / uSD 1)
 //  37          GPIO_B1_03   D19       DAT3 (SD 1 / uSD 2)
-//  14 (A0)     -            -         slot VDD sense via 10k (top) / 20k (bottom) divider
+//  14 (A0)     -            -         slot VDD sense via 10k / 10k divider
 //  15          -            -         optional card-detect sense (only if your breakout has a CD pad)
 //   2          -            -         debug pulse out (CRC error / command decode); leave unconnected
 //   3          -            -         bus-switch OE out (car build only; high = connect)
@@ -53,8 +53,8 @@
 #define AVS_POOL_DTCM  572
 
 // ---------------------------------------------------------------- VDD sense
-// divider: slot VDD -- 10k -- pin14 -- 20k -- GND   => Vpin = Vslot * 2/3
-#define VDIV_RATIO 1.5f
+// divider: slot VDD -- 10k -- pin14 -- 10k -- GND   => Vpin = Vslot / 2
+#define VDIV_RATIO 2.0f
 #define VDD_ON_V   2.70f   // slot volts: above = powered (hysteresis)
 #define VDD_OFF_V  2.20f   // below = unpowered
 
