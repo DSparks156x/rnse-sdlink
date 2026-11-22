@@ -1,4 +1,4 @@
-# rnv2enc - build on Raspberry Pi 5 (aarch64, NEON) or x86-64 Linux (scalar; NEON logic testable via emulation)
+# rnv2enc - build on a Raspberry Pi (aarch64, NEON; tuned for the CPU it builds on) or x86-64 Linux (scalar; NEON logic testable via emulation)
 #   make            -> rnv2enc (CLI), librnv2enc.a, rnv2dec_ref (unchanged reference decoder copy), test_kernels
 #   make test       -> NEON-vs-scalar kernel self-check + closed-loop encode/decode check on a synthetic clip
 #   make emutest    -> x86 only: compile the NEON kernels against src/neon_emu.h and run the same self-check
@@ -7,7 +7,7 @@ CC      ?= gcc
 ARCH    := $(shell uname -m)
 OPT     ?= -O3
 ifeq ($(ARCH),aarch64)
-  MARCH ?= -mcpu=cortex-a76
+  MARCH ?= -mcpu=native
 endif
 ifeq ($(ARCH),x86_64)
   MARCH ?= -march=x86-64-v2

@@ -40,7 +40,7 @@ Hudiy/AA --(wlr export-dmabuf)--> pi/wlcap --raw--> pienc/rnv3enc --RNV3--> pi/a
 |---|---|---|
 | Teensy firmware | `cd teensy && pio run` | PlatformIO with the Teensy platform. `usb_serial_touch.py` patches the Teensy core's `usb_desc.h` to add a CDC+touch USB type. Not run in the last cleanup (it edits the shared core) |
 | RNS-E programs | `cd rnse && mkdir -p out && bash build.sh` | `sh-elf-gcc` (SH-4, big-endian, `-m4-single`) at `~/sh-elf/bin/sh-elf-*`; output in `rnse/out/` (`sdstream.bin`, `sdboot.bin`, ...) |
-| Pi binaries | `make` at the top: `bin/rnv3enc`, `bin/avlink`, `bin/wlcap` (`make test` runs the encoder self-checks) | gcc on the Pi 5; `WAYLAND_DISPLAY` and `XDG_RUNTIME_DIR` at run time for wlcap |
+| Pi binaries | `make` at the top: `bin/rnv3enc`, `bin/avlink`, `bin/wlcap` (`make test` runs the encoder self-checks) | gcc on the Pi (3, 4 or 5, aarch64); `WAYLAND_DISPLAY` and `XDG_RUNTIME_DIR` at run time for wlcap |
 | Encoder only | `cd pienc && make` (`make test` for the self-checks) | gcc; NEON is used on aarch64, emulated NEON checks run on x86 |
 | RNS-E flash module | `bash rnse/module/build.sh` (WSL on Windows) -> `rnse/out/sector_107.bin` + `.sha256` + `module.json` | sh-elf toolchain as above, python3 |
 | Firmware side (hook + table) | not here | made per firmware by private tools, see `docs/FIRMWARE_CONTRACT.md` |

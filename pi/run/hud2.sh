@@ -42,6 +42,14 @@ if [ "$R" -gt 0 ]; then
     done
   ) > rt.log 2>&1 &
 fi
+# The encoder build for this CPU (sdlink Makefile): Pi 5 Cortex-A76, Pi 4 A72, Pi 3 / Zero 2 A53. Anything else, or a bundle
+# without that variant, gets the plain ARMv8-A rnv3enc.
+if [ -z "$ENC_BIN" ]; then
+  case $(awk -F: '/^CPU part/ {gsub(/[ \t]/, "", $2); print $2; exit}' /proc/cpuinfo 2>/dev/null) in
+    0xd0b) ENCCPU=a76 ;; 0xd08) ENCCPU=a72 ;; 0xd03) ENCCPU=a53 ;; *) ENCCPU= ;;
+  esac
+  ENC_BIN=$B/rnv3enc; [ -n "$ENCCPU" ] && [ -x "$B/rnv3enc-$ENCCPU" ] && ENC_BIN=$B/rnv3enc-$ENCCPU
+fi
 withpid() { f=$1; shift; bash -c 'echo $$ > "$0"; exec "$@"' "$f" "$@"; }
 # AUDIOCAP=parec reverts. parec goes through pipewire-pulse, which loses buffers ("out of buffers" in its log): 47724-47931 frames/s against pw-record's 48004 on the same monitor, 2026-11-05.
 # echo_cancel_sink is fed by the Hudiy EQ sink: capturing there follows Hudiy volume and EQ. The EQ sink's own monitor is before both (measured 2026-11-06).
@@ -56,4 +64,4 @@ else
   timeout $1 pw-record --target "$CAPSINK" -P '{stream.capture.sink=true}' --rate 48000 --channels 2 --format f32 --latency 20ms --raw - > pcm.fifo 2>parec.log &
   AFMT=--audio-f32
 fi
-timeout $1 bash -c 'echo $$ > cap.pid; exec "$0" "$@"' "${WLCAP_BIN:-$B/wlcap}" $CAPARG 2>cap.log | withpid enc.pid "${ENC_BIN:-$B/rnv3enc}" -i - --fmt $FMT -o - --keyint ${KEYINT:-0} --linkcap ${LINKCAP:-4.5e6} --linkctl key.fifo --stats st.txt --threads ${ENCTHREADS:-2} --maxvid ${MAXVID:-161} ${ENCFLAGS:---cyc ${CYC:-4.05e6} --refill wall --dither ${DITHER:-0} --srcdead ${SRCDEAD:-3} --srcmean ${SRCMEAN:-48} --fillpen ${FILLPEN:-2}} $ENCEXTRA 2>enc.log | withpid link.pid "${AVLINK_BIN:-$B/avlink}" --video - --audio pcm.fifo $AFMT ${LINKDEV:---dev /dev/ttyACM0} --keyctl key.fifo --linkcap ${LINKCAP:-4.5e6} --maxvid ${MAXVID:-161} --whole-sf ${WHOLESF:-1} --rnse-file rnse.txt --gain-db ${GAIN:--3} --stats ${STATS:-5} --console > live.log 2>&1
+timeout $1 bash -c 'echo $$ > cap.pid; exec "$0" "$@"' "${WLCAP_BIN:-$B/wlcap}" $CAPARG 2>cap.log | withpid enc.pid "$ENC_BIN" -i - --fmt $FMT -o - --keyint ${KEYINT:-0} --linkcap ${LINKCAP:-4.5e6} --linkctl key.fifo --stats st.txt --threads ${ENCTHREADS:-2} --maxvid ${MAXVID:-161} ${ENCFLAGS:---cyc ${CYC:-4.05e6} --refill wall --dither ${DITHER:-0} --srcdead ${SRCDEAD:-3} --srcmean ${SRCMEAN:-48} --fillpen ${FILLPEN:-2}} $ENCEXTRA 2>enc.log | withpid link.pid "${AVLINK_BIN:-$B/avlink}" --video - --audio pcm.fifo $AFMT ${LINKDEV:---dev /dev/ttyACM0} --keyctl key.fifo --linkcap ${LINKCAP:-4.5e6} --maxvid ${MAXVID:-161} --whole-sf ${WHOLESF:-1} --rnse-file rnse.txt --gain-db ${GAIN:--3} --stats ${STATS:-5} --console > live.log 2>&1

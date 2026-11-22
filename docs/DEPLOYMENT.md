@@ -70,7 +70,9 @@ rm -f ~/avsd/car/DISABLE; systemctl --user start avsd-chain     # start
 - Don't restart hudiy, labwc or pipewire. Use `pkill -x`, since `pkill -f` matches your own ssh command.
 
 ### Encoder
-Build on the Pi (about a minute) or ship an aarch64 binary:
+Build on the Pi (about a minute) or ship an aarch64 binary. `-mcpu` is the Pi's core: `cortex-a76` (Pi 5), `cortex-a72` (Pi 4),
+`cortex-a53` (Pi 3, Zero 2), or `-march=armv8-a` for any aarch64 CPU. A build for a newer core dies with SIGILL on an older one.
+The top-level `make` builds all four (`bin/rnv3enc` is the ARMv8-A one) and `hud2.sh` picks by `/proc/cpuinfo` unless `ENC_BIN` is set.
 ```bash
 gcc -O3 -mcpu=cortex-a76 -std=c11 -ffp-contract=off -D_POSIX_C_SOURCE=200809L -Iinclude -Isrc -w \
     src/main.c src/enc.c src/kern_scalar.c src/kern_neon.c -o rnv3enc -lpthread -lm

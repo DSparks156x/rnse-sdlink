@@ -20,7 +20,7 @@ FILES
 
 BUILD AND SELF-TEST ON THE PI (Raspberry Pi OS Bookworm 64-bit; gcc and make are preinstalled)
   cd pienc
-  make                  # rnv2enc, librnv2enc.a, rnv2dec_ref, test_kernels, bench_kernels  (-O3 -mcpu=cortex-a76)
+  make                  # rnv2enc, librnv2enc.a, rnv2dec_ref, test_kernels, bench_kernels  (-O3 -mcpu=native)
   make test             # 1) every NEON kernel == scalar (200 k randomized calls each + structured sweeps)
                         # 2) synthetic clip: NEON == scalar bitstream, 1 == 3 threads, RGB24 == XRGB8888 input,
                         #    reference decoder output == encoder reconstruction on every frame (CRC32)
